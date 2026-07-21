@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Uncorrupt source register entry",
+  "type": "object",
+  "required": ["source_id", "name", "jurisdictions", "data_class", "tier",
+               "license", "redistribution", "legal_basis", "access_method",
+               "freshness_sla_days"],
+  "additionalProperties": false,
+  "properties": {
+    "source_id": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+    "name": {"type": "string"},
+    "jurisdictions": {"type": "array", "items": {"type": "string"}},
+    "data_class": {"enum": ["A1", "A2", "B"]},
+    "tier": {"enum": ["a", "b", "c"]},
+    "license": {"type": "string"},
+    "redistribution": {"enum": ["open", "attribution", "non_commercial", "no_redistribution"]},
+    "legal_basis": {"type": "string"},
+    "access_method": {"enum": ["bulk-api", "open-data-dump", "scrape", "ocr"]},
+    "robots_tos_reviewed": {"type": "string", "format": "date"},
+    "freshness_sla_days": {"type": "integer", "minimum": 1},
+    "dpia_cleared": {"type": "boolean"},
+    "notes": {"type": "string"}
+  }
+}

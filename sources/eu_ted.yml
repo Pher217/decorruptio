@@ -1,0 +1,16 @@
+source_id: eu_ted
+name: EU Tenders Electronic Daily (TED)
+jurisdictions: [EU]
+data_class: A1
+tier: a
+license: "European Union open data (reuse permitted)"
+redistribution: open
+legal_basis: "Public-sector open data (Directive (EU) 2019/1024); non-personal procurement notices"
+access_method: bulk-api
+robots_tos_reviewed: 2026-07-21
+freshness_sla_days: 7
+dpia_cleared: false   # not needed: A1, non-personal
+notes: >-
+  ABOVE-THRESHOLD notices only; most procurement by count is below-threshold on
+  national portals. eForms since late 2023 + older XML generations = several
+  connectors in practice. Coverage published honestly.

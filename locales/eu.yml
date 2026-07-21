@@ -1,0 +1,7 @@
+code: eu
+name_normalization_profile: passthrough   # Phase 1: passthrough until per-locale golden set exists
+currency: EUR
+procedure_metadata:
+  min_bid_days_open: 35
+  min_bid_days_restricted: 30
+notes: "EU/TED profile. Thresholds illustrative; refine against directives before enabling indicators."

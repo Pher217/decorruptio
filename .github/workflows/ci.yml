@@ -1,0 +1,19 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --extra dev
+      - name: lint
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: typecheck
+        run: uv run mypy
+      - name: validate source register
+        run: uv run uncorrupt validate-registry
+      - name: test (incl. guardrail suite)
+        run: uv run pytest

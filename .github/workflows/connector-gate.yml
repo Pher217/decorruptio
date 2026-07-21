@@ -1,0 +1,17 @@
+name: connector-gate
+on:
+  pull_request:
+    paths:
+      - "sources/**"
+      - "src/uncorrupt/connectors/**"
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --extra dev
+      - name: register entries valid (license + redistribution + data_class)
+        run: uv run uncorrupt validate-registry
+      - name: connector conformance suite
+        run: uv run pytest tests/connectors -q

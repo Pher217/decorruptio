@@ -1,0 +1,15 @@
+source_id: gleif
+name: GLEIF LEI golden copy
+jurisdictions: [GLOBAL]
+data_class: A1
+tier: a
+license: "CC0 1.0"
+redistribution: open
+legal_basis: "Open reference data on legal entities (non-personal)"
+access_method: open-data-dump
+robots_tos_reviewed: 2026-07-21
+freshness_sla_days: 7
+dpia_cleared: false
+notes: >-
+  Enrichment overlay only. ~2.5-3M LEIs, mostly financial entities; most SMEs
+  have no LEI, so the primary company key is (jurisdiction, registry_number).

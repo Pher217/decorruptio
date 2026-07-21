@@ -1,0 +1,5 @@
+# Dagster instance config. Postgres-backed storage; local artifact root.
+storage:
+  postgres:
+    postgres_url:
+      env: DATABASE_URL

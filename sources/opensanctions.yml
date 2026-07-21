@@ -1,0 +1,15 @@
+source_id: opensanctions
+name: OpenSanctions (sanctions + PEPs + watchlists)
+jurisdictions: [GLOBAL]
+data_class: A2                 # named natural persons -> gated by the global DPIA
+tier: b                        # default restricted; sanctions vs PEP vs watchlist tiered per sub-dataset
+license: "CC-BY-NC 4.0"
+redistribution: non_commercial # <- excluded from bulk OPEN exports (the guardrail test's real case)
+legal_basis: "TBD — requires the up-front global A2 DPIA/LIA before ingest"
+access_method: bulk-api
+robots_tos_reviewed: 2026-07-21
+freshness_sla_days: 2
+dpia_cleared: false            # connector will REFUSE to load until true
+notes: >-
+  Present in the register from day one so the redistribution + A2 guardrail tests
+  have a real case. Not ingested in Phase 1 (A1 only). Delisting must propagate.

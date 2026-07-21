@@ -13,10 +13,17 @@ from uncorrupt.register.enforcement import assert_bulk_open_exportable, filter_b
 
 def _rec(redist: Redistribution, tier: Tier) -> ProvenanceRecord:
     return ProvenanceRecord(
-        source_id="opensanctions", source_url="https://opensanctions.org",
-        retrieved_at=datetime(2026, 7, 21), content_hash="x" * 64,
-        license="CC-BY-NC", redistribution=redist, jurisdiction="GLOBAL",
-        data_class=DataClass.A2, tier=tier, connector="opensanctions", connector_version="0",
+        source_id="opensanctions",
+        source_url="https://opensanctions.org",
+        retrieved_at=datetime(2026, 7, 21),
+        content_hash="x" * 64,
+        license="CC-BY-NC",
+        redistribution=redist,
+        jurisdiction="GLOBAL",
+        data_class=DataClass.A2,
+        tier=tier,
+        connector="opensanctions",
+        connector_version="0",
     )
 
 

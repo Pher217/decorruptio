@@ -21,9 +21,7 @@ _ENV_KEY = "UNCORRUPT_VAULT_HMAC_KEY"
 def _key() -> bytes:
     raw = os.environ.get(_ENV_KEY, "")
     if not raw:
-        raise VaultError(
-            f"{_ENV_KEY} is not set; the tokenized-ID vault refuses to operate"
-        )
+        raise VaultError(f"{_ENV_KEY} is not set; the tokenized-ID vault refuses to operate")
     return raw.encode("utf-8")
 
 

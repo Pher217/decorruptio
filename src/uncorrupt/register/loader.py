@@ -18,9 +18,7 @@ LOCALES_DIR = _ROOT / "locales"
 def load_source(source_id: str, *, sources_dir: Path = SOURCES_DIR) -> SourceEntry:
     path = sources_dir / f"{source_id}.yml"
     if not path.exists():
-        raise RegisterError(
-            f"no register entry sources/{source_id}.yml — connector may not run"
-        )
+        raise RegisterError(f"no register entry sources/{source_id}.yml — connector may not run")
     return SourceEntry.model_validate(yaml.safe_load(path.read_text()))
 
 

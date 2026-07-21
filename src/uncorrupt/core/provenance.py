@@ -7,16 +7,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from uncorrupt.core.fx import FxProvenance
 from uncorrupt.core.tiers import DataClass, Tier
 
 
-class Redistribution(str, Enum):
-    OPEN = "open"                       # freely redistributable
-    ATTRIBUTION = "attribution"         # redistributable with attribution
-    NON_COMMERCIAL = "non_commercial"   # e.g. OpenSanctions CC-BY-NC — excluded from bulk open export
+class Redistribution(StrEnum):
+    OPEN = "open"  # freely redistributable
+    ATTRIBUTION = "attribution"  # redistributable with attribution
+    # e.g. OpenSanctions CC-BY-NC — excluded from bulk open export
+    NON_COMMERCIAL = "non_commercial"
     NO_REDISTRIBUTION = "no_redistribution"
 
 
@@ -25,7 +26,7 @@ class ProvenanceRecord:
     source_id: str
     source_url: str
     retrieved_at: datetime
-    content_hash: str                 # sha256 of the raw payload
+    content_hash: str  # sha256 of the raw payload
     license: str
     redistribution: Redistribution
     jurisdiction: str

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
+from uncorrupt.indicators.base import Flag, Indicator
 from uncorrupt.indicators.context import EvaluationContext
 
 

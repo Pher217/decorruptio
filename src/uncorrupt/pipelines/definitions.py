@@ -7,6 +7,13 @@ Kept import-safe if dagster isn't installed so the package imports cleanly.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dagster import Definitions
+
+defs: Definitions | None
+
 try:
     from dagster import Definitions
 

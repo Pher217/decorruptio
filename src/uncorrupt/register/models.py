@@ -15,16 +15,16 @@ class SourceEntry(BaseModel):
 
     source_id: str
     name: str
-    jurisdictions: list[str]          # ISO codes or ["GLOBAL"]
+    jurisdictions: list[str]  # ISO codes or ["GLOBAL"]
     data_class: DataClass
-    tier: Tier                        # default publication tier for this source
+    tier: Tier  # default publication tier for this source
     license: str
     redistribution: Redistribution
     legal_basis: str
-    access_method: str                # bulk-api | open-data-dump | scrape | ocr
+    access_method: str  # bulk-api | open-data-dump | scrape | ocr
     robots_tos_reviewed: date | None = None
     freshness_sla_days: int
-    dpia_cleared: bool = False        # A2 connectors refuse to load unless True
+    dpia_cleared: bool = False  # A2 connectors refuse to load unless True
     notes: str | None = None
 
 

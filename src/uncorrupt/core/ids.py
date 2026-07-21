@@ -15,9 +15,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CompanyKey:
-    jurisdiction: str        # ISO 3166 alpha-2
-    registry_number: str     # national company-registry identifier
-    lei: str | None = None   # GLEIF LEI, enrichment overlay only
+    jurisdiction: str  # ISO 3166 alpha-2
+    registry_number: str  # national company-registry identifier
+    lei: str | None = None  # GLEIF LEI, enrichment overlay only
 
     def __str__(self) -> str:
         return f"{self.jurisdiction}:{self.registry_number}"

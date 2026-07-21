@@ -12,25 +12,25 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from uncorrupt.core.provenance import ProvenanceRecord, VersionStamp
 from uncorrupt.indicators.context import EvaluationContext
 
 
-class ValidationStatus(str, Enum):
-    UNVALIDATED = "unvalidated"   # default — will NOT run
-    VALIDATED = "validated"       # checked against local ground truth — may run
-    REJECTED = "rejected"         # found not predictive here — must not run
+class ValidationStatus(StrEnum):
+    UNVALIDATED = "unvalidated"  # default — will NOT run
+    VALIDATED = "validated"  # checked against local ground truth — may run
+    REJECTED = "rejected"  # found not predictive here — must not run
 
 
 @dataclass(frozen=True)
 class Flag:
     indicator_id: str
-    subject_ref: str              # e.g. an OCDS ocid or FtM entity id
+    subject_ref: str  # e.g. an OCDS ocid or FtM entity id
     as_of: date
-    explanation: str              # human-readable — mandatory
+    explanation: str  # human-readable — mandatory
     evidence: list[ProvenanceRecord]  # source-doc back-references — mandatory
     stamp: VersionStamp
 
@@ -38,8 +38,8 @@ class Flag:
 class Indicator(ABC):
     id: str
     title: str
-    definition: str               # human-readable formula, cited to OCP-73 / World Bank id
-    inputs: list[str]             # OCDS paths consumed
+    definition: str  # human-readable formula, cited to OCP-73 / World Bank id
+    inputs: list[str]  # OCDS paths consumed
     params: dict[str, Any]
     validation: dict[str, ValidationStatus]  # keyed by jurisdiction/locale code
 

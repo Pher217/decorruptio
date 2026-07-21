@@ -35,9 +35,9 @@ class RawArtifact:
 
 @runtime_checkable
 class Connector(Protocol):
-    source_id: str            # MUST match a sources/<source_id>.yml register entry
+    source_id: str  # MUST match a sources/<source_id>.yml register entry
     jurisdictions: list[str]  # ISO codes or ["GLOBAL"]
-    data_class: DataClass     # A1 in Phase 1; A2 refuses to load unless register.dpia_cleared
+    data_class: DataClass  # A1 in Phase 1; A2 refuses to load unless register.dpia_cleared
 
     def discover(self, since: date | None = None) -> Iterator[FetchTask]: ...
     def fetch(self, task: FetchTask) -> Iterator[RawArtifact]: ...

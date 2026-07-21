@@ -14,8 +14,10 @@ def _validate_registry(_: argparse.Namespace) -> int:
     sources = all_sources()
     print(f"OK: {len(sources)} valid source register entries")
     for s in sources:
-        print(f"  - {s.source_id}: {s.data_class.value}/tier-{s.tier.value} "
-              f"[{s.redistribution.value}]")
+        print(
+            f"  - {s.source_id}: {s.data_class.value}/tier-{s.tier.value} "
+            f"[{s.redistribution.value}]"
+        )
     return 0
 
 

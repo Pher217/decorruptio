@@ -16,17 +16,17 @@ from decimal import Decimal
 
 @dataclass(frozen=True)
 class FxProvenance:
-    source: str          # e.g. "ecb"
-    rate_type: str       # e.g. "reference", "official", "parallel"
+    source: str  # e.g. "ecb"
+    rate_type: str  # e.g. "reference", "official", "parallel"
     as_of: date
     rate: Decimal
-    trusted: bool        # False => amount indicators must be disabled for this datum
+    trusted: bool  # False => amount indicators must be disabled for this datum
 
 
 @dataclass(frozen=True)
 class Money:
     amount: Decimal
-    currency: str        # ISO 4217
+    currency: str  # ISO 4217
 
 
 class FxRates:

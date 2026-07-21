@@ -9,18 +9,18 @@ code, not just prose.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from uncorrupt.core.errors import TierViolation
 
 
-class DataClass(str, Enum):
+class DataClass(StrEnum):
     A1 = "A1"  # non-personal money data — scales freely
     A2 = "A2"  # public-persons data — gated by up-front global DPIA
-    B = "B"    # flagging & investigation — gated per-jurisdiction
+    B = "B"  # flagging & investigation — gated per-jurisdiction
 
 
-class Tier(str, Enum):
+class Tier(StrEnum):
     A = "a"  # open: raw open data + reproducible aggregations
     B = "b"  # vetted: anomaly feed to auditors/journalists under a code of conduct
     C = "c"  # named: human investigation + right of reply + legal review only
@@ -33,6 +33,4 @@ _OPEN_EXPORT_TIERS = {Tier.A}
 def assert_exportable_to_open(tier: Tier, *, what: str = "record") -> None:
     """Raise unless `tier` may appear in a tier-a (open) export (ADR-000 G2)."""
     if tier not in _OPEN_EXPORT_TIERS:
-        raise TierViolation(
-            f"{what} is tier '{tier.value}' and cannot reach a tier-a open export"
-        )
+        raise TierViolation(f"{what} is tier '{tier.value}' and cannot reach a tier-a open export")

@@ -1,4 +1,4 @@
-"""Ingest raw artifacts from connectors into the DuckDB staging layer.
+"""Ingest raw artifacts from connectors into the Django/PostgreSQL staging layer.
 
 Maps each source's native format into the unified OCDS-flattened schema:
 - Ukraine Prozorro: near-OCDS JSON → tenders + awards + bids
@@ -9,21 +9,20 @@ Maps each source's native format into the unified OCDS-flattened schema:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
-import duckdb
-
 from uncorrupt.connectors.base import RawArtifact
+from uncorrupt.staging.models import Award, Bid, Tender
 
 
-def _safe_float(v: Any) -> float | None:
+def _to_cents(v: Any) -> int:
     if v is None or v == "":
-        return None
+        return 0
     try:
-        return float(v)
+        return round(float(v) * 100)
     except (ValueError, TypeError):
-        return None
+        return 0
 
 
 def _safe_int(v: Any) -> int | None:
@@ -35,19 +34,19 @@ def _safe_int(v: Any) -> int | None:
         return None
 
 
-def _parse_date(v: Any) -> str | None:
+def _parse_dt(v: Any) -> datetime | None:
     if v is None or v == "":
         return None
     s = str(v)
-    # ISO datetime or date
-    if "T" in s:
-        return s
-    if len(s) == 10:
-        return s + "T00:00:00"
-    return s
+    if "T" not in s and len(s) == 10:
+        s = s + "T00:00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
 
 
-def _ingest_ua_prozorro(conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, now: str) -> None:
+def _ingest_ua_prozorro(artifact: RawArtifact) -> None:
     """Map ProZorro tender JSON → tenders + awards + bids."""
     data = json.loads(artifact.payload)
     t = data.get("data", data)
@@ -61,42 +60,31 @@ def _ingest_ua_prozorro(conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, 
     pe = t.get("procuringEntity", {})
     pe_id = pe.get("identifier", {})
 
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO tenders
-        (source_id, tender_id, ocid, title, description, status,
-         procurement_method, procurement_method_details, award_criteria,
-         currency, value_amount, tender_start, tender_end,
-         buyer_name, buyer_id_scheme, buyer_id, buyer_country,
-         item_count, raw_json, fetched_at, source_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            "ua_prozorro",
-            tender_id,
-            t.get("tenderID"),
-            t.get("title"),
-            t.get("description"),
-            t.get("status"),
-            t.get("procurementMethod"),
-            t.get("procurementMethodType"),
-            t.get("awardCriteria"),
-            value.get("currency"),
-            _safe_float(value.get("amount")),
-            _parse_date(tp.get("startDate")),
-            _parse_date(tp.get("endDate")),
-            pe.get("name"),
-            pe_id.get("scheme"),
-            pe_id.get("id"),
-            pe.get("address", {}).get("countryName"),
-            _safe_int(len(t.get("items", []))),
-            json.dumps(t, ensure_ascii=False),
-            now,
-            artifact.source_url,
-        ],
+    tender, _ = Tender.objects.update_or_create(
+        source_id="ua_prozorro",
+        tender_id=tender_id,
+        defaults={
+            "ocid": t.get("tenderID"),
+            "title": t.get("title"),
+            "description": t.get("description"),
+            "status": t.get("status"),
+            "procurement_method": t.get("procurementMethod"),
+            "procurement_method_details": t.get("procurementMethodType"),
+            "award_criteria": t.get("awardCriteria"),
+            "currency": value.get("currency") or "USD",
+            "value_amount_cents": _to_cents(value.get("amount")),
+            "tender_start": _parse_dt(tp.get("startDate")),
+            "tender_end": _parse_dt(tp.get("endDate")),
+            "buyer_name": pe.get("name"),
+            "buyer_id_scheme": pe_id.get("scheme"),
+            "buyer_id": pe_id.get("id"),
+            "buyer_country": pe.get("address", {}).get("countryName"),
+            "item_count": len(t.get("items", [])),
+            "raw_json": t,
+            "source_url": artifact.source_url,
+        },
     )
 
-    # Awards
     for award in t.get("awards", []):
         award_id = award.get("id", "")
         if not award_id:
@@ -104,63 +92,47 @@ def _ingest_ua_prozorro(conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, 
         supplier = award.get("suppliers", [{}])[0] if award.get("suppliers") else {}
         sup_id = supplier.get("identifier", {})
         award_value = award.get("value", {})
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO awards
-            (source_id, tender_id, award_id, supplier_name,
-             supplier_id_scheme, supplier_id, currency, value_amount,
-             status, award_date, raw_json, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "ua_prozorro",
-                tender_id,
-                award_id,
-                supplier.get("name"),
-                sup_id.get("scheme"),
-                sup_id.get("id"),
-                award_value.get("currency"),
-                _safe_float(award_value.get("amount")),
-                award.get("status"),
-                _parse_date(award.get("date")),
-                json.dumps(award, ensure_ascii=False),
-                now,
-            ],
+        Award.objects.update_or_create(
+            source_id="ua_prozorro",
+            tender_id=tender_id,
+            award_id=award_id,
+            defaults={
+                "tender_ref": tender,
+                "supplier_name": supplier.get("name"),
+                "supplier_id_scheme": sup_id.get("scheme"),
+                "supplier_id": sup_id.get("id"),
+                "currency": award_value.get("currency") or "USD",
+                "value_amount_cents": _to_cents(award_value.get("amount")),
+                "status": award.get("status"),
+                "award_date": _parse_dt(award.get("date")),
+                "raw_json": award,
+            },
         )
 
-    # Bids
     for bid in t.get("bids", []):
         bid_id = bid.get("id", "")
         if not bid_id:
             continue
         bidder = bid.get("tenderers", [{}])[0] if bid.get("tenderers") else {}
         bid_value = bid.get("value", {})
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO bids
-            (source_id, tender_id, bid_id, bidder_name, bidder_id,
-             currency, value_amount, status, bid_date, raw_json, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "ua_prozorro",
-                tender_id,
-                bid_id,
-                bidder.get("name"),
-                bidder.get("identifier", {}).get("id"),
-                bid_value.get("currency"),
-                _safe_float(bid_value.get("amount")),
-                bid.get("status"),
-                _parse_date(bid.get("date")),
-                json.dumps(bid, ensure_ascii=False),
-                now,
-            ],
+        Bid.objects.update_or_create(
+            source_id="ua_prozorro",
+            tender_id=tender_id,
+            bid_id=bid_id,
+            defaults={
+                "tender_ref": tender,
+                "bidder_name": bidder.get("name"),
+                "bidder_id": bidder.get("identifier", {}).get("id"),
+                "currency": bid_value.get("currency") or "USD",
+                "value_amount_cents": _to_cents(bid_value.get("amount")),
+                "status": bid.get("status"),
+                "bid_date": _parse_dt(bid.get("date")),
+                "raw_json": bid,
+            },
         )
 
 
-def _ingest_uk_contracts_finder(
-    conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, now: str
-) -> None:
+def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
     """Map UK CF OCDS release → tenders + awards."""
     r = json.loads(artifact.payload)
     ocid = r.get("ocid", "")
@@ -172,7 +144,6 @@ def _ingest_uk_contracts_finder(
     value = tender.get("value", {})
     tp = tender.get("tenderPeriod", {})
 
-    # Buyer from parties
     buyer_name = None
     buyer_id = None
     buyer_id_scheme = None
@@ -184,74 +155,56 @@ def _ingest_uk_contracts_finder(
             buyer_id_scheme = pid.get("scheme")
             break
 
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO tenders
-        (source_id, tender_id, ocid, title, description, status,
-         procurement_method, procurement_method_details, award_criteria,
-         currency, value_amount, tender_start, tender_end,
-         buyer_name, buyer_id_scheme, buyer_id, buyer_country,
-         item_count, raw_json, fetched_at, source_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            "uk_contracts_finder",
-            tender_id,
-            ocid,
-            tender.get("title"),
-            tender.get("description"),
-            tender.get("status"),
-            tender.get("procurementMethod"),
-            tender.get("procurementMethodDetails"),
-            tender.get("awardCriteria"),
-            value.get("currency"),
-            _safe_float(value.get("amount")),
-            _parse_date(tp.get("startDate")),
-            _parse_date(tp.get("endDate")),
-            buyer_name,
-            buyer_id_scheme,
-            buyer_id,
-            "GB",
-            _safe_int(len(tender.get("items", []))),
-            json.dumps(r, ensure_ascii=False),
-            now,
-            artifact.source_url,
-        ],
+    tender_obj, _ = Tender.objects.update_or_create(
+        source_id="uk_contracts_finder",
+        tender_id=tender_id,
+        defaults={
+            "ocid": ocid,
+            "title": tender.get("title"),
+            "description": tender.get("description"),
+            "status": tender.get("status"),
+            "procurement_method": tender.get("procurementMethod"),
+            "procurement_method_details": tender.get("procurementMethodDetails"),
+            "award_criteria": tender.get("awardCriteria"),
+            "currency": value.get("currency") or "USD",
+            "value_amount_cents": _to_cents(value.get("amount")),
+            "tender_start": _parse_dt(tp.get("startDate")),
+            "tender_end": _parse_dt(tp.get("endDate")),
+            "buyer_name": buyer_name,
+            "buyer_id_scheme": buyer_id_scheme,
+            "buyer_id": buyer_id,
+            "buyer_country": "GB",
+            "item_count": len(tender.get("items", [])),
+            "raw_json": r,
+            "source_url": artifact.source_url,
+        },
     )
 
-    # Awards
     for award in r.get("awards", []):
         award_id = award.get("id", "")
         if not award_id:
             continue
         supplier = award.get("suppliers", [{}])[0] if award.get("suppliers") else {}
         award_value = award.get("value", {})
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO awards
-            (source_id, tender_id, award_id, supplier_name,
-             supplier_id_scheme, supplier_id, currency, value_amount,
-             status, award_date, raw_json, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "uk_contracts_finder",
-                tender_id,
-                award_id,
-                supplier.get("name"),
-                supplier.get("identifier", {}).get("scheme"),
-                supplier.get("identifier", {}).get("id"),
-                award_value.get("currency"),
-                _safe_float(award_value.get("amount")),
-                award.get("status"),
-                _parse_date(award.get("date")),
-                json.dumps(award, ensure_ascii=False),
-                now,
-            ],
+        Award.objects.update_or_create(
+            source_id="uk_contracts_finder",
+            tender_id=tender_id,
+            award_id=award_id,
+            defaults={
+                "tender_ref": tender_obj,
+                "supplier_name": supplier.get("name"),
+                "supplier_id_scheme": supplier.get("identifier", {}).get("scheme"),
+                "supplier_id": supplier.get("identifier", {}).get("id"),
+                "currency": award_value.get("currency") or "USD",
+                "value_amount_cents": _to_cents(award_value.get("amount")),
+                "status": award.get("status"),
+                "award_date": _parse_dt(award.get("date")),
+                "raw_json": award,
+            },
         )
 
 
-def _ingest_co_secop_ii(conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, now: str) -> None:
+def _ingest_co_secop_ii(artifact: RawArtifact) -> None:
     """Map Colombia SECOP II Socrata row → tenders + awards (no separate bids)."""
     row = json.loads(artifact.payload)
     tender_id = row.get("id_del_proceso", "")
@@ -260,66 +213,48 @@ def _ingest_co_secop_ii(conn: duckdb.DuckDBPyConnection, artifact: RawArtifact, 
 
     is_adjudicado = row.get("adjudicado", "No") == "Sí"
 
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO tenders
-        (source_id, tender_id, ocid, title, description, status,
-         procurement_method, procurement_method_details, award_criteria,
-         currency, value_amount, tender_start, tender_end,
-         buyer_name, buyer_id_scheme, buyer_id, buyer_country,
-         item_count, raw_json, fetched_at, source_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            "co_secop_ii",
-            tender_id,
-            tender_id,
-            row.get("nombre_del_procedimiento"),
-            row.get("descripci_n_del_procedimiento"),
-            row.get("estado_del_procedimiento"),
-            row.get("modalidad_de_contratacion"),
-            row.get("justificaci_n_modalidad_de"),
-            None,
-            "COP",
-            _safe_float(row.get("precio_base")),
-            _parse_date(row.get("fecha_de_publicacion_del")),
-            _parse_date(row.get("fecha_de_ultima_publicaci")),
-            row.get("entidad"),
-            "NIT",
-            row.get("nit_entidad"),
-            "CO",
-            _safe_int(row.get("numero_de_lotes")),
-            json.dumps(row, ensure_ascii=False),
-            now,
-            artifact.source_url,
-        ],
+    tender, _ = Tender.objects.update_or_create(
+        source_id="co_secop_ii",
+        tender_id=tender_id,
+        defaults={
+            "ocid": tender_id,
+            "title": row.get("nombre_del_procedimiento"),
+            "description": row.get("descripci_n_del_procedimiento"),
+            "status": row.get("estado_del_procedimiento"),
+            "procurement_method": row.get("modalidad_de_contratacion"),
+            "procurement_method_details": row.get("justificaci_n_modalidad_de"),
+            "award_criteria": None,
+            "currency": "COP",
+            "value_amount_cents": _to_cents(row.get("precio_base")),
+            "tender_start": _parse_dt(row.get("fecha_de_publicacion_del")),
+            "tender_end": _parse_dt(row.get("fecha_de_ultima_publicaci")),
+            "buyer_name": row.get("entidad"),
+            "buyer_id_scheme": "NIT",
+            "buyer_id": row.get("nit_entidad"),
+            "buyer_country": "CO",
+            "item_count": _safe_int(row.get("numero_de_lotes")),
+            "raw_json": row,
+            "source_url": artifact.source_url,
+        },
     )
 
-    # If adjudicated, create an award with the supplier info
     if is_adjudicado:
         award_id = f"{tender_id}-award"
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO awards
-            (source_id, tender_id, award_id, supplier_name,
-             supplier_id_scheme, supplier_id, currency, value_amount,
-             status, award_date, raw_json, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "co_secop_ii",
-                tender_id,
-                award_id,
-                row.get("nombre_del_proveedor"),
-                "NIT",
-                row.get("nit_del_proveedor_adjudicado"),
-                "COP",
-                _safe_float(row.get("valor_total_adjudicacion")),
-                "active" if is_adjudicado else "pending",
-                _parse_date(row.get("fecha_de_ultima_publicaci")),
-                json.dumps(row, ensure_ascii=False),
-                now,
-            ],
+        Award.objects.update_or_create(
+            source_id="co_secop_ii",
+            tender_id=tender_id,
+            award_id=award_id,
+            defaults={
+                "tender_ref": tender,
+                "supplier_name": row.get("nombre_del_proveedor"),
+                "supplier_id_scheme": "NIT",
+                "supplier_id": row.get("nit_del_proveedor_adjudicado"),
+                "currency": "COP",
+                "value_amount_cents": _to_cents(row.get("valor_total_adjudicacion")),
+                "status": "active",
+                "award_date": _parse_dt(row.get("fecha_de_ultima_publicaci")),
+                "raw_json": row,
+            },
         )
 
 
@@ -330,21 +265,16 @@ _INGESTERS = {
 }
 
 
-def ingest_artifacts(
-    conn: duckdb.DuckDBPyConnection,
-    source_id: str,
-    artifacts: list[RawArtifact],
-) -> int:
+def ingest_artifacts(source_id: str, artifacts: list[RawArtifact]) -> int:
     """Ingest a batch of raw artifacts from a given source. Returns count ingested."""
     ingester = _INGESTERS.get(source_id)
     if not ingester:
         raise ValueError(f"No ingester registered for source '{source_id}'")
 
-    now = datetime.now(UTC).isoformat()
     count = 0
     for artifact in artifacts:
         try:
-            ingester(conn, artifact, now)
+            ingester(artifact)
             count += 1
         except Exception:
             continue

@@ -1,30 +1,30 @@
-.PHONY: help sync up down demo test lint typecheck dashboard validate-registry
+.PHONY: help sync up down migrate test lint typecheck validate-registry experiment
 
 help:
 	@echo "sync             - uv sync (install deps + create .venv)"
-	@echo "up               - start postgres + minio + dagster (docker compose)"
+	@echo "up               - start postgres (docker compose)"
 	@echo "down             - stop services"
-	@echo "demo             - run the Phase-1 A1 walking skeleton end-to-end"
+	@echo "migrate          - run Django migrations"
 	@echo "test             - pytest (incl. guardrail suite)"
 	@echo "lint             - ruff check + format --check"
 	@echo "typecheck        - mypy"
 	@echo "validate-registry- load + validate sources/*.yml"
-	@echo "dashboard        - build the read-only tier-a dashboard"
+	@echo "experiment       - run the three-country kill experiment"
 
 sync:
 	uv sync --extra dev
 
 up:
-	docker compose up -d postgres minio dagster
+	docker compose up -d postgres
 
 down:
 	docker compose down
 
-demo:
-	uv run dagster asset materialize --select '*' -m uncorrupt.pipelines.definitions
+migrate:
+	DJANGO_SETTINGS_MODULE=config.settings.dev uv run python manage.py migrate
 
 test:
-	uv run pytest
+	DJANGO_SETTINGS_MODULE=config.settings.test uv run pytest
 
 lint:
 	uv run ruff check .
@@ -36,5 +36,6 @@ typecheck:
 validate-registry:
 	uv run uncorrupt validate-registry
 
-dashboard:
-	cd dashboard && npm install && npm run build
+experiment:
+	DJANGO_SETTINGS_MODULE=config.settings.dev uv run python scripts/kill_experiment.py --output experiments/flags_raw.json
+	DJANGO_SETTINGS_MODULE=config.settings.dev uv run python scripts/curate_flags.py --input experiments/flags_raw.json --top 10

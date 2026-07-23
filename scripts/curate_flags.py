@@ -47,8 +47,8 @@ def _score_flag(
     # Rarity bonus: underrepresented indicators/jurisdictions get boosted
     rarity_score = indicator_rarity.get(ind, 0) + jur_rarity.get(jur, 0)
 
-    # Value-at-stake: log-scale (1M → ~14, 100K → ~12, 1K → ~7)
-    value = flag.get("tender_value")
+    # Value-at-stake: log-scale (1M cents → ~8, 100K cents → ~5, 1K cents → ~3)
+    value = flag.get("tender_value_cents")
     value_score = math.log10(value) if value and value > 0 else 0
 
     # Explanation specificity: longer = more context for a journalist
@@ -179,14 +179,14 @@ def render_dossier(selected: list[dict], meta: dict) -> str:
 
         title = flag.get("tender_title") or "(no title)"
         buyer = flag.get("buyer_name") or "(unknown buyer)"
-        value = flag.get("tender_value")
+        value_cents = flag.get("tender_value_cents")
         currency = flag.get("tender_currency") or ""
         method = flag.get("procurement_method") or "—"
 
         lines.append(f"**Tender:** {title}")
         lines.append(f"**Buyer:** {buyer}")
-        if value:
-            lines.append(f"**Contract value:** {value:,.0f} {currency}")
+        if value_cents and value_cents > 0:
+            lines.append(f"**Contract value:** {value_cents / 100:,.2f} {currency}")
         else:
             lines.append("**Contract value:** not available")
         lines.append(f"**Procurement method:** {method}")

@@ -9,16 +9,16 @@ procedures. In Colombia, this maps to modalidad_de_contratacion containing
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from typing import Any
-
-import duckdb
 
 from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionStamp
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
 from uncorrupt.indicators.context import EvaluationContext
+from uncorrupt.staging.models import Tender
 
 # Direct award keywords by source
 DIRECT_KEYWORDS = {
@@ -40,48 +40,48 @@ class DirectAwardShare(Indicator):
         "gb": ValidationStatus.VALIDATED,
     }
 
-    def evaluate(self, records: Any, ctx: EvaluationContext) -> Iterator[Flag]:
-        conn: duckdb.DuckDBPyConnection = records
+    def evaluate(self, ctx: EvaluationContext) -> Iterator[Flag]:
         today = date.today()
         threshold = self.params["share_threshold"]
 
-        rows = conn.execute(
-            """
-            SELECT source_id, buyer_name,
-                   COUNT(*) as total_tenders,
-                   source_url, raw_json,
-                   procurement_method, procurement_method_details
-            FROM tenders
-            WHERE buyer_name IS NOT NULL
-            GROUP BY source_id, buyer_name, source_url, raw_json,
-                     procurement_method, procurement_method_details
-            """
-        ).fetchall()
-
-        # Aggregate per buyer
+        # Aggregate per buyer: total tenders and direct-award count
         buyers: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            source_id, buyer, total, url, raw, method, method_details = row
+        buyer_tenders = list(
+            Tender.objects.filter(buyer_name__isnull=False).values(
+                "source_id",
+                "buyer_name",
+                "procurement_method",
+                "procurement_method_details",
+                "source_url",
+                "raw_json",
+            )
+        )
+        # Group tender details per buyer for keyword checks + source_url
+        for t in buyer_tenders:
+            buyer = t["buyer_name"]
+            if buyer is None:
+                continue
             if buyer not in buyers:
                 buyers[buyer] = {
-                    "source_id": source_id,
+                    "source_id": t["source_id"],
                     "total": 0,
                     "direct": 0,
-                    "url": url,
-                    "raw": raw,
+                    "url": t["source_url"],
+                    "raw": t["raw_json"],
                 }
-            buyers[buyer]["total"] += total
-            method_str = f"{method or ''} {method_details or ''}".lower()
-            keywords = DIRECT_KEYWORDS.get(source_id, ["direct"])
+            buyers[buyer]["total"] += 1
+            method_str = (
+                f"{t['procurement_method'] or ''} {t['procurement_method_details'] or ''}"
+            ).lower()
+            keywords = DIRECT_KEYWORDS.get(t["source_id"], ["direct"])
             if any(kw in method_str for kw in keywords):
-                buyers[buyer]["direct"] += total
+                buyers[buyer]["direct"] += 1
 
         for buyer, data in buyers.items():
             if data["total"] < 3:
                 continue
             share = data["direct"] / data["total"] if data["total"] > 0 else 0
             if share >= threshold:
-                raw = data["raw"]
                 yield Flag(
                     indicator_id=self.id,
                     subject_ref=buyer,
@@ -97,7 +97,7 @@ class DirectAwardShare(Indicator):
                             source_url=data["url"],
                             retrieved_at=datetime.now(UTC),
                             content_hash=hashlib.sha256(
-                                raw.encode() if isinstance(raw, str) else raw
+                                json.dumps(data["raw"]).encode()
                             ).hexdigest(),
                             license="Open data",
                             redistribution=Redistribution.OPEN,

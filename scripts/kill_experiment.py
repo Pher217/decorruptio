@@ -1,6 +1,6 @@
 """Comparative kill experiment runner (ADR-002 D3).
 
-Fetches a sample from each of the three procurement APIs, ingests into DuckDB,
+Fetches a sample from each of the three procurement APIs, ingests into Django/PostgreSQL,
 runs all five indicators, and produces a flag export ready for blind journalist
 review. The goal: 10+ reproducible flags → 3 journalists blind-rate →
 ≥1 says "I'd chase this" or kill.
@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date
 
-import duckdb
+import django
 import httpx
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
+django.setup()
 
 from uncorrupt.connectors.base import RawArtifact
 from uncorrupt.indicators.catalog.i001_single_bidder import SingleBidder
@@ -27,7 +31,8 @@ from uncorrupt.indicators.catalog.i004_price_vs_estimate import PriceVsEstimate
 from uncorrupt.indicators.catalog.i005_direct_award_share import DirectAwardShare
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.loader import load_locale
-from uncorrupt.staging import create_schema, ingest_artifacts
+from uncorrupt.staging import ingest_artifacts
+from uncorrupt.staging.models import Tender
 
 UA_API = "https://api.openprocurement.org/api/2.5"
 UK_API = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
@@ -35,8 +40,8 @@ CO_API = "https://www.datos.gov.co/resource/p6dx-8zbt.json"
 
 
 def fetch_ua(n: int = 50) -> list[RawArtifact]:
-    """Fetch n tenders from ProZorro (2 API calls per tender: list + detail)."""
-    resp = httpx.get(f"{UA_API}/tenders", params={"limit": n}, timeout=30)
+    """Fetch n recent tenders from ProZorro (descending=1 gives newest first)."""
+    resp = httpx.get(f"{UA_API}/tenders", params={"limit": n, "descending": 1}, timeout=30)
     resp.raise_for_status()
     ids = [item["id"] for item in resp.json().get("data", [])]
     artifacts = []
@@ -86,72 +91,46 @@ def fetch_co(n: int = 50) -> list[RawArtifact]:
     ]
 
 
-def _lookup_tender_meta(conn: duckdb.DuckDBPyConnection, source_id: str, subject_ref: str) -> dict:
-    """Look up tender metadata for a flag's subject_ref.
-
-    For i003 the subject_ref is 'buyer→supplier' format, so we extract
-    the buyer name and look up the tender that way.
-    """
-    # Try direct tender_id match first
-    row = conn.execute(
-        """
-        SELECT title, value_amount, currency, buyer_name, procurement_method
-        FROM tenders WHERE tender_id = ?
-        """,
-        [subject_ref],
-    ).fetchone()
-
-    if row:
+def _lookup_tender_meta(source_id: str, subject_ref: str) -> dict:
+    """Look up tender metadata for a flag's subject_ref using Django ORM."""
+    try:
+        tender = Tender.objects.get(tender_id=subject_ref)
+    except Tender.DoesNotExist:
+        pass
+    else:
         return {
-            "title": row[0],
-            "value_amount": row[1],
-            "currency": row[2],
-            "buyer_name": row[3],
-            "procurement_method": row[4],
+            "title": tender.title,
+            "value_amount_cents": tender.value_amount_cents,
+            "currency": tender.currency,
+            "buyer_name": tender.buyer_name,
+            "procurement_method": tender.procurement_method,
         }
 
-    # For i003: subject_ref is 'buyer→supplier' — try to find by award
     if "→" in subject_ref:
         buyer = subject_ref.split("→")[0].strip()
-        row = conn.execute(
-            """
-            SELECT t.title, t.value_amount, t.currency, t.buyer_name,
-                   t.procurement_method
-            FROM tenders t
-            JOIN awards a ON t.source_id = a.source_id
-                         AND t.tender_id = a.tender_id
-            WHERE t.buyer_name LIKE ?
-            LIMIT 1
-            """,
-            [f"%{buyer}%"],
-        ).fetchone()
-        if row:
+        tender = Tender.objects.filter(buyer_name__icontains=buyer).first()
+        if tender:
             return {
-                "title": row[0],
-                "value_amount": row[1],
-                "currency": row[2],
-                "buyer_name": row[3],
-                "procurement_method": row[4],
+                "title": tender.title,
+                "value_amount_cents": tender.value_amount_cents,
+                "currency": tender.currency,
+                "buyer_name": tender.buyer_name,
+                "procurement_method": tender.procurement_method,
             }
 
-    # For i004: subject_ref is 'tender_id:award_id'
     if ":" in subject_ref:
         tender_id = subject_ref.split(":")[0]
-        row = conn.execute(
-            """
-            SELECT title, value_amount, currency, buyer_name,
-                   procurement_method
-            FROM tenders WHERE tender_id = ?
-            """,
-            [tender_id],
-        ).fetchone()
-        if row:
+        try:
+            tender = Tender.objects.get(tender_id=tender_id)
+        except Tender.DoesNotExist:
+            pass
+        else:
             return {
-                "title": row[0],
-                "value_amount": row[1],
-                "currency": row[2],
-                "buyer_name": row[3],
-                "procurement_method": row[4],
+                "title": tender.title,
+                "value_amount_cents": tender.value_amount_cents,
+                "currency": tender.currency,
+                "buyer_name": tender.buyer_name,
+                "procurement_method": tender.procurement_method,
             }
 
     return {}
@@ -159,8 +138,12 @@ def _lookup_tender_meta(conn: duckdb.DuckDBPyConnection, source_id: str, subject
 
 def run_experiment(sample_size: int = 50) -> dict:
     """Run the full kill experiment and return results as a dict."""
-    conn = duckdb.connect(":memory:")
-    create_schema(conn)
+    # Clear staging tables for a fresh run
+    from uncorrupt.staging.models import Award, Bid
+
+    Tender.objects.all().delete()
+    Award.objects.all().delete()
+    Bid.objects.all().delete()
 
     print(f"Fetching {sample_size} records from each source...")
     sources = [
@@ -173,12 +156,11 @@ def run_experiment(sample_size: int = 50) -> dict:
         print(f"  {source_id}...", end=" ", flush=True)
         try:
             artifacts = fetcher(sample_size)
-            count = ingest_artifacts(conn, source_id, artifacts)
+            count = ingest_artifacts(source_id, artifacts)
             print(f"ingested {count}/{len(artifacts)}")
         except Exception as e:
             print(f"ERROR: {e}")
 
-    # Run all indicators for each locale, filtering data by source
     source_by_locale = {"ua": "ua_prozorro", "gb": "uk_contracts_finder", "co": "co_secop_ii"}
     indicators = [
         SingleBidder(),
@@ -193,29 +175,15 @@ def run_experiment(sample_size: int = 50) -> dict:
         locale = load_locale(locale_code)
         ctx = EvaluationContext(locale=locale)
 
-        # Swap in filtered data for this locale's source
-        conn.execute("ALTER TABLE tenders RENAME TO _all_tenders")
-        conn.execute("ALTER TABLE awards RENAME TO _all_awards")
-        conn.execute("ALTER TABLE bids RENAME TO _all_bids")
-        conn.execute(
-            f"CREATE TABLE tenders AS SELECT * FROM _all_tenders WHERE source_id = '{source_id}'"
-        )
-        conn.execute(
-            f"CREATE TABLE awards AS SELECT * FROM _all_awards WHERE source_id = '{source_id}'"
-        )
-        conn.execute(
-            f"CREATE TABLE bids AS SELECT * FROM _all_bids WHERE source_id = '{source_id}'"
-        )
-
         print(f"\nRunning indicators for {locale_code} ({source_id})...")
         for ind in indicators:
             if not ind.runs_in(locale_code):
                 continue
-            flags = list(ind.evaluate(conn, ctx))
+            flags = list(ind.evaluate(ctx))
             if flags:
                 print(f"  {ind.id}: {len(flags)} flags")
                 for f in flags:
-                    meta = _lookup_tender_meta(conn, source_id, f.subject_ref)
+                    meta = _lookup_tender_meta(source_id, f.subject_ref)
                     all_flags.append(
                         {
                             "indicator_id": f.indicator_id,
@@ -237,7 +205,7 @@ def run_experiment(sample_size: int = 50) -> dict:
                                 "indicator_version": f.stamp.indicator_version,
                             },
                             "tender_title": meta.get("title"),
-                            "tender_value": meta.get("value_amount"),
+                            "tender_value_cents": meta.get("value_amount_cents"),
                             "tender_currency": meta.get("currency"),
                             "buyer_name": meta.get("buyer_name"),
                             "procurement_method": meta.get("procurement_method"),
@@ -246,15 +214,6 @@ def run_experiment(sample_size: int = 50) -> dict:
             else:
                 print(f"  {ind.id}: 0 flags")
 
-        # Restore full tables
-        conn.execute("DROP TABLE tenders")
-        conn.execute("DROP TABLE awards")
-        conn.execute("DROP TABLE bids")
-        conn.execute("ALTER TABLE _all_tenders RENAME TO tenders")
-        conn.execute("ALTER TABLE _all_awards RENAME TO awards")
-        conn.execute("ALTER TABLE _all_bids RENAME TO bids")
-
-    # Summary
     by_indicator: dict[str, int] = {}
     by_jurisdiction: dict[str, int] = {}
     for flag in all_flags:
@@ -277,7 +236,6 @@ def run_experiment(sample_size: int = 50) -> dict:
         print(f"\n✅ PASS: {len(all_flags)} flags ≥ 10 threshold for blind review.")
     else:
         print(f"\n⚠️  WARNING: Only {len(all_flags)} flags < 10 threshold.")
-        print("   Consider increasing sample size or adjusting thresholds.")
 
     return {
         "experiment_date": date.today().isoformat(),

@@ -6,17 +6,19 @@ In Colombia SECOP II, this maps to proveedores_que_manifestaron == 1.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from typing import Any
 
-import duckdb
+from django.db.models import Count
 
 from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionStamp
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
 from uncorrupt.indicators.context import EvaluationContext
+from uncorrupt.staging.models import Tender
 
 
 class SingleBidder(Indicator):
@@ -31,44 +33,31 @@ class SingleBidder(Indicator):
         "gb": ValidationStatus.VALIDATED,
     }
 
-    def evaluate(self, records: Any, ctx: EvaluationContext) -> Iterator[Flag]:
-        """records is a duckdb connection with staging tables populated."""
-        conn: duckdb.DuckDBPyConnection = records
+    def evaluate(self, ctx: EvaluationContext) -> Iterator[Flag]:
         today = date.today()
 
-        # For sources with a bids table (ProZorro)
-        rows = conn.execute(
-            """
-            SELECT t.source_id, t.tender_id, t.title, t.buyer_name,
-                   t.source_url, t.raw_json,
-                   COUNT(b.bid_id) as bid_count
-            FROM tenders t
-            JOIN awards a ON t.source_id = a.source_id AND t.tender_id = a.tender_id
-            LEFT JOIN bids b ON t.source_id = b.source_id AND t.tender_id = b.tender_id
-            WHERE t.source_id = 'ua_prozorro'
-            GROUP BY t.source_id, t.tender_id, t.title, t.buyer_name, t.source_url, t.raw_json
-            HAVING bid_count = 1
-            """
-        ).fetchall()
-
-        for row in rows:
-            source_id, tender_id, title, buyer, url, raw, bid_count = row
-            raw_data = json.loads(raw) if isinstance(raw, str) else raw
+        # Ukraine ProZorro: tenders with awards and exactly 1 bid
+        ua_tenders = (
+            Tender.objects.filter(source_id="ua_prozorro", awards__isnull=False)
+            .annotate(bid_count=Count("bids"))
+            .filter(bid_count=1)
+        )
+        for t in ua_tenders:
             yield Flag(
                 indicator_id=self.id,
-                subject_ref=tender_id,
+                subject_ref=t.tender_id,
                 as_of=today,
                 explanation=(
-                    f"Tender '{title or tender_id}' awarded with only {bid_count} bid. "
-                    f"Buyer: {buyer}. Single-bidder awards are the strongest "
+                    f"Tender '{t.title or t.tender_id}' awarded with only 1 bid. "
+                    f"Buyer: {t.buyer_name}. Single-bidder awards are the strongest "
                     "predictor of corruption in procurement (World Bank)."
                 ),
                 evidence=[
                     ProvenanceRecord(
-                        source_id=source_id,
-                        source_url=url,
-                        retrieved_at=__import__("datetime").datetime.now(UTC),
-                        content_hash=hashlib_sha256(raw),
+                        source_id=t.source_id,
+                        source_url=t.source_url,
+                        retrieved_at=datetime.now(UTC),
+                        content_hash=hashlib.sha256(json.dumps(t.raw_json).encode()).hexdigest(),
                         license="Open data",
                         redistribution=Redistribution.OPEN,
                         jurisdiction="UA",
@@ -85,37 +74,28 @@ class SingleBidder(Indicator):
                 ),
             )
 
-        # For Colombia SECOP II: check proveedores_que_manifestaron in raw_json
-        co_rows = conn.execute(
-            """
-            SELECT t.source_id, t.tender_id, t.title, t.buyer_name,
-                   t.source_url, t.raw_json
-            FROM tenders t
-            JOIN awards a ON t.source_id = a.source_id AND t.tender_id = a.tender_id
-            WHERE t.source_id = 'co_secop_ii'
-            """
-        ).fetchall()
-
-        for row in co_rows:
-            source_id, tender_id, title, buyer, url, raw = row
-            raw_data = json.loads(raw) if isinstance(raw, str) else raw
-            manifest_count = _safe_int(raw_data.get("proveedores_que_manifestaron", 0))
+        # Colombia SECOP II: check proveedores_que_manifestaron in raw_json
+        co_tenders = Tender.objects.filter(source_id="co_secop_ii", awards__isnull=False)
+        for t in co_tenders:  # type: ignore[assignment]
+            manifest_count = _safe_int(t.raw_json.get("proveedores_que_manifestaron", 0))
             if manifest_count == 1:
                 yield Flag(
                     indicator_id=self.id,
-                    subject_ref=tender_id,
+                    subject_ref=t.tender_id,
                     as_of=today,
                     explanation=(
-                        f"Process '{title or tender_id}' awarded with only 1 supplier "
-                        f"manifesting interest. Buyer: {buyer}. "
-                        f"Modalidad: {raw_data.get('modalidad_de_contratacion', '?')}."
+                        f"Process '{t.title or t.tender_id}' awarded with only 1 supplier "
+                        f"manifesting interest. Buyer: {t.buyer_name}. "
+                        f"Modalidad: {t.raw_json.get('modalidad_de_contratacion', '?')}."
                     ),
                     evidence=[
                         ProvenanceRecord(
-                            source_id=source_id,
-                            source_url=url,
-                            retrieved_at=__import__("datetime").datetime.now(UTC),
-                            content_hash=hashlib_sha256(raw),
+                            source_id=t.source_id,
+                            source_url=t.source_url,
+                            retrieved_at=datetime.now(UTC),
+                            content_hash=hashlib.sha256(
+                                json.dumps(t.raw_json).encode()
+                            ).hexdigest(),
                             license="Open data",
                             redistribution=Redistribution.OPEN,
                             jurisdiction="CO",
@@ -132,17 +112,47 @@ class SingleBidder(Indicator):
                     ),
                 )
 
+        # UK Contracts Finder: no bids table — flag if only 1 award
+        uk_tenders = (
+            Tender.objects.filter(source_id="uk_contracts_finder")
+            .annotate(award_count=Count("awards"))
+            .filter(award_count=1)
+        )
+        for t in uk_tenders:  # type: ignore[assignment]
+            yield Flag(
+                indicator_id=self.id,
+                subject_ref=t.tender_id,
+                as_of=today,
+                explanation=(
+                    f"Tender '{t.title or t.tender_id}' awarded with only 1 award. "
+                    f"Buyer: {t.buyer_name}. Single-award contracts may indicate "
+                    "lack of competition (UK Contracts Finder has no bid-level data)."
+                ),
+                evidence=[
+                    ProvenanceRecord(
+                        source_id=t.source_id,
+                        source_url=t.source_url,
+                        retrieved_at=datetime.now(UTC),
+                        content_hash=hashlib.sha256(json.dumps(t.raw_json).encode()).hexdigest(),
+                        license="Open data",
+                        redistribution=Redistribution.OPEN,
+                        jurisdiction="GB",
+                        data_class=DataClass.A1,
+                        tier=Tier.A,
+                        connector="uk_contracts_finder",
+                        connector_version="0.1",
+                    )
+                ],
+                stamp=VersionStamp(
+                    data_snapshot=today.isoformat(),
+                    code_version="0.0.1",
+                    indicator_version=self.id,
+                ),
+            )
+
 
 def _safe_int(v: Any) -> int:
     try:
         return int(float(v))
     except (ValueError, TypeError):
         return 0
-
-
-def hashlib_sha256(data: str | bytes) -> str:
-    import hashlib
-
-    if isinstance(data, str):
-        data = data.encode()
-    return hashlib.sha256(data).hexdigest()

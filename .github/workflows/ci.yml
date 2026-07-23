@@ -5,6 +5,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: decorruptio
+          POSTGRES_PASSWORD: decorruptio
+          POSTGRES_DB: decorruptio
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://decorruptio:decorruptio@localhost:5432/decorruptio
+      DJANGO_SETTINGS_MODULE: config.settings.test
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -15,5 +31,7 @@ jobs:
         run: uv run mypy
       - name: validate source register
         run: uv run uncorrupt validate-registry
+      - name: migrate
+        run: uv run python manage.py migrate --settings=config.settings.test
       - name: test (incl. guardrail suite)
         run: uv run pytest

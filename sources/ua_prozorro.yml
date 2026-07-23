@@ -1,0 +1,19 @@
+source_id: ua_prozorro
+name: Ukraine ProZorro (Open Procurement API)
+jurisdictions: [UA]
+data_class: A1
+tier: a
+license: "Open data — freely usable and distributable including commercially, with attribution to ProZorro"
+redistribution: open
+legal_basis: "Ukrainian Law 'On Access to Public Information' (2011); non-personal procurement notices"
+access_method: bulk-api
+robots_tos_reviewed: 2026-07-23
+freshness_sla_days: 1
+dpia_cleared: false   # not needed: A1, non-personal entity-level data
+notes: >-
+  API at https://api.openprocurement.org/api/2.5/tenders — OCDS-like JSON with
+  tenderPeriod, procuringEntity, bids, awards, value. Near-OCDS but not a
+  release package; needs a light mapping to canonical OCDS. Pagination via
+  next_page.offset cursor. Data is real-time; includes all procurement methods
+  (open, limited, negotiation, reporting, defense). Built post-Maidan as an
+  anti-corruption tool by Ukrainian civil society (TI Ukraine, DOUJA).

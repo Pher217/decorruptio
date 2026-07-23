@@ -1,0 +1,20 @@
+source_id: co_secop_ii
+name: Colombia SECOP II (Sistema Electrónico de Contratación Pública)
+jurisdictions: [CO]
+data_class: A1
+tier: a
+license: "Open data — Colombia's Law 1712 de 2014 (Transparencia y Acceso a la Información Pública)"
+redistribution: open
+legal_basis: "Public-sector open data; non-personal procurement process data"
+access_method: bulk-api
+robots_tos_reviewed: 2026-07-23
+freshness_sla_days: 7
+dpia_cleared: false   # not needed: A1, non-personal entity-level data
+notes: >-
+  Socrata API at https://www.datos.gov.co/resource/p6dx-8zbt.json (Procesos de
+  Contratación). NOT OCDS-native — fields like modalidad_de_contratacion,
+  proveedores, valor_total_adjudicacion, id_del_proceso, nit_entidad need
+  mapping to OCDS. Rich corruption-relevant fields: direct awards, single-bidder
+  counts (proveedores_que_manifestaron), price vs base (precio_base vs
+  valor_total_adjudicacion). High enforcement gap — Colombia consistently
+  scores poorly on global corruption indices.

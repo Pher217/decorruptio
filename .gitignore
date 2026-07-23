@@ -12,6 +12,8 @@ __pycache__/
 data/
 dagster_home/
 *.duckdb
+# Experiment outputs (regenerated, not versioned)
+experiments/
 # Node
 node_modules/
 dashboard/dist/

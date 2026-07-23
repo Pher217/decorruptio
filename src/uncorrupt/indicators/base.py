@@ -47,5 +47,5 @@ class Indicator(ABC):
         return self.validation.get(locale_code) is ValidationStatus.VALIDATED
 
     @abstractmethod
-    def evaluate(self, records: Any, ctx: EvaluationContext) -> Iterator[Flag]:
-        """Yield Flags. `records` is an OCDS frame (compiled releases)."""
+    def evaluate(self, ctx: EvaluationContext) -> Iterator[Flag]:
+        """Yield Flags. Queries Django staging models directly."""

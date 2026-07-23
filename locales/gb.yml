@@ -1,0 +1,8 @@
+code: gb
+name_normalization_profile: passthrough   # Phase 1: passthrough until per-locale golden set exists
+currency: GBP
+procedure_metadata:
+  min_bid_days_open: 30       # UK PCR 2015 minimum for open procedures
+  min_bid_days_restricted: 25
+  direct_award_threshold: 25000   # GBP — below this, direct awards are common (threshold varies by framework)
+notes: "UK/Contracts Finder profile. Baseline in the comparative experiment — lower enforcement gap expected."

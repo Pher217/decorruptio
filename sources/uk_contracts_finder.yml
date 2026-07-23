@@ -1,0 +1,20 @@
+source_id: uk_contracts_finder
+name: UK Contracts Finder
+jurisdictions: [GB]
+data_class: A1
+tier: a
+license: "Open Government Licence v3.0"
+redistribution: open
+legal_basis: "Public-sector open data; non-personal procurement notices (UK Public Contracts Regulations 2015)"
+access_method: bulk-api
+robots_tos_reviewed: 2026-07-23
+freshness_sla_days: 1
+dpia_cleared: false   # not needed: A1, non-personal entity-level data
+notes: >-
+  OCDS Search API at
+  https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search
+  — returns native OCDS 1.1 release packages. Cursor-based pagination.
+  OGL v3.0 licence. Includes EU profile extensions + budget breakdown.
+  Serves as the low-enforcement-gap baseline in the three-country
+  comparative kill experiment (ADR-002 D3). Lower residual signal expected
+  vs Ukraine/Colombia due to stronger UK procurement oversight (NCA, CCS).

@@ -1,0 +1,8 @@
+code: co
+name_normalization_profile: passthrough   # Phase 1: passthrough until per-locale golden set exists
+currency: COP
+procedure_metadata:
+  min_bid_days_open: 10       # Colombian public procurement minimum (Ley 80 de 1993)
+  min_bid_days_restricted: 5
+  direct_award_threshold: 0   # Contratación directa has no value threshold in Colombia — it's a modality
+notes: "Colombia/SECOP II profile. Modalidad de contratación drives the analysis: 'Contratación directa' = direct award. Thresholds illustrative."

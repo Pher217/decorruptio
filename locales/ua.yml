@@ -1,0 +1,8 @@
+code: ua
+name_normalization_profile: passthrough   # Phase 1: passthrough until per-locale golden set exists
+currency: UAH
+procedure_metadata:
+  min_bid_days_open: 30       # above-threshold open procedure minimum (Ukrainian Law on Public Procurement)
+  min_bid_days_restricted: 25
+  direct_award_threshold: 50000   # UAH — negotiation procedure threshold (small value)
+notes: "Ukraine/ProZorro profile. Thresholds from Ukrainian Public Procurement Law; refine before enabling indicators."

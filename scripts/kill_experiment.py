@@ -86,6 +86,77 @@ def fetch_co(n: int = 50) -> list[RawArtifact]:
     ]
 
 
+def _lookup_tender_meta(conn: duckdb.DuckDBPyConnection, source_id: str, subject_ref: str) -> dict:
+    """Look up tender metadata for a flag's subject_ref.
+
+    For i003 the subject_ref is 'buyer→supplier' format, so we extract
+    the buyer name and look up the tender that way.
+    """
+    # Try direct tender_id match first
+    row = conn.execute(
+        """
+        SELECT title, value_amount, currency, buyer_name, procurement_method
+        FROM tenders WHERE tender_id = ?
+        """,
+        [subject_ref],
+    ).fetchone()
+
+    if row:
+        return {
+            "title": row[0],
+            "value_amount": row[1],
+            "currency": row[2],
+            "buyer_name": row[3],
+            "procurement_method": row[4],
+        }
+
+    # For i003: subject_ref is 'buyer→supplier' — try to find by award
+    if "→" in subject_ref:
+        buyer = subject_ref.split("→")[0].strip()
+        row = conn.execute(
+            """
+            SELECT t.title, t.value_amount, t.currency, t.buyer_name,
+                   t.procurement_method
+            FROM tenders t
+            JOIN awards a ON t.source_id = a.source_id
+                         AND t.tender_id = a.tender_id
+            WHERE t.buyer_name LIKE ?
+            LIMIT 1
+            """,
+            [f"%{buyer}%"],
+        ).fetchone()
+        if row:
+            return {
+                "title": row[0],
+                "value_amount": row[1],
+                "currency": row[2],
+                "buyer_name": row[3],
+                "procurement_method": row[4],
+            }
+
+    # For i004: subject_ref is 'tender_id:award_id'
+    if ":" in subject_ref:
+        tender_id = subject_ref.split(":")[0]
+        row = conn.execute(
+            """
+            SELECT title, value_amount, currency, buyer_name,
+                   procurement_method
+            FROM tenders WHERE tender_id = ?
+            """,
+            [tender_id],
+        ).fetchone()
+        if row:
+            return {
+                "title": row[0],
+                "value_amount": row[1],
+                "currency": row[2],
+                "buyer_name": row[3],
+                "procurement_method": row[4],
+            }
+
+    return {}
+
+
 def run_experiment(sample_size: int = 50) -> dict:
     """Run the full kill experiment and return results as a dict."""
     conn = duckdb.connect(":memory:")
@@ -144,6 +215,7 @@ def run_experiment(sample_size: int = 50) -> dict:
             if flags:
                 print(f"  {ind.id}: {len(flags)} flags")
                 for f in flags:
+                    meta = _lookup_tender_meta(conn, source_id, f.subject_ref)
                     all_flags.append(
                         {
                             "indicator_id": f.indicator_id,
@@ -164,6 +236,11 @@ def run_experiment(sample_size: int = 50) -> dict:
                                 "code_version": f.stamp.code_version,
                                 "indicator_version": f.stamp.indicator_version,
                             },
+                            "tender_title": meta.get("title"),
+                            "tender_value": meta.get("value_amount"),
+                            "tender_currency": meta.get("currency"),
+                            "buyer_name": meta.get("buyer_name"),
+                            "procurement_method": meta.get("procurement_method"),
                         }
                     )
             else:

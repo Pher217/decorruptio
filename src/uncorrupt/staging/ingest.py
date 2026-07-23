@@ -211,7 +211,7 @@ def _ingest_co_secop_ii(artifact: RawArtifact) -> None:
     if not tender_id:
         return
 
-    is_adjudicado = row.get("adjudicado", "No") == "Sí"
+    is_adjudicado = row.get("adjudicado", "No") in ("Sí", "Si", "si", "sí")
 
     tender, _ = Tender.objects.update_or_create(
         source_id="co_secop_ii",
@@ -239,7 +239,7 @@ def _ingest_co_secop_ii(artifact: RawArtifact) -> None:
     )
 
     if is_adjudicado:
-        award_id = f"{tender_id}-award"
+        award_id = row.get("id_adjudicacion") or f"{tender_id}-award"
         Award.objects.update_or_create(
             source_id="co_secop_ii",
             tender_id=tender_id,
@@ -252,7 +252,7 @@ def _ingest_co_secop_ii(artifact: RawArtifact) -> None:
                 "currency": "COP",
                 "value_amount_cents": _to_cents(row.get("valor_total_adjudicacion")),
                 "status": "active",
-                "award_date": _parse_dt(row.get("fecha_de_ultima_publicaci")),
+                "award_date": _parse_dt(row.get("fecha_adjudicacion")),
                 "raw_json": row,
             },
         )

@@ -26,7 +26,7 @@ INDICATOR_LABELS: dict[str, str] = {
     "i001_single_bidder": "Single-bidder award",
     "i002_short_bid_window": "Short bid window",
     "i003_repeat_winner_share": "Repeat-winner concentration",
-    "i004_price_vs_estimate": "Price above estimate",
+    "i004_price_vs_estimate": "Price deviation from estimate",
     "i005_direct_award_share": "Direct award share",
 }
 
@@ -36,11 +36,17 @@ JURISDICTION_LABELS: dict[str, str] = {
     "CO": "Colombia (SECOP II)",
 }
 
+# i002 is excluded from curation — ADR-003 identified it as weak/noise
+EXCLUDED_INDICATORS = {"i002_short_bid_window"}
+
 
 def _score_flag(
-    flag: dict, indicator_rarity: dict[str, float], jur_rarity: dict[str, float]
+    flag: dict,
+    indicator_rarity: dict[str, float],
+    jur_rarity: dict[str, float],
+    multi_flag_subjects: set[str],
 ) -> float:
-    """Score a flag for curation. Higher = more newsworthy."""
+    """Score a flag for curation. Higher = more credible/newsworthy."""
     jur = flag["evidence"][0]["jurisdiction"] if flag["evidence"] else "?"
     ind = flag["indicator_id"]
 
@@ -54,30 +60,57 @@ def _score_flag(
     # Explanation specificity: longer = more context for a journalist
     expl_score = min(len(flag.get("explanation", "")) / 200.0, 2.0)
 
+    # Multi-flag convergence bonus: tender flagged by multiple indicators
+    convergence_bonus = 2.0 if flag["subject_ref"] in multi_flag_subjects else 0.0
+
+    # Source URL present (credibility: evidence must be traceable)
+    has_url = 1.0 if flag["evidence"] and flag["evidence"][0].get("source_url") else -1.0
+
     # Weighted sum
-    return rarity_score * 3.0 + value_score * 2.0 + expl_score * 1.0
+    return (
+        rarity_score * 3.0
+        + value_score * 2.0
+        + expl_score * 1.0
+        + convergence_bonus * 2.0
+        + has_url * 1.0
+    )
 
 
 def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
-    """Select the top-N flags maximizing indicator + jurisdiction diversity.
+    """Select the top-N credible flags maximizing indicator + jurisdiction diversity.
 
+    Excludes weak indicators (i002 short bid window per ADR-003).
     Uses a quota-based approach:
     - At least 1 flag per fired indicator (if enough flags exist)
     - At least 1 flag per jurisdiction (if enough flags exist)
     - No single indicator gets more than 40% of the slots
     - No single jurisdiction gets more than 50% of the slots
-    - Remaining slots filled by value-at-stake
+    - Remaining slots filled by credibility score
     """
+    # Exclude weak indicators
+    flags = [f for f in flags if f["indicator_id"] not in EXCLUDED_INDICATORS]
+
+    # Build multi-flag subject set (convergence signal)
+    by_subject: dict[str, set[str]] = {}
+    for f in flags:
+        key = f["subject_ref"]
+        if key not in by_subject:
+            by_subject[key] = set()
+        by_subject[key].add(f["indicator_id"])
+    multi_flag_subjects = {k for k, v in by_subject.items() if len(v) >= 2}
+
     ind_counts = Counter(f["indicator_id"] for f in flags)
-    jur_counts = Counter(f["evidence"][0]["jurisdiction"] if f["evidence"] else "?" for f in flags)
+    jur_counts = Counter(
+        f["evidence"][0]["jurisdiction"] if f["evidence"] else "?" for f in flags
+    )
     total = len(flags)
 
-    indicator_rarity = {k: 1.0 - (v / total) for k, v in ind_counts.items()}
-    jur_rarity = {k: 1.0 - (v / total) for k, v in jur_counts.items()}
+    indicator_rarity = {k: 1.0 - (v / total) for k, v in ind_counts.items()} if total else {}
+    jur_rarity = {k: 1.0 - (v / total) for k, v in jur_counts.items()} if total else {}
 
     scored = []
     for flag in flags:
-        score = _score_flag(flag, indicator_rarity, jur_rarity)
+        score = _score_flag(flag, indicator_rarity, jur_rarity, multi_flag_subjects)
         scored.append((score, flag))
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -121,7 +154,7 @@ def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
                 continue
             flag_copy = dict(flag)
             flag_copy["_score"] = round(score, 3)
-            flag_copy["_selection_reason"] = "High value-at-stake"
+            flag_copy["_selection_reason"] = "High credibility score"
             selected.append(flag_copy)
             ind_quota[ind] += 1
             jur_quota[jur] += 1
@@ -150,8 +183,15 @@ def render_dossier(selected: list[dict], meta: dict) -> str:
     lines.append("")
     lines.append(f"**Date:** {meta['experiment_date']}")
     lines.append(
+        f"**Snapshot:** {meta.get('snapshot_date', 'n/a')} "
+        f"(frozen data — reproducible)"
+    )
+    lines.append(
         f"**Sample:** {meta['sample_size_per_source']} records per source "
         f"({meta['total_flags']} raw flags → top {len(selected)} curated)"
+    )
+    lines.append(
+        "\n**Excluded:** i002_short_bid_window (weak indicator, per ADR-003)"
     )
     lines.append("")
     lines.append("## How to review")
@@ -265,12 +305,15 @@ def main() -> None:
     # Write curated JSON
     output = {
         "experiment_date": data["experiment_date"],
+        "snapshot_date": data.get("snapshot_date", "n/a"),
+        "snapshot_dir": data.get("snapshot_dir", "n/a"),
         "sample_size_per_source": data["sample_size_per_source"],
         "total_raw_flags": data["total_flags"],
         "curated_count": len(selected),
         "selection_criteria": (
-            "Greedy diversity maximization: indicator diversity × "
-            "jurisdiction diversity × value-at-stake × explanation specificity"
+            "Credibility-first: excluded weak indicators (i002 per ADR-003), "
+            "prioritized multi-flag convergence + value-at-stake + source URL "
+            "traceability. Greedy diversity: indicator × jurisdiction."
         ),
         "flags": selected,
     }
@@ -282,6 +325,7 @@ def main() -> None:
     # Write blind-review dossier
     meta = {
         "experiment_date": data["experiment_date"],
+        "snapshot_date": data.get("snapshot_date", "n/a"),
         "sample_size_per_source": data["sample_size_per_source"],
         "total_flags": data["total_flags"],
     }

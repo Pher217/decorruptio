@@ -63,6 +63,9 @@ class RepeatWinnerShare(Indicator):
             buyer_totals[key] = buyer_totals.get(key, 0) + row["award_count"]
             rows.append(dict(row))
 
+        # Denominator: buyer-supplier pairs evaluated (after placeholder exclusion)
+        self.units_evaluated = len(rows)
+
         # Only flag buyer-supplier pairs where the buyer has >= 4 total awards.
         # With fewer data points (e.g., 1-of-2 = 50%), the share is the statistical
         # floor, not a signal. Require >= 4 for the concentration to be meaningful.

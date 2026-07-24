@@ -31,6 +31,9 @@ import httpx
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
 django.setup()
 
+# Base-rate suppression threshold — shared with curate_flags.py (single source of truth)
+from scripts.curate_flags import BASE_RATE_THRESHOLD
+
 from uncorrupt.connectors.base import RawArtifact
 from uncorrupt.indicators.catalog.i001_single_bidder import SingleBidder
 from uncorrupt.indicators.catalog.i002_short_bid_window import ShortBidWindow
@@ -282,6 +285,7 @@ def run_experiment(
     ]
 
     all_flags: list[dict[str, Any]] = []
+    base_rate_table: list[dict[str, Any]] = []
     for locale_code, source_id in source_by_locale.items():
         locale = load_locale(locale_code)
         ctx = EvaluationContext(locale=locale, source_id=source_id)
@@ -291,16 +295,36 @@ def run_experiment(
             if not ind.runs_in(locale_code):
                 continue
             flags = list(ind.evaluate(ctx))
+            units = ind.units_evaluated
+            base_rate = len(flags) / units if units > 0 else 0.0
+            discriminating = base_rate <= BASE_RATE_THRESHOLD
+
+            base_rate_table.append(
+                {
+                    "source_id": source_id,
+                    "indicator_id": ind.id,
+                    "flags_emitted": len(flags),
+                    "units_evaluated": units,
+                    "base_rate": round(base_rate, 4),
+                    "discriminating": discriminating,
+                }
+            )
+
             if flags:
-                print(f"  {ind.id}: {len(flags)} flags")
+                rate_str = f"{base_rate:.0%}" if units > 0 else "N/A"
+                disc_str = "yes" if discriminating else "NO (>20%)"
+                print(f"  {ind.id}: {len(flags)} flags ({rate_str} base rate, {disc_str})")
                 for f in flags:
                     meta = _lookup_tender_meta(source_id, f.subject_ref)
+                    explanation = f.explanation
+                    if not discriminating and units > 0:
+                        explanation += f" [WEAK: base rate {base_rate:.0%}]"
                     all_flags.append(
                         {
                             "indicator_id": f.indicator_id,
                             "subject_ref": f.subject_ref,
                             "as_of": f.as_of.isoformat(),
-                            "explanation": f.explanation,
+                            "explanation": explanation,
                             "evidence": [
                                 {
                                     "source_id": e.source_id,
@@ -320,6 +344,8 @@ def run_experiment(
                             "tender_currency": meta.get("currency"),
                             "buyer_name": meta.get("buyer_name"),
                             "procurement_method": meta.get("procurement_method"),
+                            "base_rate": round(base_rate, 4),
+                            "discriminating": discriminating,
                         }
                     )
             else:
@@ -343,10 +369,23 @@ def run_experiment(
     for k, v in sorted(by_jurisdiction.items()):
         print(f"  {k}: {v}")
 
-    if len(all_flags) >= 10:
-        print(f"\n✅ PASS: {len(all_flags)} flags ≥ 10 threshold for blind review.")
-    else:
-        print(f"\n⚠️  Only {len(all_flags)} flags. Fewer than 10 is valid — not failure.")
+    # Base-rate table — the key deliverable: which indicators are valid where.
+    print(f"\n{'=' * 60}")
+    print("BASE-RATE TABLE (flags / units_evaluated / base_rate / discriminating)")
+    print(f"{'=' * 60}")
+    print(f"{'Source':<22} {'Indicator':<28} {'Flags':>6} {'Units':>6} {'Rate':>7} {'Discr.':>8}")
+    print("-" * 80)
+    for entry in base_rate_table:
+        rate_str = f"{entry['base_rate']:.0%}" if entry["units_evaluated"] > 0 else "N/A"
+        disc_str = "yes" if entry["discriminating"] else "NO"
+        print(
+            f"{entry['source_id']:<22} {entry['indicator_id']:<28} "
+            f"{entry['flags_emitted']:>6} {entry['units_evaluated']:>6} "
+            f"{rate_str:>7} {disc_str:>8}"
+        )
+
+    print(f"\nTotal flags: {len(all_flags)}")
+    print("Fewer than 10 is a valid result — not failure (ADR-002 D5).")
 
     return {
         "experiment_date": date.today().isoformat(),
@@ -357,6 +396,7 @@ def run_experiment(
         "total_flags": len(all_flags),
         "by_indicator": by_indicator,
         "by_jurisdiction": by_jurisdiction,
+        "base_rate_table": base_rate_table,
         "flags": all_flags,
     }
 

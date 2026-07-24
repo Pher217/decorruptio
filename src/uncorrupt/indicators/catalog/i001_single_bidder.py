@@ -39,12 +39,11 @@ class SingleBidder(Indicator):
         source = ctx.source_id
 
         if source == "ua_prozorro":
+            # Denominator: all tenders with awards (population at risk)
+            all_with_awards = Tender.objects.filter(source_id=source, awards__isnull=False)
+            self.units_evaluated = all_with_awards.count()
             # Tenders with awards and exactly 1 bid
-            ua_tenders: Any = (
-                Tender.objects.filter(source_id=source, awards__isnull=False)
-                .annotate(bid_count=Count("bids"))
-                .filter(bid_count=1)
-            )
+            ua_tenders: Any = all_with_awards.annotate(bid_count=Count("bids")).filter(bid_count=1)
             for t in ua_tenders:
                 yield Flag(
                     indicator_id=self.id,
@@ -80,8 +79,9 @@ class SingleBidder(Indicator):
                 )
 
         elif source == "co_secop_ii":
-            # Check unique suppliers with offers in raw_json
+            # Denominator: all tenders with awards (population at risk)
             co_tenders = Tender.objects.filter(source_id=source, awards__isnull=False)
+            self.units_evaluated = co_tenders.count()
             for t in co_tenders:
                 # proveedores_que_manifestaron is often 0; proveedores_unicos_con
                 # (unique suppliers with responses) is the meaningful count
@@ -134,11 +134,13 @@ class SingleBidder(Indicator):
                 "competitive",
                 "restricted",
             ]
+            # Denominator: all tenders with exactly 1 award (population at risk)
             uk_tenders: Any = (
                 Tender.objects.filter(source_id=source)
                 .annotate(award_count=Count("awards"))
                 .filter(award_count=1)
             )
+            self.units_evaluated = uk_tenders.count()
             for t in uk_tenders:
                 if is_framework_or_dps(
                     t.title,

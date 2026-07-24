@@ -6,8 +6,10 @@ review. The goal: up to 10 independently credible flags → 3 journalists blind-
 ≥1 says "I'd chase this" or kill.
 
 FROZEN SNAPSHOT: On first run, raw artifacts are saved to experiments/snapshot_YYYY-MM-DD/.
-On subsequent runs with --snapshot-dir, artifacts are loaded from disk, making results
-fully reproducible for journalist review.
+On subsequent runs with --snapshot-dir, artifacts are loaded from disk, making
+inputs frozen and reproducible for journalist review. Note: as_of / retrieved_at /
+data_snapshot timestamps use today()/now(), so re-runs differ in those fields —
+the inputs are frozen, not the output timestamps.
 
 Usage:
     uv run python scripts/kill_experiment.py [--sample-size N] [--output experiments/flags_raw.json]
@@ -137,7 +139,7 @@ def _save_snapshot(snapshot_dir: Path, source_id: str, artifacts: list[RawArtifa
             {
                 "source_url": a.source_url,
                 "media_type": a.media_type,
-                "payload_b64": a.payload.hex(),
+                "payload_hex": a.payload.hex(),
             }
         )
     path = snapshot_dir / f"{source_id}.json"
@@ -155,7 +157,9 @@ def _load_snapshot(snapshot_dir: Path, source_id: str) -> list[RawArtifact]:
     for item in raw:
         artifacts.append(
             RawArtifact(
-                payload=bytes.fromhex(item["payload_b64"]),
+                payload=bytes.fromhex(
+                    item["payload_hex"] if "payload_hex" in item else item["payload_b64"]
+                ),
                 source_url=item["source_url"],
                 media_type=item["media_type"],
             )
@@ -166,6 +170,8 @@ def _load_snapshot(snapshot_dir: Path, source_id: str) -> list[RawArtifact]:
 
 def _lookup_tender_meta(source_id: str, subject_ref: str) -> dict:
     """Look up tender metadata for a flag's subject_ref using Django ORM.
+
+    All queries are scoped by source_id to prevent cross-jurisdiction contamination.
 
     Handles three subject_ref formats:
     - tender_id (i001, i002, i004)
@@ -183,26 +189,28 @@ def _lookup_tender_meta(source_id: str, subject_ref: str) -> dict:
             "procurement_method_details": t.procurement_method_details,
         }
 
+    qs = Tender.objects.filter(source_id=source_id)
+
     # Try direct tender_id lookup
     try:
-        return _meta(Tender.objects.get(tender_id=subject_ref))
+        return _meta(qs.get(tender_id=subject_ref))
     except Tender.DoesNotExist:
         pass
 
     # i003: buyer→supplier format
     if "→" in subject_ref:
         buyer = subject_ref.split("→")[0].strip()
-        tender = Tender.objects.filter(buyer_name__icontains=buyer).first()
+        tender = qs.filter(buyer_name__icontains=buyer).first()
         if tender:
             return _meta(tender)
 
     # i005: subject_ref is the buyer name
-    tender = Tender.objects.filter(buyer_name__iexact=subject_ref).first()
+    tender = qs.filter(buyer_name__iexact=subject_ref).first()
     if tender:
         return _meta(tender)
 
     # Try buyer_name contains (for truncated names)
-    tender = Tender.objects.filter(buyer_name__icontains=subject_ref[:50]).first()
+    tender = qs.filter(buyer_name__icontains=subject_ref[:50]).first()
     if tender:
         return _meta(tender)
 
@@ -210,7 +218,7 @@ def _lookup_tender_meta(source_id: str, subject_ref: str) -> dict:
     if ":" in subject_ref:
         tender_id = subject_ref.split(":")[0]
         try:
-            return _meta(Tender.objects.get(tender_id=tender_id))
+            return _meta(qs.get(tender_id=tender_id))
         except Tender.DoesNotExist:
             pass
 

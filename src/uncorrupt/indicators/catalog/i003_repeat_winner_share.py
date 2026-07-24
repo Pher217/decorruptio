@@ -49,10 +49,15 @@ class RepeatWinnerShare(Indicator):
             )
         )
 
-        # Build buyer totals (distinct supplier-pairs per buyer = total awards)
+        # Build buyer totals (distinct supplier-pairs per buyer = total awards).
+        # Exclude placeholder/junk supplier names — they are not real entities
+        # and produce meaningless concentration flags (e.g. "Various" won 4 of 5).
         buyer_totals: dict[tuple[str, str], int] = {}
         rows: list[dict[str, Any]] = []
         for row in pairs:
+            supplier = row["supplier_name"] or ""
+            if _is_placeholder_supplier(supplier):
+                continue
             buyer = row["tender_ref__buyer_name"] or ""
             key = (row["source_id"], buyer)
             buyer_totals[key] = buyer_totals.get(key, 0) + row["award_count"]
@@ -117,3 +122,26 @@ class RepeatWinnerShare(Indicator):
                         indicator_version=self.id,
                     ),
                 )
+
+
+# Placeholder/junk supplier names that should never produce a concentration flag.
+# Case-insensitive, trimmed. These are not real entities — grouping on them is meaningless.
+_PLACEHOLDER_SUPPLIERS = frozenset(
+    {
+        "various",
+        "multiple",
+        "multiple suppliers",
+        "n/a",
+        "na",
+        "none",
+        "not applicable",
+        "tbc",
+        "unknown",
+        "-",
+        "",
+    }
+)
+
+
+def _is_placeholder_supplier(name: str) -> bool:
+    return name.strip().lower() in _PLACEHOLDER_SUPPLIERS

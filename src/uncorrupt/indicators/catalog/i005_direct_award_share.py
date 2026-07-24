@@ -27,6 +27,10 @@ DIRECT_KEYWORDS = {
     "uk_contracts_finder": ["direct", "single_tender"],
 }
 
+# Minimum tenders per buyer for the share to be statistically meaningful.
+# With <4 tenders, a high share is the floor, not a signal (same logic as i003).
+MIN_BUYER_AWARDS = 4
+
 
 class DirectAwardShare(Indicator):
     id = "i005_direct_award_share"
@@ -81,7 +85,9 @@ class DirectAwardShare(Indicator):
                 buyers[buyer]["direct"] += 1
 
         for buyer, data in buyers.items():
-            if data["total"] < 3:
+            # Minimum denominator guard: with <4 tenders, the share is the statistical
+            # floor, not a signal (mirrors i003's MIN_BUYER_AWARDS).
+            if data["total"] < MIN_BUYER_AWARDS:
                 continue
             share = data["direct"] / data["total"] if data["total"] > 0 else 0
             if share >= threshold:

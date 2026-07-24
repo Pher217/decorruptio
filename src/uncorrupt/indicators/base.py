@@ -43,9 +43,18 @@ class Indicator(ABC):
     params: dict[str, Any]
     validation: dict[str, ValidationStatus]  # keyed by jurisdiction/locale code
 
+    # Set by evaluate() to the number of units (tenders, buyers, pairs)
+    # actually evaluated for the source. Used by the runner to compute
+    # base rates: flags_emitted / units_evaluated.
+    units_evaluated: int = 0
+
     def runs_in(self, locale_code: str) -> bool:
         return self.validation.get(locale_code) is ValidationStatus.VALIDATED
 
     @abstractmethod
     def evaluate(self, ctx: EvaluationContext) -> Iterator[Flag]:
-        """Yield Flags. Queries Django staging models directly."""
+        """Yield Flags. Queries Django staging models directly.
+
+        Must set self.units_evaluated to the count of units iterated
+        (tenders, buyers, or pairs — the indicator's real unit).
+        """

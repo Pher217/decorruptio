@@ -46,6 +46,7 @@ class PriceVsEstimate(Indicator):
             value_amount_cents__gt=0,
             tender_ref__value_amount_cents__gt=0,
         )
+        self.units_evaluated = awards.count()
         for a in awards:
             if a.tender_ref is None:
                 continue

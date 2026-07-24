@@ -84,6 +84,9 @@ class DirectAwardShare(Indicator):
             if any(kw in method_str for kw in keywords):
                 buyers[buyer]["direct"] += 1
 
+        # Denominator: distinct buyers evaluated
+        self.units_evaluated = len(buyers)
+
         for buyer, data in buyers.items():
             # Minimum denominator guard: with <4 tenders, the share is the statistical
             # floor, not a signal (mirrors i003's MIN_BUYER_AWARDS).

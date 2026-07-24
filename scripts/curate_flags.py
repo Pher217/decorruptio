@@ -41,7 +41,17 @@ EXCLUDED_INDICATORS = {"i002_short_bid_window"}
 
 # Below-estimate i004 flags are weak — reverse auctions and ceiling-based
 # systems make below-estimate the expected outcome, not an anomaly.
-WEAK_FLAG_MARKERS = {"[WEAK: below-estimate]"}
+# Base-rate suppressed flags are weak — an indicator that fires on >20% of
+# units is describing the market, not detecting an anomaly.
+WEAK_FLAG_MARKERS = {"[WEAK: below-estimate]", "[WEAK: base rate"}
+
+# An indicator firing on more than 20% of its evaluated units is not
+# discriminating — it is describing the market structure. 20% is the
+# threshold: below it, the condition is rare enough to be a signal;
+# above it, the condition is common enough to be background noise.
+# (UK single-bidder fires on ~5% — signal. UA single-bidder fires on
+# ~61% — noise. CO single-bidder fires on ~36% — noise.)
+BASE_RATE_THRESHOLD = 0.20
 
 
 def _score_flag(
@@ -81,9 +91,13 @@ def _score_flag(
 
 
 def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
-    """Select the top-N credible flags maximizing indicator + jurisdiction diversity.
+    """Select at most top-N credible flags maximizing indicator + jurisdiction diversity.
 
-    Excludes weak indicators (i002 short bid window per ADR-003).
+    top_n is a MAXIMUM, never a target. Diversity caps are never relaxed to
+    reach a count. If fewer flags survive, fewer are returned.
+
+    Excludes weak indicators (i002 short bid window per ADR-003) and weak
+    flags (below-estimate i004, base-rate suppressed).
     Uses a quota-based approach:
     - At least 1 flag per fired indicator (if enough flags exist)
     - At least 1 flag per jurisdiction (if enough flags exist)
@@ -167,18 +181,6 @@ def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
             selected.append(flag_copy)
             ind_quota[ind] += 1
             jur_quota[jur] += 1
-            if len(selected) >= top_n:
-                break
-
-    # Pass 3: relax caps if still under top_n
-    if len(selected) < top_n:
-        for score, flag in scored:
-            if any(s["subject_ref"] == flag["subject_ref"] for s in selected):
-                continue
-            flag_copy = dict(flag)
-            flag_copy["_score"] = round(score, 3)
-            flag_copy["_selection_reason"] = "High score (relaxed caps)"
-            selected.append(flag_copy)
             if len(selected) >= top_n:
                 break
 
@@ -316,8 +318,10 @@ def main() -> None:
         "curated_count": len(selected),
         "selection_criteria": (
             "Credibility-first: excluded weak indicators (i002 per ADR-003), "
+            "excluded weak flags (below-estimate, base-rate suppressed), "
             "prioritized multi-flag convergence + value-at-stake + source URL "
-            "traceability. Greedy diversity: indicator × jurisdiction."
+            "traceability. Greedy diversity: indicator × jurisdiction. "
+            "top_n is a maximum, never a target — no cap relaxation."
         ),
         "flags": selected,
     }

@@ -39,6 +39,10 @@ JURISDICTION_LABELS: dict[str, str] = {
 # i002 is excluded from curation — ADR-003 identified it as weak/noise
 EXCLUDED_INDICATORS = {"i002_short_bid_window"}
 
+# Below-estimate i004 flags are weak — reverse auctions and ceiling-based
+# systems make below-estimate the expected outcome, not an anomaly.
+WEAK_FLAG_MARKERS = {"[WEAK: below-estimate]"}
+
 
 def _score_flag(
     flag: dict,
@@ -89,6 +93,13 @@ def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
     """
     # Exclude weak indicators
     flags = [f for f in flags if f["indicator_id"] not in EXCLUDED_INDICATORS]
+
+    # Exclude weak below-estimate i004 flags (reverse auction / ceiling system)
+    flags = [
+        f
+        for f in flags
+        if not any(marker in f.get("explanation", "") for marker in WEAK_FLAG_MARKERS)
+    ]
 
     # Build multi-flag subject set (convergence signal)
     by_subject: dict[str, set[str]] = {}
@@ -180,7 +191,7 @@ def render_dossier(selected: list[dict], meta: dict) -> str:
     lines.append("# Decorruptio — Blind Review Dossier")
     lines.append("")
     lines.append(f"**Date:** {meta['experiment_date']}")
-    lines.append(f"**Snapshot:** {meta.get('snapshot_date', 'n/a')} (frozen data — reproducible)")
+    lines.append(f"**Snapshot:** {meta.get('snapshot_date', 'n/a')} (frozen inputs — reproducible)")
     lines.append(
         f"**Sample:** {meta['sample_size_per_source']} records per source "
         f"({meta['total_flags']} raw flags → top {len(selected)} curated)"

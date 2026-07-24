@@ -10,19 +10,29 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from uncorrupt.connectors.base import RawArtifact
 from uncorrupt.staging.models import Award, Bid, Tender
 
+# Per-source default currency when the source payload doesn't specify one.
+DEFAULT_CURRENCY: dict[str, str] = {
+    "ua_prozorro": "UAH",
+    "uk_contracts_finder": "GBP",
+    "co_secop_ii": "COP",
+}
+
 
 def _to_cents(v: Any) -> int:
+    """Convert a value to integer cents using Decimal (no float round-trip)."""
     if v is None or v == "":
         return 0
     try:
-        return round(float(v) * 100)
-    except (ValueError, TypeError):
+        d = Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
         return 0
+    return int((d * 100).to_integral_value(rounding="ROUND_HALF_UP"))
 
 
 def _safe_int(v: Any) -> int | None:
@@ -71,7 +81,7 @@ def _ingest_ua_prozorro(artifact: RawArtifact) -> None:
             "procurement_method": t.get("procurementMethod"),
             "procurement_method_details": t.get("procurementMethodType"),
             "award_criteria": t.get("awardCriteria"),
-            "currency": value.get("currency") or "USD",
+            "currency": value.get("currency") or DEFAULT_CURRENCY["ua_prozorro"],
             "value_amount_cents": _to_cents(value.get("amount")),
             "tender_start": _parse_dt(tp.get("startDate")),
             "tender_end": _parse_dt(tp.get("endDate")),
@@ -101,7 +111,7 @@ def _ingest_ua_prozorro(artifact: RawArtifact) -> None:
                 "supplier_name": supplier.get("name"),
                 "supplier_id_scheme": sup_id.get("scheme"),
                 "supplier_id": sup_id.get("id"),
-                "currency": award_value.get("currency") or "USD",
+                "currency": award_value.get("currency") or DEFAULT_CURRENCY["ua_prozorro"],
                 "value_amount_cents": _to_cents(award_value.get("amount")),
                 "status": award.get("status"),
                 "award_date": _parse_dt(award.get("date")),
@@ -123,7 +133,7 @@ def _ingest_ua_prozorro(artifact: RawArtifact) -> None:
                 "tender_ref": tender,
                 "bidder_name": bidder.get("name"),
                 "bidder_id": bidder.get("identifier", {}).get("id"),
-                "currency": bid_value.get("currency") or "USD",
+                "currency": bid_value.get("currency") or DEFAULT_CURRENCY["ua_prozorro"],
                 "value_amount_cents": _to_cents(bid_value.get("amount")),
                 "status": bid.get("status"),
                 "bid_date": _parse_dt(bid.get("date")),
@@ -166,7 +176,7 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
             "procurement_method": tender.get("procurementMethod"),
             "procurement_method_details": tender.get("procurementMethodDetails"),
             "award_criteria": tender.get("awardCriteria"),
-            "currency": value.get("currency") or "USD",
+            "currency": value.get("currency") or DEFAULT_CURRENCY["uk_contracts_finder"],
             "value_amount_cents": _to_cents(value.get("amount")),
             "tender_start": _parse_dt(tp.get("startDate")),
             "tender_end": _parse_dt(tp.get("endDate")),
@@ -195,7 +205,7 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
                 "supplier_name": supplier.get("name"),
                 "supplier_id_scheme": supplier.get("identifier", {}).get("scheme"),
                 "supplier_id": supplier.get("identifier", {}).get("id"),
-                "currency": award_value.get("currency") or "USD",
+                "currency": award_value.get("currency") or DEFAULT_CURRENCY["uk_contracts_finder"],
                 "value_amount_cents": _to_cents(award_value.get("amount")),
                 "status": award.get("status"),
                 "award_date": _parse_dt(award.get("date")),
@@ -272,10 +282,13 @@ def ingest_artifacts(source_id: str, artifacts: list[RawArtifact]) -> int:
         raise ValueError(f"No ingester registered for source '{source_id}'")
 
     count = 0
+    failed = 0
     for artifact in artifacts:
         try:
             ingester(artifact)
             count += 1
         except Exception:
+            failed += 1
             continue
+    print(f"  [{source_id}] ingested {count}, failed {failed}")
     return count

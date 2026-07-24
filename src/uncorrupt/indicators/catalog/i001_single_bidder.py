@@ -17,6 +17,7 @@ from django.db.models import Count
 from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionStamp
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
+from uncorrupt.indicators.catalog._framework import is_framework_or_dps
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.staging.models import Tender
 
@@ -125,23 +126,9 @@ class SingleBidder(Indicator):
             # No bid-level data — flag only genuinely competitive procedures where
             # a single award suggests suppressed competition.
             #
-            # UK Contracts Finder procedure types:
-            # - "Call-off from a framework agreement" → single-supplier BY DESIGN,
-            #   NOT suspicious — EXCLUDE
-            # - "Competitive procedure with negotiation" → competitive, single
-            #   award IS suspicious — INCLUDE
-            # - "Open", "Restricted" → competitive by definition — INCLUDE
-            # - "Negotiated without prior publication" → direct award, i005 covers
-            #   those — EXCLUDE from i001
-            #
-            # The signal is only real when the procedure was meant to be competitive.
-            NON_COMPETITIVE_KEYWORDS = [
-                "call-off",
-                "call off",
-                "framework",
-                "negotiated without prior publication",
-                "direct",
-            ]
+            # Framework call-offs, DPS establishments, and supplier lists are
+            # single-supplier BY DESIGN — exclude them. The signal is only real
+            # when the procedure was meant to be competitive.
             COMPETITIVE_KEYWORDS = [
                 "open",
                 "competitive",
@@ -153,12 +140,16 @@ class SingleBidder(Indicator):
                 .filter(award_count=1)
             )
             for t in uk_tenders:
+                if is_framework_or_dps(
+                    t.title,
+                    t.procurement_method,
+                    t.procurement_method_details,
+                    t.raw_json,
+                ):
+                    continue
                 method_str = (
                     f"{t.procurement_method or ''} {t.procurement_method_details or ''}"
                 ).lower()
-                # Exclude non-competitive procedures (framework call-offs, direct)
-                if any(kw in method_str for kw in NON_COMPETITIVE_KEYWORDS):
-                    continue
                 # Only flag if the procedure is genuinely competitive
                 if not any(kw in method_str for kw in COMPETITIVE_KEYWORDS):
                     continue

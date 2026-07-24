@@ -128,9 +128,7 @@ def fetch_co(n: int = 200) -> list[RawArtifact]:
     return artifacts[:n]
 
 
-def _save_snapshot(
-    snapshot_dir: Path, source_id: str, artifacts: list[RawArtifact]
-) -> None:
+def _save_snapshot(snapshot_dir: Path, source_id: str, artifacts: list[RawArtifact]) -> None:
     """Save raw artifacts to disk for frozen-snapshot reproducibility."""
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     out: list[dict] = []
@@ -174,6 +172,7 @@ def _lookup_tender_meta(source_id: str, subject_ref: str) -> dict:
     - buyer→supplier (i003)
     - buyer_name (i005)
     """
+
     def _meta(t: Tender) -> dict:
         return {
             "title": t.title,

@@ -79,8 +79,7 @@ def test_i003_includes_high_denominator() -> None:
     flag_subjects = [f.subject_ref for f in flags]
     # The 4-of-5 supplier MUST appear in flags
     assert any(dominant_supplier in s for s in flag_subjects), (
-        f"i003 failed to flag a 4-of-5 (80%) pair with 5 total awards. "
-        f"Flags: {flag_subjects}"
+        f"i003 failed to flag a 4-of-5 (80%) pair with 5 total awards. Flags: {flag_subjects}"
     )
 
 
@@ -143,6 +142,5 @@ def test_i001_uk_includes_competitive_single_award() -> None:
     flags = list(indicator.evaluate(ctx))
     flag_subjects = [f.subject_ref for f in flags]
     assert "competitive-single-1" in flag_subjects, (
-        f"i001 failed to flag an open procedure with single award. "
-        f"Flags: {flag_subjects}"
+        f"i001 failed to flag an open procedure with single award. Flags: {flag_subjects}"
     )

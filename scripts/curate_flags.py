@@ -100,9 +100,7 @@ def curate(flags: list[dict], top_n: int = 10) -> list[dict]:
     multi_flag_subjects = {k for k, v in by_subject.items() if len(v) >= 2}
 
     ind_counts = Counter(f["indicator_id"] for f in flags)
-    jur_counts = Counter(
-        f["evidence"][0]["jurisdiction"] if f["evidence"] else "?" for f in flags
-    )
+    jur_counts = Counter(f["evidence"][0]["jurisdiction"] if f["evidence"] else "?" for f in flags)
     total = len(flags)
 
     indicator_rarity = {k: 1.0 - (v / total) for k, v in ind_counts.items()} if total else {}
@@ -182,17 +180,12 @@ def render_dossier(selected: list[dict], meta: dict) -> str:
     lines.append("# Decorruptio — Blind Review Dossier")
     lines.append("")
     lines.append(f"**Date:** {meta['experiment_date']}")
-    lines.append(
-        f"**Snapshot:** {meta.get('snapshot_date', 'n/a')} "
-        f"(frozen data — reproducible)"
-    )
+    lines.append(f"**Snapshot:** {meta.get('snapshot_date', 'n/a')} (frozen data — reproducible)")
     lines.append(
         f"**Sample:** {meta['sample_size_per_source']} records per source "
         f"({meta['total_flags']} raw flags → top {len(selected)} curated)"
     )
-    lines.append(
-        "\n**Excluded:** i002_short_bid_window (weak indicator, per ADR-003)"
-    )
+    lines.append("\n**Excluded:** i002_short_bid_window (weak indicator, per ADR-003)")
     lines.append("")
     lines.append("## How to review")
     lines.append("")

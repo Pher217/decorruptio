@@ -84,12 +84,8 @@ class SingleBidder(Indicator):
             for t in co_tenders:
                 # proveedores_que_manifestaron is often 0; proveedores_unicos_con
                 # (unique suppliers with responses) is the meaningful count
-                manifest_count = _safe_int(
-                    t.raw_json.get("proveedores_que_manifestaron", 0)
-                )
-                unique_count = _safe_int(
-                    t.raw_json.get("proveedores_unicos_con", 0)
-                )
+                manifest_count = _safe_int(t.raw_json.get("proveedores_que_manifestaron", 0))
+                unique_count = _safe_int(t.raw_json.get("proveedores_unicos_con", 0))
                 supplier_count = max(manifest_count, unique_count)
                 if supplier_count == 1:
                     yield Flag(
@@ -158,8 +154,7 @@ class SingleBidder(Indicator):
             )
             for t in uk_tenders:
                 method_str = (
-                    f"{t.procurement_method or ''} "
-                    f"{t.procurement_method_details or ''}"
+                    f"{t.procurement_method or ''} {t.procurement_method_details or ''}"
                 ).lower()
                 # Exclude non-competitive procedures (framework call-offs, direct)
                 if any(kw in method_str for kw in NON_COMPETITIVE_KEYWORDS):

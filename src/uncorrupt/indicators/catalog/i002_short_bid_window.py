@@ -35,7 +35,11 @@ class ShortBidWindow(Indicator):
         today = date.today()
         min_days = ctx.locale.procedure_metadata.get("min_bid_days_open", self.params["min_days"])
 
-        tenders = Tender.objects.filter(tender_start__isnull=False, tender_end__isnull=False)
+        tenders = Tender.objects.filter(
+            source_id=ctx.source_id,
+            tender_start__isnull=False,
+            tender_end__isnull=False,
+        )
         for t in tenders:
             assert t.tender_start is not None and t.tender_end is not None
             window_days = (t.tender_end - t.tender_start).days

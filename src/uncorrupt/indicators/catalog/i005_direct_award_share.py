@@ -47,7 +47,10 @@ class DirectAwardShare(Indicator):
         # Aggregate per buyer: total tenders and direct-award count
         buyers: dict[str, dict[str, Any]] = {}
         buyer_tenders = list(
-            Tender.objects.filter(buyer_name__isnull=False).values(
+            Tender.objects.filter(
+                source_id=ctx.source_id,
+                buyer_name__isnull=False,
+            ).values(
                 "source_id",
                 "buyer_name",
                 "procurement_method",

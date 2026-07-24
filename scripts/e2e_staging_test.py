@@ -16,7 +16,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
 django.setup()
 
 from uncorrupt.connectors.base import RawArtifact
-from uncorrupt.staging import ingest_artifacts
+from uncorrupt.staging.ingest import ingest_artifacts
 from uncorrupt.staging.models import Award, Tender
 
 UA_API = "https://api.openprocurement.org/api/2.5"

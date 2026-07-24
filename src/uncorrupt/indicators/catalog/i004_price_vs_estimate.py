@@ -36,6 +36,7 @@ class PriceVsEstimate(Indicator):
         threshold = self.params["pct_threshold"]
 
         awards = Award.objects.select_related("tender_ref").filter(
+            source_id=ctx.source_id,
             value_amount_cents__gt=0,
             tender_ref__value_amount_cents__gt=0,
         )

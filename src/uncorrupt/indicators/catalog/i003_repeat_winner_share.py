@@ -38,6 +38,7 @@ class RepeatWinnerShare(Indicator):
 
         pairs = (
             Award.objects.filter(
+                source_id=ctx.source_id,
                 supplier_name__isnull=False,
                 tender_ref__buyer_name__isnull=False,
             )
@@ -57,13 +58,18 @@ class RepeatWinnerShare(Indicator):
             buyer_totals[key] = buyer_totals.get(key, 0) + row["award_count"]
             rows.append(dict(row))
 
+        # Only flag buyer-supplier pairs where the buyer has >= 4 total awards.
+        # With fewer data points (e.g., 1-of-2 = 50%), the share is the statistical
+        # floor, not a signal. Require >= 4 for the concentration to be meaningful.
+        MIN_BUYER_AWARDS = 4
+
         for r in rows:
             source_id = r["source_id"]
             buyer = r["tender_ref__buyer_name"] or ""
             supplier = r["supplier_name"]
             award_count = r["award_count"]
             total_awards = buyer_totals[(source_id, buyer)]
-            if total_awards < 2:
+            if total_awards < MIN_BUYER_AWARDS:
                 continue
             share = award_count / total_awards
             if share >= threshold:

@@ -19,3 +19,4 @@ node_modules/
 dashboard/dist/
 # OS
 .DS_Store
+decorruptio_dev.db

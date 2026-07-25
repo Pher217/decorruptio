@@ -45,6 +45,7 @@ def measure(snapshot_dir: Path, source_id: str = "uk_contracts_finder") -> dict:
     total_refs = 0
     company_eligible_refs = 0
     gb_coh_refs = 0
+    gb_coh_empty_id_refs = 0
     non_company_refs = 0
     no_scheme_refs = 0
     scheme_counts: Counter[str] = Counter()
@@ -68,11 +69,17 @@ def measure(snapshot_dir: Path, source_id: str = "uk_contracts_finder") -> dict:
 
                 party = party_by_id.get(sup_id) or party_by_name.get(sup_name)
                 scheme = party.get("identifier", {}).get("scheme", "NONE") if party else "NONE"
+                ident_id = party.get("identifier", {}).get("id", "") if party else ""
                 scheme_counts[scheme] += 1
 
                 if scheme == "GB-COH":
-                    gb_coh_refs += 1
-                    company_eligible_refs += 1
+                    if ident_id and ident_id.strip():
+                        gb_coh_refs += 1
+                        company_eligible_refs += 1
+                    else:
+                        gb_coh_empty_id_refs += 1
+                        # scheme present but no id → cannot resolve, still company-eligible
+                        company_eligible_refs += 1
                 elif scheme in NON_COMPANY_SCHEMES:
                     non_company_refs += 1
                 elif scheme == "NONE":
@@ -90,6 +97,7 @@ def measure(snapshot_dir: Path, source_id: str = "uk_contracts_finder") -> dict:
         "total_supplier_refs": total_refs,
         "company_eligible_refs": company_eligible_refs,
         "gb_coh_refs": gb_coh_refs,
+        "gb_coh_empty_id_refs": gb_coh_empty_id_refs,
         "non_company_refs": non_company_refs,
         "no_scheme_refs": no_scheme_refs,
         "scheme_counts": dict(scheme_counts),
@@ -133,6 +141,11 @@ def main() -> None:
     print()
     print(f"Non-company entities excluded from denominator: {r['non_company_refs']}")
     print(f"Suppliers with no scheme (unknown, treated as eligible): {r['no_scheme_refs']}")
+    if r["gb_coh_empty_id_refs"]:
+        print(
+            f"GB-COH scheme present but identifier id empty "
+            f"(counted as eligible but NOT as covered): {r['gb_coh_empty_id_refs']}"
+        )
     print()
     gate = "PASS (>= 50%)" if r["eligible_coverage_pct"] >= 50 else "FAIL (< 50%)"
     print(f"50% gate (company-eligible denominator): {gate}")

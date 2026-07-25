@@ -482,3 +482,113 @@ class SupplierResolutionTest(TestCase):
         res = SupplierResolution.objects.get(supplier_name="Unique Supplier Ltd")
         assert res.match_confidence == 0.9
         assert res.match_method == "exact_name"
+
+
+class Phase4KnownCaseCoverageTest(TestCase):
+    """Phase 4 — indicator coverage test against known UK PPE cases.
+
+    These are adjudicated High Court cases, all public record. The contracts
+    were 2020 emergency PCR reg 32(2)(c) direct awards, so i001/i005 firing
+    on them proves nothing (direct award was near-universal). Only the
+    company-join indicators count.
+
+    Coverage table (expected):
+    | case          | expected indicator | flagged? |
+    | PPE Medpro    | i006               | yes      |
+    | PestFix       | i007               | yes      |
+    | Ayanda        | NONE               | no       | (documented gap)
+
+    IMPORTANT: the frozen snapshot is 2026 data — these 2020 contracts are
+    NOT in it. These tests use synthetic fixtures built from the known public
+    facts (incorporation date, award date, value, accounts category).
+    """
+
+    def test_ppe_medpro_caught_by_i006(self):
+        """PPE Medpro: incorporated 2020-05-12, won GBP 81m on 2020-06-12 (31 days).
+
+        MUST be caught by i006 (incorporation proximity).
+        """
+        from datetime import date
+
+        _setup_company(
+            company_number="12345678",
+            company_name="PPE Medpro Ltd",
+            incorporation_date=date(2020, 5, 12),
+            accounts_category="SMALL",
+        )
+        _setup_award_with_resolution(
+            supplier_name="PPE Medpro Ltd",
+            company_number="12345678",
+            award_value_gbp=81_000_000,
+            award_date="2020-06-12T00:00:00",
+        )
+
+        i006 = IncorporationProximity()
+        flags = list(i006.evaluate(_make_ctx()))
+        assert len(flags) == 1
+        assert "31 days" in flags[0].explanation
+
+    def test_pestfix_caught_by_i007(self):
+        """PestFix: small pest-control firm won ~GBP 340m.
+
+        Older company, so i006 does NOT catch it.
+        MUST be caught by i007 (value vs company size).
+        """
+        from datetime import date
+
+        _setup_company(
+            company_number="12345678",
+            company_name="PestFix Systems Ltd",
+            incorporation_date=date(2007, 1, 1),
+            accounts_category="SMALL",
+        )
+        _setup_award_with_resolution(
+            supplier_name="PestFix Systems Ltd",
+            company_number="12345678",
+            award_value_gbp=340_000_000,
+            award_date="2020-04-01T00:00:00",
+        )
+
+        # i006 must NOT catch it (company is 13 years old)
+        i006 = IncorporationProximity()
+        i006_flags = list(i006.evaluate(_make_ctx()))
+        assert len(i006_flags) == 0
+
+        # i007 MUST catch it (small company, huge award)
+        i007 = ValueVsCompanySize()
+        i007_flags = list(i007.evaluate(_make_ctx()))
+        assert len(i007_flags) == 1
+        assert "small" in i007_flags[0].explanation.lower()
+
+    def test_ayanda_caught_by_neither(self):
+        """Ayanda Capital (~GBP 252m): caught by neither i006 nor i007.
+
+        Documented gap — not papered over.
+        """
+        from datetime import date
+
+        _setup_company(
+            company_number="12345678",
+            company_name="Ayanda Capital Ltd",
+            incorporation_date=date(2015, 1, 1),  # 5 years old — not new
+            accounts_category="FULL",  # not dormant/micro/small
+        )
+        _setup_award_with_resolution(
+            supplier_name="Ayanda Capital Ltd",
+            company_number="12345678",
+            award_value_gbp=252_000_000,
+            award_date="2020-04-01T00:00:00",
+        )
+
+        i006 = IncorporationProximity()
+        i006_flags = list(i006.evaluate(_make_ctx()))
+        assert len(i006_flags) == 0
+
+        i007 = ValueVsCompanySize()
+        i007_flags = list(i007.evaluate(_make_ctx()))
+        assert len(i007_flags) == 0
+
+        # i008 also should not catch it (FULL accounts, current filings)
+        i008 = DormancyDelinquency()
+        i008_flags = list(i008.evaluate(_make_ctx()))
+        assert len(i008_flags) == 0

@@ -238,16 +238,38 @@ class TestEdge:
     def test_edge_source_name_required(self):
         """Every edge must carry a source citation — this is the core of Phase 1."""
         referrer, supplier = self._create_pair()
-        edge = Edge(
-            edge_type="referred_to_lane",
-            source_entity=referrer,
-            target_entity=supplier,
-            source_name="",  # empty string, not null — DB allows it but it's vacuous
-        )
-        # The model allows empty source_name at the DB level; validation is at the
-        # application layer. The test documents the constraint: source_name
-        # should never be empty in practice.
-        assert edge.source_name == ""
+        with pytest.raises(IntegrityError):
+            Edge.objects.create(
+                edge_type="referred_to_lane",
+                source_entity=referrer,
+                target_entity=supplier,
+                source_name="",  # empty string, not null — must be rejected
+            )
+
+    def test_edge_match_confidence_out_of_range_rejected(self):
+        """match_confidence must be within [0, 1] — a probability, not an arbitrary float."""
+        referrer, supplier = self._create_pair()
+        with pytest.raises(IntegrityError):
+            Edge.objects.create(
+                edge_type="referred_to_lane",
+                source_entity=referrer,
+                target_entity=supplier,
+                source_name="Test",
+                match_confidence=1.5,
+            )
+
+    def test_edge_valid_to_before_valid_from_rejected(self):
+        """An interval that ends before it starts is inverted data, not a real claim."""
+        referrer, supplier = self._create_pair()
+        with pytest.raises(IntegrityError):
+            Edge.objects.create(
+                edge_type="referred_to_lane",
+                source_entity=referrer,
+                target_entity=supplier,
+                source_name="Test",
+                valid_from="2020-04-01",
+                valid_to="2020-01-01",
+            )
 
     def test_edge_cascade_delete(self):
         source, target = self._create_pair()

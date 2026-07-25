@@ -175,6 +175,22 @@ class Edge(models.Model):
             models.Index(fields=["edge_type", "valid_from"]),
             models.Index(fields=["source_entity", "target_entity", "edge_type"]),
         ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(source_name=""),
+                name="edge_source_name_not_empty",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(match_confidence__gte=0.0) & models.Q(match_confidence__lte=1.0),
+                name="edge_match_confidence_range",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(valid_to__isnull=True)
+                | models.Q(valid_from__isnull=True)
+                | models.Q(valid_to__gte=models.F("valid_from")),
+                name="edge_valid_to_after_valid_from",
+            ),
+        ]
 
     def __str__(self) -> str:
         return (

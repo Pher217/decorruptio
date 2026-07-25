@@ -30,6 +30,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -43,6 +44,8 @@ from django.db import transaction
 from uncorrupt.graph.models import Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name
 from uncorrupt.staging.models import Company
+
+logger = logging.getLogger(__name__)
 
 EC_API_BASE = "https://search.electoralcommission.org.uk/api/csv/Donations"
 SOURCE_NAME = "Electoral Commission"
@@ -257,6 +260,8 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
     matched = 0
     unmatched_donor = 0
     skipped_individual = 0
+    skipped_no_recipient_name = 0
+    invalid_received_date = 0
     total = 0
 
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -286,46 +291,90 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
 
                 recipient_name = (row.get("RegulatedEntityName") or "").strip()
                 regulated_entity_id = (row.get("RegulatedEntityId") or "").strip()
-                recipient_entity, _ = Entity.objects.get_or_create(
-                    entity_type=_recipient_entity_type(
+                # Never create a shared node from a bare name (governing
+                # principle: duplication over merging). When there is no
+                # registry ID, the name IS the identity key, so it must be
+                # part of the lookup — otherwise every ID-less recipient of
+                # the same entity_type would collapse into the first row
+                # ever created. If there is no name either, skip the row
+                # rather than inventing an anonymous shared node.
+                if not regulated_entity_id and not recipient_name:
+                    skipped_no_recipient_name += 1
+                    continue
+
+                recipient_lookup: dict[str, Any] = {
+                    "entity_type": _recipient_entity_type(
                         (row.get("RegulatedEntityType") or "").strip()
                     ),
-                    registry_scheme="EC-REGULATED-ENTITY",
-                    registry_id=regulated_entity_id or None,
-                    defaults={"name": recipient_name},
+                    "registry_scheme": "EC-REGULATED-ENTITY",
+                }
+                if regulated_entity_id:
+                    recipient_lookup["registry_id"] = regulated_entity_id
+                    recipient_defaults = {"name": recipient_name}
+                else:
+                    recipient_lookup["registry_id"] = None
+                    recipient_lookup["name"] = recipient_name
+                    recipient_defaults = {}
+                recipient_entity, _ = Entity.objects.get_or_create(
+                    **recipient_lookup, defaults=recipient_defaults
                 )
 
                 amount_cents = _to_cents(row.get("Value") or "")
-                valid_from = _parse_ec_date(row.get("ReceivedDate") or "") or _parse_ec_date(
-                    row.get("AcceptedDate") or ""
-                )
+                received_raw = row.get("ReceivedDate") or ""
+                if received_raw.strip():
+                    valid_from = _parse_ec_date(received_raw)
+                    if valid_from is None:
+                        invalid_received_date += 1
+                        logger.warning(
+                            "Unparseable ReceivedDate %r for ECRef %r; not falling back to "
+                            "AcceptedDate",
+                            received_raw,
+                            row.get("ECRef"),
+                        )
+                else:
+                    valid_from = _parse_ec_date(row.get("AcceptedDate") or "")
                 ec_ref = (row.get("ECRef") or "").strip()
 
-                Edge.objects.get_or_create(
-                    edge_type="donation",
-                    source_entity=donor_entity,
-                    target_entity=recipient_entity,
-                    source_reference=ec_ref or None,
-                    defaults={
-                        "valid_from": valid_from,
-                        "source_name": SOURCE_NAME,
-                        "source_url": (
-                            "https://search.electoralcommission.org.uk/Search/Donations"
-                            f"?ecref={ec_ref}"
-                            if ec_ref
-                            else None
-                        ),
-                        "match_confidence": confidence,
-                        "match_method": method,
-                        "amount_cents": amount_cents,
-                        "currency": "GBP",
-                    },
-                )
-                matched += 1
+                edge_fields = {
+                    "valid_from": valid_from,
+                    "source_name": SOURCE_NAME,
+                    "source_url": (
+                        f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
+                        if ec_ref
+                        else None
+                    ),
+                    "match_confidence": confidence,
+                    "match_method": method,
+                    "amount_cents": amount_cents,
+                    "currency": "GBP",
+                }
+
+                edge_lookup: dict[str, Any] = {
+                    "edge_type": "donation",
+                    "source_entity": donor_entity,
+                    "target_entity": recipient_entity,
+                }
+                if ec_ref:
+                    edge_lookup["source_reference"] = ec_ref
+                else:
+                    # No EC reference: distinct donations between the same
+                    # pair must stay distinct rather than collapsing into
+                    # one edge — key on the claim itself.
+                    edge_lookup["source_reference"] = None
+                    edge_lookup["valid_from"] = valid_from
+                    edge_lookup["amount_cents"] = amount_cents
+                    del edge_fields["valid_from"]
+                    del edge_fields["amount_cents"]
+
+                _, created = Edge.objects.update_or_create(**edge_lookup, defaults=edge_fields)
+                if created:
+                    matched += 1
 
     return {
         "matched": matched,
         "unmatched_donor": unmatched_donor,
         "skipped_individual": skipped_individual,
+        "skipped_no_recipient_name": skipped_no_recipient_name,
+        "invalid_received_date": invalid_received_date,
         "total": total,
     }

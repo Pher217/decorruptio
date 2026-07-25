@@ -27,6 +27,11 @@ class Entity(models.Model):
         ("company", "Company"),
         ("person", "Person (public official)"),
         ("public_body", "Public body / government organization"),
+        ("political_party", "Political party"),
+        (
+            "regulated_entity",
+            "Other EC-regulated entity (members association, third-party campaigner, etc.)",
+        ),
     ]
 
     entity_type = models.CharField(max_length=20, choices=ENTITY_TYPES, db_index=True)

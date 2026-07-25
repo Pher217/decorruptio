@@ -1,0 +1,331 @@
+"""Electoral Commission donations ingest (Phase 1.2).
+
+Source: https://search.electoralcommission.org.uk — the public donation
+search tool. It exposes a CSV export via `/api/csv/Donations` (discovered
+from the site's own `pefsearch.js`, which builds the "Export Results" link
+the search UI renders — this is the same export a human clicking the button
+would get, not HTML scraping of rendered pages).
+
+Scope boundary (ADR-004 D1): company-level data and public-function office
+holders only, no private-individual profiling. Donor rows from individuals
+are recorded in the raw CSV but deliberately NOT turned into graph Entities
+or Edges here — only donors identifiable as companies (by registration
+number, or a uniqueness-guarded exact name match) are ingested. This mirrors
+`uncorrupt.staging.companies_house.resolve_suppliers`.
+
+Money: `Value` in the CSV is a formatted string like "£7,500.00". Parsed via
+Decimal (no float round-trip) into integer cents on `Edge.amount_cents`.
+
+Dates: EC donation rows carry both `AcceptedDate` (when the party/regulated
+entity formally accepted the donation into its accounts) and `ReceivedDate`
+(when the money/gift was actually received). `Edge.valid_from` is set to
+`ReceivedDate` because that is when the relationship materially began —
+temporal correctness against award dates is the point of this phase, and
+"accepted" is a downstream administrative step that can lag receipt by
+weeks. Falls back to `AcceptedDate` only if `ReceivedDate` is blank.
+"""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+import httpx
+from django.db import transaction
+
+from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.staging.companies_house import _normalise_name
+from uncorrupt.staging.models import Company
+
+EC_API_BASE = "https://search.electoralcommission.org.uk/api/csv/Donations"
+SOURCE_NAME = "Electoral Commission"
+
+# Donor statuses that identify an organisation we can resolve to a company.
+# "Individual" and similar person-level statuses are excluded by design
+# (ADR-004 D1) — see module docstring.
+ORGANISATION_DONOR_STATUSES = frozenset(
+    {
+        "Company",
+        "Trade Union",
+        "Building Society",
+        "Limited Liability Partnership",
+        "Unincorporated Association",
+        "Friendly Society",
+        "Registered Political Party",
+        "Public Fund",
+    }
+)
+
+ENTITY_TYPE_BY_REGULATED_TYPE: dict[str, str] = {
+    "Political Party": "political_party",
+}
+DEFAULT_REGULATED_ENTITY_TYPE = "regulated_entity"
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """Provenance record for a downloaded EC donations CSV."""
+
+    csv_path: Path
+    provenance_path: Path
+    row_count: int
+    source_url_template: str
+    retrieved_at: datetime
+    content_hash: str
+
+
+def fetch_ec_donations_csv(
+    from_date: date,
+    to_date: date,
+    output_dir: str | Path,
+    entity_types: tuple[str, ...] = ("pp", "ppm", "tp"),
+    page_size: int = 1000,
+    max_retries: int = 5,
+    polite_delay_seconds: float = 1.0,
+    client: httpx.Client | None = None,
+) -> FetchResult:
+    """Download EC donation records for a date range into a local CSV.
+
+    Paginates via `start`/`rows`. Backs off with exponential delay on 429
+    (or any 5xx) rather than hammering the service; gives up after
+    `max_retries` consecutive failures on the same page.
+
+    Writes the raw CSV plus a JSON provenance record (source URL template,
+    retrieval timestamp, content hash) into `output_dir`. Callers are
+    expected to point `output_dir` at a gitignored path (e.g. `experiments/`)
+    — this function does not commit anything.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "ec_donations.csv"
+    provenance_path = output_dir / "ec_donations.provenance.json"
+
+    owns_client = client is None
+    client = client or httpx.Client(timeout=30.0)
+
+    header: list[str] | None = None
+    rows: list[list[str]] = []
+    start = 0
+
+    try:
+        while True:
+            params = {
+                "start": start,
+                "rows": page_size,
+                "query": "",
+                "sort": "AcceptedDate",
+                "order": "desc",
+                "date": "Received",
+                "from": from_date.isoformat(),
+                "to": to_date.isoformat(),
+            }
+            query = [*params.items(), *[("et", e) for e in entity_types]]
+            url = httpx.URL(EC_API_BASE, params=query)
+
+            page_rows = _fetch_page_with_backoff(client, url, max_retries)
+            if not page_rows:
+                break
+
+            page_header, *page_data = page_rows
+            if header is None:
+                header = page_header
+            rows.extend(page_data)
+
+            if len(page_data) < page_size:
+                break
+            start += page_size
+            time.sleep(polite_delay_seconds)
+    finally:
+        if owns_client:
+            client.close()
+
+    header = header or []
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+    content_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    retrieved_at = datetime.now(UTC)
+    et_list = list(entity_types)
+    source_url_template = f"{EC_API_BASE}?from={from_date}&to={to_date}&et={et_list}"
+    provenance = {
+        "source_url_template": source_url_template,
+        "retrieved_at": retrieved_at.isoformat(),
+        "content_hash": f"sha256:{content_hash}",
+        "row_count": len(rows),
+        "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+    }
+    provenance_path.write_text(json.dumps(provenance, indent=2))
+
+    return FetchResult(
+        csv_path=csv_path,
+        provenance_path=provenance_path,
+        row_count=len(rows),
+        source_url_template=source_url_template,
+        retrieved_at=retrieved_at,
+        content_hash=f"sha256:{content_hash}",
+    )
+
+
+def _fetch_page_with_backoff(
+    client: httpx.Client, url: httpx.URL, max_retries: int
+) -> list[list[str]]:
+    delay = 2.0
+    for _attempt in range(max_retries):
+        response = client.get(url)
+        if response.status_code == 200:
+            text = response.text.lstrip("﻿")
+            return list(csv.reader(text.splitlines()))
+        if response.status_code == 429 or response.status_code >= 500:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        response.raise_for_status()
+    raise RuntimeError(f"EC donations fetch failed after {max_retries} retries: {url}")
+
+
+def _to_cents(value: str) -> int | None:
+    """Parse an EC-formatted money string like '£7,500.00' into integer cents."""
+    if not value:
+        return None
+    cleaned = value.replace("£", "").replace(",", "").strip()
+    try:
+        d = Decimal(cleaned)
+    except (InvalidOperation, ValueError):
+        return None
+    return int((d * 100).to_integral_value(rounding="ROUND_HALF_UP"))
+
+
+def _parse_ec_date(value: str) -> date | None:
+    """Parse an EC CSV date like '05/01/2020' (dd/mm/yyyy)."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _recipient_entity_type(regulated_entity_type: str) -> str:
+    return ENTITY_TYPE_BY_REGULATED_TYPE.get(regulated_entity_type, DEFAULT_REGULATED_ENTITY_TYPE)
+
+
+def _resolve_donor_company(row: dict[str, str]) -> tuple[Company | None, float, str]:
+    """Resolve a donation's donor to a Companies House Company.
+
+    Returns (company_or_none, match_confidence, match_method). Only resolves
+    organisation-status donors (never individuals — ADR-004 D1).
+    """
+    donor_status = (row.get("DonorStatus") or "").strip()
+    if donor_status not in ORGANISATION_DONOR_STATUSES:
+        return None, 0.0, "identifier"
+
+    company_number = (row.get("CompanyRegistrationNumber") or "").strip()
+    if company_number:
+        company = Company.objects.filter(company_number=company_number).first()
+        if company:
+            return company, 1.0, "identifier"
+        return None, 0.0, "identifier"
+
+    donor_name = (row.get("DonorName") or "").strip()
+    if not donor_name:
+        return None, 0.0, "identifier"
+
+    normalised = _normalise_name(donor_name)
+    matches = Company.objects.filter(normalised_name=normalised)
+    if matches.count() == 1:
+        return matches.get(), 0.9, "exact_name"
+
+    # 0 or 2+ candidates: uniqueness guard — never guess.
+    return None, 0.0, "identifier"
+
+
+def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
+    """Ingest a previously-downloaded EC donations CSV into Entity/Edge rows.
+
+    Returns summary stats: {matched, unmatched_donor, skipped_individual, total}.
+    """
+    csv_path = Path(csv_path)
+    matched = 0
+    unmatched_donor = 0
+    skipped_individual = 0
+    total = 0
+
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        with transaction.atomic():
+            for row in reader:
+                total += 1
+                donor_status = (row.get("DonorStatus") or "").strip()
+
+                company, confidence, method = _resolve_donor_company(row)
+                if donor_status not in ORGANISATION_DONOR_STATUSES:
+                    skipped_individual += 1
+                    continue
+                if company is None:
+                    unmatched_donor += 1
+                    continue
+
+                donor_entity, _ = Entity.objects.get_or_create(
+                    entity_type="company",
+                    company_number=company.company_number,
+                    defaults={
+                        "name": company.company_name,
+                        "registry_scheme": "GB-COH",
+                        "registry_id": company.company_number,
+                    },
+                )
+
+                recipient_name = (row.get("RegulatedEntityName") or "").strip()
+                regulated_entity_id = (row.get("RegulatedEntityId") or "").strip()
+                recipient_entity, _ = Entity.objects.get_or_create(
+                    entity_type=_recipient_entity_type(
+                        (row.get("RegulatedEntityType") or "").strip()
+                    ),
+                    registry_scheme="EC-REGULATED-ENTITY",
+                    registry_id=regulated_entity_id or None,
+                    defaults={"name": recipient_name},
+                )
+
+                amount_cents = _to_cents(row.get("Value") or "")
+                valid_from = _parse_ec_date(row.get("ReceivedDate") or "") or _parse_ec_date(
+                    row.get("AcceptedDate") or ""
+                )
+                ec_ref = (row.get("ECRef") or "").strip()
+
+                Edge.objects.get_or_create(
+                    edge_type="donation",
+                    source_entity=donor_entity,
+                    target_entity=recipient_entity,
+                    source_reference=ec_ref or None,
+                    defaults={
+                        "valid_from": valid_from,
+                        "source_name": SOURCE_NAME,
+                        "source_url": (
+                            "https://search.electoralcommission.org.uk/Search/Donations"
+                            f"?ecref={ec_ref}"
+                            if ec_ref
+                            else None
+                        ),
+                        "match_confidence": confidence,
+                        "match_method": method,
+                        "amount_cents": amount_cents,
+                        "currency": "GBP",
+                    },
+                )
+                matched += 1
+
+    return {
+        "matched": matched,
+        "unmatched_donor": unmatched_donor,
+        "skipped_individual": skipped_individual,
+        "total": total,
+    }

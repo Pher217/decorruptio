@@ -190,66 +190,61 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
     tier2 = 0
     unmatched = 0
 
-    for s in suppliers:
-        name = s["supplier_name"] or ""
-        scheme = s["supplier_id_scheme"] or ""
-        sid = s["supplier_id"] or ""
+    with transaction.atomic():
+        for s in suppliers:
+            name = s["supplier_name"] or ""
+            scheme = s["supplier_id_scheme"] or ""
+            sid = s["supplier_id"] or ""
 
-        # Tier 1: identifier match
-        if scheme == "GB-COH" and sid:
-            res, created = SupplierResolution.objects.update_or_create(
-                source_id=source_id,
-                supplier_name=name,
-                defaults={
-                    "supplier_id_scheme": scheme,
-                    "supplier_id": sid,
-                    "company_number": sid,
-                    "match_confidence": 1.0,
-                    "match_method": "identifier",
-                    "normalisation_note": None,
-                },
-            )
-            # Link company FK if it exists
-            company = Company.objects.filter(company_number=sid).first()
-            if company:
-                res.company = company
-                res.save()
-            tier1 += 1
-            continue
+            # Tier 1: identifier match — only count as matched if the Company
+            # actually exists in our CH snapshot. If not, record the attempt but
+            # count as unmatched so indicators don't silently skip it.
+            if scheme == "GB-COH" and sid:
+                company = Company.objects.filter(company_number=sid).first()
+                if company:
+                    SupplierResolution.objects.update_or_create(
+                        source_id=source_id,
+                        supplier_name=name,
+                        defaults={
+                            "supplier_id_scheme": scheme,
+                            "supplier_id": sid,
+                            "company": company,
+                            "company_number": sid,
+                            "match_confidence": 1.0,
+                            "match_method": "identifier",
+                            "normalisation_note": None,
+                        },
+                    )
+                    tier1 += 1
+                else:
+                    SupplierResolution.objects.update_or_create(
+                        source_id=source_id,
+                        supplier_name=name,
+                        defaults={
+                            "supplier_id_scheme": scheme,
+                            "supplier_id": sid,
+                            "company": None,
+                            "company_number": sid,
+                            "match_confidence": 0.0,
+                            "match_method": None,
+                            "normalisation_note": (
+                                f"GB-COH identifier '{sid}' not found in CH bulk snapshot."
+                            ),
+                        },
+                    )
+                    unmatched += 1
+                continue
 
-        # Tier 2: exact name match (uniqueness-guarded)
-        normalised = _normalise_name(name)
-        if not normalised:
-            unmatched += 1
-            continue
+            # Tier 2: exact name match (uniqueness-guarded)
+            normalised = _normalise_name(name)
+            if not normalised:
+                unmatched += 1
+                continue
 
-        matches = Company.objects.filter(normalised_name=normalised)
+            matches = Company.objects.filter(normalised_name=normalised)
 
-        if matches.count() == 1:
-            company = matches.get()
-            res, created = SupplierResolution.objects.update_or_create(
-                source_id=source_id,
-                supplier_name=name,
-                defaults={
-                    "supplier_id_scheme": scheme,
-                    "supplier_id": sid,
-                    "company": company,
-                    "company_number": company.company_number,
-                    "match_confidence": 0.9,
-                    "match_method": "exact_name",
-                    "normalisation_note": (
-                        f"Uppercase + whitespace normalised. "
-                        f"Company status: {company.company_status}"
-                    ),
-                },
-            )
-            tier2 += 1
-        elif matches.count() > 1:
-            # Uniqueness guard: multiple companies with the same name → no match
-            # Prefer active company if exactly one is active
-            active = matches.filter(company_status="Active")
-            if active.count() == 1:
-                company = active.get()
+            if matches.count() == 1:
+                company = matches.get()
                 res, created = SupplierResolution.objects.update_or_create(
                     source_id=source_id,
                     supplier_name=name,
@@ -261,34 +256,57 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
                         "match_confidence": 0.9,
                         "match_method": "exact_name",
                         "normalisation_note": (
-                            f"Multiple companies with this name; selected the sole active one. "
-                            f"{matches.count()} total matches, 1 active."
+                            f"Uppercase + whitespace normalised. "
+                            f"Company status: {company.company_status}"
                         ),
                     },
                 )
                 tier2 += 1
+            elif matches.count() > 1:
+                # Uniqueness guard: multiple companies with the same name → no match
+                # Prefer active company if exactly one is active
+                active = matches.filter(company_status="Active")
+                if active.count() == 1:
+                    company = active.get()
+                    res, created = SupplierResolution.objects.update_or_create(
+                        source_id=source_id,
+                        supplier_name=name,
+                        defaults={
+                            "supplier_id_scheme": scheme,
+                            "supplier_id": sid,
+                            "company": company,
+                            "company_number": company.company_number,
+                            "match_confidence": 0.9,
+                            "match_method": "exact_name",
+                            "normalisation_note": (
+                                f"Multiple companies with this name; selected the sole active one. "
+                                f"{matches.count()} total matches, 1 active."
+                            ),
+                        },
+                    )
+                    tier2 += 1
+                else:
+                    # Ambiguous — no match
+                    SupplierResolution.objects.update_or_create(
+                        source_id=source_id,
+                        supplier_name=name,
+                        defaults={
+                            "supplier_id_scheme": scheme,
+                            "supplier_id": sid,
+                            "company": None,
+                            "company_number": None,
+                            "match_confidence": 0.0,
+                            "match_method": None,
+                            "normalisation_note": (
+                                f"Ambiguous name: {matches.count()} companies, "
+                                f"{active.count()} active. No match — uniqueness guard."
+                            ),
+                        },
+                    )
+                    unmatched += 1
             else:
-                # Ambiguous — no match
-                SupplierResolution.objects.update_or_create(
-                    source_id=source_id,
-                    supplier_name=name,
-                    defaults={
-                        "supplier_id_scheme": scheme,
-                        "supplier_id": sid,
-                        "company": None,
-                        "company_number": None,
-                        "match_confidence": 0.0,
-                        "match_method": None,
-                        "normalisation_note": (
-                            f"Ambiguous name: {matches.count()} companies, "
-                            f"{active.count()} active. No match — uniqueness guard."
-                        ),
-                    },
-                )
+                # No match at all
                 unmatched += 1
-        else:
-            # No match at all
-            unmatched += 1
 
     total = tier1 + tier2 + unmatched
     return {

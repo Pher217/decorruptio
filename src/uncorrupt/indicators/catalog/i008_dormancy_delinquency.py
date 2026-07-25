@@ -85,7 +85,7 @@ class DormancyDelinquency(Indicator):
                 filing_age_days = (
                     award.award_date.date() - company.accounts_last_made_up_date
                 ).days
-                stale_threshold_days = STALE_FILING_MONTHS * 30
+                stale_threshold_days = STALE_FILING_MONTHS * 30.44  # avg month length
                 if filing_age_days > stale_threshold_days:
                     months_stale = filing_age_days // 30
                     stale_reason = (
@@ -137,7 +137,9 @@ def _make_evidence(award: Award, company, source: str) -> ProvenanceRecord:
         source_id=source,
         source_url=award.tender_ref.source_url if award.tender_ref else "",
         retrieved_at=datetime.now(UTC),
-        content_hash=hashlib.sha256(json.dumps(award.raw_json).encode()).hexdigest(),
+        content_hash=hashlib.sha256(
+            json.dumps(award.raw_json, sort_keys=True).encode()
+        ).hexdigest(),
         license="Open data",
         redistribution=Redistribution.OPEN,
         jurisdiction="GB",

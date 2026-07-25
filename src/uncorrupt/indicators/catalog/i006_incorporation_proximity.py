@@ -118,7 +118,9 @@ def _make_evidence(award: Award, company, source: str) -> ProvenanceRecord:
         source_id=source,
         source_url=award.tender_ref.source_url if award.tender_ref else "",
         retrieved_at=datetime.now(UTC),
-        content_hash=hashlib.sha256(json.dumps(award.raw_json).encode()).hexdigest(),
+        content_hash=hashlib.sha256(
+            json.dumps(award.raw_json, sort_keys=True).encode()
+        ).hexdigest(),
         license="Open data",
         redistribution=Redistribution.OPEN,
         jurisdiction="GB",

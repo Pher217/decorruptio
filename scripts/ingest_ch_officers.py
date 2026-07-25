@@ -24,7 +24,11 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
 django.setup()
 
-from uncorrupt.graph.ch_officers import fetch_company_officers, ingest_company_officers
+from uncorrupt.graph.ch_officers import (
+    DEFAULT_MAX_CACHE_AGE_DAYS,
+    fetch_company_officers,
+    ingest_company_officers,
+)
 
 DEFAULT_OUTPUT_DIR = "experiments/ch_officers"
 
@@ -52,6 +56,13 @@ def main() -> None:
         action="store_true",
         help="Skip the download and ingest an existing cache in --output-dir.",
     )
+    parser.add_argument(
+        "--max-age-days",
+        type=int,
+        default=DEFAULT_MAX_CACHE_AGE_DAYS,
+        help="Refetch a cached company response older than this many days "
+        f"(default {DEFAULT_MAX_CACHE_AGE_DAYS}).",
+    )
     args = parser.parse_args()
 
     company_numbers = list(args.company_numbers or [])
@@ -61,7 +72,9 @@ def main() -> None:
         parser.error("provide --company-number and/or --company-numbers-file")
 
     if not args.skip_fetch:
-        results = fetch_company_officers(company_numbers, args.output_dir)
+        results = fetch_company_officers(
+            company_numbers, args.output_dir, max_cache_age_days=args.max_age_days
+        )
         fetched = sum(1 for r in results if not r.cached)
         cached = sum(1 for r in results if r.cached)
         print(f"Fetched {fetched} companies ({cached} already cached) -> {args.output_dir}")

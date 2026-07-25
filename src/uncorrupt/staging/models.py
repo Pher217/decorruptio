@@ -148,3 +148,79 @@ class Flag(models.Model):
 
     def __str__(self) -> str:
         return f"{self.indicator_id}:{self.subject_ref} ({self.review_status})"
+
+
+class Company(models.Model):
+    """A company from the Companies House "Basic Company Data" bulk CSV.
+
+    Company-level data only — no officers, no PSC, no personal data (scope boundary).
+    """
+
+    company_number = models.CharField(max_length=20, primary_key=True)
+    company_name = models.CharField(max_length=500, db_index=True)
+    company_status = models.CharField(max_length=50, null=True, blank=True)
+    incorporation_date = models.DateField(null=True, blank=True)
+    accounts_category = models.CharField(max_length=100, null=True, blank=True)
+    accounts_last_made_up_date = models.DateField(null=True, blank=True)
+    sic_codes = models.TextField(null=True, blank=True)
+    registered_address = models.TextField(null=True, blank=True)
+    # Normalised name for tier-2 matching (uppercase, stripped whitespace)
+    normalised_name = models.CharField(max_length=500, db_index=True, null=True, blank=True)
+    # Which CH bulk snapshot this came from
+    bulk_snapshot_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["normalised_name"]),
+            models.Index(fields=["company_name"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.company_number}: {self.company_name}"
+
+
+class SupplierResolution(models.Model):
+    """Resolution of a supplier (from Awards) to a Companies House company.
+
+    Tier 1: identifier match (supplier_id with scheme GB-COH → company_number). Confidence 1.0.
+    Tier 2: exact name match (uniqueness-guarded — only when exactly one company has that name).
+    Tier 3: normalised name match — deferred (fuzzy), not yet built.
+    """
+
+    MATCH_METHODS = [
+        ("identifier", "Identifier (GB-COH)"),
+        ("exact_name", "Exact name"),
+        ("normalised_name", "Normalised name (deferred)"),
+    ]
+
+    source_id = models.CharField(max_length=50, db_index=True)
+    supplier_name = models.CharField(max_length=500)
+    supplier_id_scheme = models.CharField(max_length=50, null=True, blank=True)
+    supplier_id = models.CharField(max_length=200, null=True, blank=True)
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="resolutions",
+        null=True,
+        blank=True,
+    )
+    company_number = models.CharField(max_length=20, null=True, blank=True, db_index=True)
+    match_confidence = models.FloatField(default=0.0)
+    match_method = models.CharField(max_length=20, choices=MATCH_METHODS, null=True, blank=True)
+    # For non-identifier matches, how the name was normalised
+    normalisation_note = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("source_id", "supplier_name")]
+        indexes = [
+            models.Index(fields=["source_id", "match_method"]),
+            models.Index(fields=["company_number"]),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.source_id}:{self.supplier_name} → {self.company_number} ({self.match_method})"
+        )

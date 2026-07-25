@@ -9,7 +9,7 @@ Maps each source's native format into the unified OCDS-flattened schema:
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -51,7 +51,8 @@ def _parse_dt(v: Any) -> datetime | None:
     if "T" not in s and len(s) == 10:
         s = s + "T00:00:00"
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     except ValueError:
         return None
 

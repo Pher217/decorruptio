@@ -206,8 +206,9 @@ def _setup_award_with_resolution(
 
 
 def _parse_dt(s: str):
+    from datetime import UTC
 
-    return datetime.fromisoformat(s)
+    return datetime.fromisoformat(s).replace(tzinfo=UTC)
 
 
 def _make_ctx():
@@ -482,6 +483,85 @@ class SupplierResolutionTest(TestCase):
         res = SupplierResolution.objects.get(supplier_name="Unique Supplier Ltd")
         assert res.match_confidence == 0.9
         assert res.match_method == "exact_name"
+
+    def test_exact_name_sole_active_match(self):
+        """Multiple companies share a name but only one is Active → match the active one."""
+        _setup_company(
+            company_number="11111111",
+            company_name="Shared Name Ltd",
+            company_status="Active",
+        )
+        _setup_company(
+            company_number="22222222",
+            company_name="Shared Name Ltd",
+            company_status="Dissolved",
+        )
+
+        tender = Tender.objects.create(
+            source_id="uk_contracts_finder",
+            tender_id="test-tender-sole-active",
+            source_url="https://example.com",
+        )
+        Award.objects.create(
+            source_id="uk_contracts_finder",
+            tender_id="test-tender-sole-active",
+            award_id="test-award-sole-active",
+            tender_ref=tender,
+            supplier_name="Shared Name Ltd",
+            currency="GBP",
+            value_amount_cents=5000000,
+            status="active",
+            award_date=_parse_dt("2024-06-15T00:00:00"),
+            raw_json={},
+        )
+
+        result = resolve_suppliers("uk_contracts_finder")
+        assert result["tier2_exact_name"] == 1
+
+        res = SupplierResolution.objects.get(supplier_name="Shared Name Ltd")
+        assert res.match_confidence == 0.9
+        assert res.match_method == "exact_name"
+        assert res.company_number == "11111111"
+        assert "sole active" in (res.normalisation_note or "").lower()
+
+    def test_exact_name_two_active_no_match(self):
+        """Multiple active companies share a name → uniqueness guard, no match."""
+        _setup_company(
+            company_number="11111111",
+            company_name="Dup Active Ltd",
+            company_status="Active",
+        )
+        _setup_company(
+            company_number="22222222",
+            company_name="Dup Active Ltd",
+            company_status="Active",
+        )
+
+        tender = Tender.objects.create(
+            source_id="uk_contracts_finder",
+            tender_id="test-tender-two-active",
+            source_url="https://example.com",
+        )
+        Award.objects.create(
+            source_id="uk_contracts_finder",
+            tender_id="test-tender-two-active",
+            award_id="test-award-two-active",
+            tender_ref=tender,
+            supplier_name="Dup Active Ltd",
+            currency="GBP",
+            value_amount_cents=5000000,
+            status="active",
+            award_date=_parse_dt("2024-06-15T00:00:00"),
+            raw_json={},
+        )
+
+        result = resolve_suppliers("uk_contracts_finder")
+        assert result["tier2_exact_name"] == 0
+        assert result["unmatched"] >= 1
+
+        res = SupplierResolution.objects.get(supplier_name="Dup Active Ltd")
+        assert res.match_confidence == 0.0
+        assert res.match_method is None
 
 
 class Phase4KnownCaseCoverageTest(TestCase):

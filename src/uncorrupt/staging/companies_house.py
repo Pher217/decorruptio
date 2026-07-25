@@ -59,7 +59,8 @@ def ingest_ch_bulk_csv(
         reader = csv.DictReader(f)
         # Build a mapping from CSV columns to our fields
         header_lower = {
-            h.lower().replace(" ", "").replace("_", ""): h for h in reader.fieldnames or []
+            h.lower().replace(" ", "").replace("_", "").replace(".", ""): h
+            for h in reader.fieldnames or []
         }
 
         # Map known column names (normalised) to CSV headers

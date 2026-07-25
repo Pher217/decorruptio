@@ -47,5 +47,9 @@ uv run python scripts/kill_experiment.py --sample-size 50 --output flags.json
 - **UK Contracts Finder**: native OCDS 1.1, cursor pagination via `Link` header
 - **Colombia SECOP II**: Socrata API, SoQL query syntax (`$where`, `$limit`, `$order`)
 
+## Scripts
+- **One script, iterated; never a new variant per attempt.** Delete exploratory scripts before opening a PR.
+- Keep `scripts/` to production-quality runners only. Throwaway experiments go in `experiments/` (gitignored).
+
 ## Mexico dropped
 CompraNet API returning 503/500. Replaced with Colombia SECOP II (same enforcement-gap profile, live API).

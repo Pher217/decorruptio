@@ -40,6 +40,9 @@ from uncorrupt.indicators.catalog.i002_short_bid_window import ShortBidWindow
 from uncorrupt.indicators.catalog.i003_repeat_winner_share import RepeatWinnerShare
 from uncorrupt.indicators.catalog.i004_price_vs_estimate import PriceVsEstimate
 from uncorrupt.indicators.catalog.i005_direct_award_share import DirectAwardShare
+from uncorrupt.indicators.catalog.i006_incorporation_proximity import IncorporationProximity
+from uncorrupt.indicators.catalog.i007_value_vs_company_size import ValueVsCompanySize
+from uncorrupt.indicators.catalog.i008_dormancy_delinquency import DormancyDelinquency
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.loader import load_locale
 from uncorrupt.staging.ingest import ingest_artifacts
@@ -282,6 +285,9 @@ def run_experiment(
         RepeatWinnerShare(),
         PriceVsEstimate(),
         DirectAwardShare(),
+        IncorporationProximity(),
+        ValueVsCompanySize(),
+        DormancyDelinquency(),
     ]
 
     all_flags: list[dict[str, Any]] = []

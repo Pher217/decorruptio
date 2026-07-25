@@ -10,7 +10,7 @@ Company-level fields only — no officers, no PSC, no personal data (scope bound
 from __future__ import annotations
 
 import csv
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -137,7 +137,9 @@ def _parse_date(s: str | None) -> date | None:
         return None
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
         try:
-            return date.fromisoformat(s) if fmt == "%Y-%m-%d" else date.strptime(s, fmt)  # type: ignore[arg-type]
+            if fmt == "%Y-%m-%d":
+                return date.fromisoformat(s)
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
     return None

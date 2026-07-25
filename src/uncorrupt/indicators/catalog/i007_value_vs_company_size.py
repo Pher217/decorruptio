@@ -85,14 +85,15 @@ class ValueVsCompanySize(Indicator):
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
-            res = resolutions[award.supplier_name]
-            company = _get_company(res["company_number"])
+            assert award.supplier_name is not None
+            r = resolutions[award.supplier_name]
+            company = _get_company(r["company_number"])
             if not company or not company.accounts_category:
                 continue
 
             category = company.accounts_category.lower().strip()
             value_cents = award.value_amount_cents
-            confidence_note = _confidence_note(res)
+            confidence_note = _confidence_note(r)
 
             flag_reason = None
             threshold = 0

@@ -65,13 +65,14 @@ class DormancyDelinquency(Indicator):
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
-            res = resolutions[award.supplier_name]
-            company = _get_company(res["company_number"])
+            assert award.supplier_name is not None
+            r = resolutions[award.supplier_name]
+            company = _get_company(r["company_number"])
             if not company:
                 continue
 
             flag_reason = None
-            confidence_note = _confidence_note(res)
+            confidence_note = _confidence_note(r)
 
             # Check for dormant accounts
             if (

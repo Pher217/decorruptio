@@ -64,15 +64,16 @@ class IncorporationProximity(Indicator):
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
-            res = resolutions[award.supplier_name]
-            company = _get_company(res["company_number"])
+            assert award.supplier_name is not None
+            r = resolutions[award.supplier_name]
+            company = _get_company(r["company_number"])
             if not company or not company.incorporation_date or not award.award_date:
                 continue
 
             age_days = (award.award_date.date() - company.incorporation_date).days
 
             if 0 <= age_days < INCORPORATION_PROXIMITY_DAYS:
-                confidence_note = _confidence_note(res)
+                confidence_note = _confidence_note(r)
                 yield Flag(
                     indicator_id=self.id,
                     subject_ref=f"{award.tender_id}:{award.award_id}",

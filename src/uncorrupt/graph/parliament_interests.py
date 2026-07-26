@@ -88,7 +88,7 @@ from typing import Any
 import httpx
 from django.db import transaction
 
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name
 from uncorrupt.staging.models import Company
 
@@ -626,21 +626,29 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
                     properties["end_date_before_registration_date"] = valid_to.isoformat()
                     valid_to = None
 
-                Edge.objects.get_or_create(
+                # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                edge, _ = Edge.objects.get_or_create(
                     edge_type="declared_interest",
                     source_entity=member_entity,
                     target_entity=counterparty_entity,
-                    source_reference=str(interest_id),
+                    valid_from=valid_from,
+                    valid_to=valid_to,
                     defaults={
-                        "valid_from": valid_from,
-                        "valid_to": valid_to,
-                        "source_name": SOURCE_NAME,
-                        "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
-                        "match_confidence": confidence,
-                        "match_method": method,
                         "amount_cents": amount_cents,
                         "currency": currency,
                         "properties": properties,
+                    },
+                )
+
+                # Attestation = THE EVIDENCE
+                Attestation.objects.get_or_create(
+                    edge=edge,
+                    source_name=SOURCE_NAME,
+                    source_reference=str(interest_id),
+                    defaults={
+                        "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
+                        "match_confidence": confidence,
+                        "match_method": method,
                     },
                 )
                 matched += 1

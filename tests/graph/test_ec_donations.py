@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from uncorrupt.graph.ec_donations import ingest_ec_donations_csv
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.models import Company
 
 CSV_HEADER = [
@@ -71,9 +71,9 @@ class TestEcDonationsIngest:
         summary = ingest_ec_donations_csv(csv_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="C0501001")
-        assert edge.match_confidence == 1.0
-        assert edge.match_method == "identifier"
+        attestation = Attestation.objects.get(source_reference="C0501001")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
 
     def test_ambiguous_donor_name_creates_no_edge(self, tmp_path):
         """Two companies sharing a normalised name must never be guessed (uniqueness guard)."""
@@ -105,7 +105,7 @@ class TestEcDonationsIngest:
 
         assert summary["matched"] == 0
         assert summary["unmatched_donor"] == 1
-        assert Edge.objects.filter(source_reference="C0501002").count() == 0
+        assert Attestation.objects.filter(source_reference="C0501002").count() == 0
 
     def test_amount_cents_is_an_integer(self, tmp_path):
         """Money must be integer cents — never a float — regardless of the CSV formatting."""
@@ -134,7 +134,8 @@ class TestEcDonationsIngest:
 
         ingest_ec_donations_csv(csv_path)
 
-        edge = Edge.objects.get(source_reference="C0501003")
+        attestation = Attestation.objects.get(source_reference="C0501003")
+        edge = attestation.edge
         assert edge.amount_cents == 123456
         assert isinstance(edge.amount_cents, int)
         assert edge.currency == "GBP"
@@ -166,7 +167,8 @@ class TestEcDonationsIngest:
 
         ingest_ec_donations_csv(csv_path)
 
-        edge = Edge.objects.get(source_reference="C0501004")
+        attestation = Attestation.objects.get(source_reference="C0501004")
+        edge = attestation.edge
         assert edge.valid_from.isoformat() == "2020-03-01"
 
     def test_idless_recipients_with_different_names_stay_distinct(self, tmp_path):
@@ -247,7 +249,7 @@ class TestEcDonationsIngest:
 
         assert summary["matched"] == 0
         assert summary["skipped_no_recipient_name"] == 1
-        assert Edge.objects.filter(source_reference="C0501012").count() == 0
+        assert Attestation.objects.filter(source_reference="C0501012").count() == 0
 
     def test_unparseable_received_date_does_not_fall_back_to_accepted_date(self, tmp_path):
         """A malformed (non-blank) ReceivedDate must not silently become AcceptedDate."""
@@ -277,7 +279,8 @@ class TestEcDonationsIngest:
         summary = ingest_ec_donations_csv(csv_path)
 
         assert summary["invalid_received_date"] == 1
-        edge = Edge.objects.get(source_reference="C0501006")
+        attestation = Attestation.objects.get(source_reference="C0501006")
+        edge = attestation.edge
         assert edge.valid_from is None
 
     def test_blank_received_date_falls_back_to_accepted_date(self, tmp_path):
@@ -308,7 +311,8 @@ class TestEcDonationsIngest:
         summary = ingest_ec_donations_csv(csv_path)
 
         assert summary["invalid_received_date"] == 0
-        edge = Edge.objects.get(source_reference="C0501007")
+        attestation = Attestation.objects.get(source_reference="C0501007")
+        edge = attestation.edge
         assert edge.valid_from.isoformat() == "2020-03-20"
 
     def test_reingest_updates_stale_amount_instead_of_duplicating(self, tmp_path):
@@ -339,8 +343,9 @@ class TestEcDonationsIngest:
         summary_2 = ingest_ec_donations_csv(csv_path_2)
 
         assert summary_2["matched"] == 0  # nothing newly created, only refreshed
-        assert Edge.objects.filter(source_reference="C0501008").count() == 1
-        edge = Edge.objects.get(source_reference="C0501008")
+        assert Attestation.objects.filter(source_reference="C0501008").count() == 1
+        attestation = Attestation.objects.get(source_reference="C0501008")
+        edge = attestation.edge
         assert edge.amount_cents == 150000
 
     def test_distinct_donations_without_ecref_stay_distinct(self, tmp_path):
@@ -383,12 +388,7 @@ class TestEcDonationsIngest:
         summary = ingest_ec_donations_csv(csv_path)
 
         assert summary["matched"] == 2
-        assert (
-            Edge.objects.filter(
-                source_reference__isnull=True, amount_cents__in=[100000, 200000]
-            ).count()
-            == 2
-        )
+        assert Edge.objects.filter(amount_cents__in=[100000, 200000]).count() == 2
 
     def test_individual_donor_creates_no_entity_or_edge(self, tmp_path):
         """Individual donors are out of scope (ADR-004 D1) — no Entity/Edge created."""
@@ -413,5 +413,5 @@ class TestEcDonationsIngest:
         summary = ingest_ec_donations_csv(csv_path)
 
         assert summary["skipped_individual"] == 1
-        assert Edge.objects.filter(source_reference="C0501005").count() == 0
+        assert Attestation.objects.filter(source_reference="C0501005").count() == 0
         assert not Entity.objects.filter(name="Anthony P Clarke").exists()

@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Entity
 from uncorrupt.graph.parliament_interests import (
     fetch_parliament_interests,
     ingest_parliament_interests_json,
@@ -97,7 +97,7 @@ class TestParliamentInterestsIngest:
 
         ingest_parliament_interests_json(json_path)
 
-        edge = Edge.objects.get(source_reference="16217")
+        edge = Attestation.objects.get(source_reference="16217").edge
         assert edge.valid_from.isoformat() == "2026-07-13"
 
     def test_end_date_maps_to_valid_to(self, tmp_path):
@@ -122,7 +122,7 @@ class TestParliamentInterestsIngest:
 
         ingest_parliament_interests_json(json_path)
 
-        edge = Edge.objects.get(source_reference="16306")
+        edge = Attestation.objects.get(source_reference="16306").edge
         assert edge.valid_to.isoformat() == "2026-08-19"
 
     def test_ambiguous_counterparty_name_creates_no_edge(self, tmp_path):
@@ -150,7 +150,7 @@ class TestParliamentInterestsIngest:
 
         assert summary["matched"] == 0
         assert summary["unmatched_counterparty"] == 1
-        assert Edge.objects.filter(source_reference="16400").count() == 0
+        assert Attestation.objects.filter(source_reference="16400").count() == 0
 
     def test_company_number_counterparty_gives_full_confidence(self, tmp_path):
         """A donor row with a company registration number joins with zero name matching."""
@@ -176,9 +176,10 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="16217")
-        assert edge.match_confidence == 1.0
-        assert edge.match_method == "identifier"
+        attestation = Attestation.objects.get(source_reference="16217")
+        edge = attestation.edge
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
         assert edge.amount_cents == 1000000
         assert edge.currency == "GBP"
 
@@ -202,7 +203,7 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="16500")
+        edge = Attestation.objects.get(source_reference="16500").edge
         assert edge.amount_cents is None
         assert (
             edge.properties["value_band"] == "(ii) Other shareholdings, valued at more than £70,000"
@@ -226,7 +227,7 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["skipped_private_individual"] == 1
-        assert Edge.objects.filter(source_reference="16218").count() == 0
+        assert Attestation.objects.filter(source_reference="16218").count() == 0
         assert not Entity.objects.filter(name="Anthony P Clarke").exists()
 
     def test_family_member_category_creates_no_entity_or_edge(self, tmp_path):
@@ -246,7 +247,7 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["skipped_family"] == 1
-        assert Edge.objects.filter(source_reference="16600").count() == 0
+        assert Attestation.objects.filter(source_reference="16600").count() == 0
         assert not Entity.objects.filter(name="Dr Maria Psatha").exists()
 
     def test_child_interest_inherits_parent_payer_name(self, tmp_path):
@@ -274,10 +275,11 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="16312")
+        edge = Attestation.objects.get(source_reference="16312").edge
         assert edge.target_entity.name == "Law Firm LLP"
-        assert edge.match_confidence == 0.9
-        assert edge.match_method == "exact_name"
+        attestation = edge.attestations.get()
+        assert attestation.match_confidence == 0.9
+        assert attestation.match_method == "exact_name"
 
     def test_named_non_company_counterparty_resolves_at_reduced_confidence(self, tmp_path):
         """A named payer with no Companies House match still records at reduced confidence."""
@@ -296,9 +298,10 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="16700")
-        assert edge.match_confidence == 0.5
-        assert edge.match_method == "name_only"
+        edge = Attestation.objects.get(source_reference="16700").edge
+        attestation = edge.attestations.get()
+        assert attestation.match_confidence == 0.5
+        assert attestation.match_method == "name_only"
         assert edge.target_entity.entity_type == "regulated_entity"
 
     def test_member_entity_created_with_registry_id(self, tmp_path):
@@ -361,8 +364,8 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 2
-        edge_1 = Edge.objects.get(source_reference="17001")
-        edge_2 = Edge.objects.get(source_reference="17002")
+        edge_1 = Attestation.objects.get(source_reference="17001").edge
+        edge_2 = Attestation.objects.get(source_reference="17002").edge
         assert edge_1.target_entity.pk != edge_2.target_entity.pk
         assert edge_1.target_entity.registry_scheme == "UK-PARLIAMENT-UNRESOLVED"
 
@@ -384,7 +387,7 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["matched"] == 1
-        edge = Edge.objects.get(source_reference="17010")
+        edge = Attestation.objects.get(source_reference="17010").edge
         assert edge.properties["declared_company_number"] == "99999999"
         assert edge.target_entity.registry_scheme == "UK-PARLIAMENT-UNRESOLVED"
 
@@ -412,7 +415,7 @@ class TestParliamentInterestsIngest:
         summary = ingest_parliament_interests_json(json_path)
 
         assert summary["inverted_interval"] == 1
-        edge = Edge.objects.get(source_reference="17020")
+        edge = Attestation.objects.get(source_reference="17020").edge
         assert edge.valid_to is None
         assert edge.properties["end_date_before_registration_date"] == "2026-06-19"
 
@@ -435,7 +438,7 @@ class TestParliamentInterestsIngest:
 
         assert summary["skipped_unclassified_counterparty"] == 1
         assert summary["matched"] == 0
-        assert Edge.objects.filter(source_reference="17030").count() == 0
+        assert Attestation.objects.filter(source_reference="17030").count() == 0
         assert not Entity.objects.filter(name="Ambiguous Donor").exists()
 
     def test_payer_with_no_private_individual_classification_is_skipped(self, tmp_path):
@@ -475,7 +478,7 @@ class TestParliamentInterestsIngest:
 
         ingest_parliament_interests_json(json_path)
 
-        edge = Edge.objects.get(source_reference="17040")
+        edge = Attestation.objects.get(source_reference="17040").edge
         assert edge.amount_cents is None
         assert edge.properties["value_band_min_cents"] == 7000000
         assert "value_band_max_cents" not in edge.properties
@@ -499,7 +502,7 @@ class TestParliamentInterestsIngest:
 
         ingest_parliament_interests_json(json_path)
 
-        edge = Edge.objects.get(source_reference="17041")
+        edge = Attestation.objects.get(source_reference="17041").edge
         assert "value_band_min_cents" not in edge.properties
         assert "value_band_max_cents" not in edge.properties
         assert (

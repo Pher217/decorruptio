@@ -59,7 +59,7 @@ from typing import Any
 import httpx
 from django.db import transaction
 
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name
 from uncorrupt.staging.models import Company
 
@@ -400,19 +400,27 @@ def ingest_company_officers(
                 else:
                     source_reference = f"{company_number}:{name}:{appointed_on or ''}"
 
-                Edge.objects.get_or_create(
+                # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                edge, _ = Edge.objects.get_or_create(
                     edge_type="officer_of",
                     source_entity=person_entity,
                     target_entity=company_entity,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    defaults={
+                        "properties": edge_properties,
+                    },
+                )
+
+                # Attestation = THE EVIDENCE
+                Attestation.objects.get_or_create(
+                    edge=edge,
+                    source_name=SOURCE_NAME,
                     source_reference=source_reference,
                     defaults={
-                        "valid_from": valid_from,
-                        "valid_to": valid_to,
-                        "source_name": SOURCE_NAME,
                         "source_url": officers_url,
                         "match_confidence": confidence,
                         "match_method": match_method,
-                        "properties": edge_properties,
                     },
                 )
                 edges_created += 1

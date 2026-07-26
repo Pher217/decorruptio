@@ -9,6 +9,38 @@ from __future__ import annotations
 from django.db import models
 
 
+class IngestRun(models.Model):
+    """Tracks each ingest run for freshness SLA computation (ADR-005 D2).
+
+    One row per ingest execution. The most recent successful run per source
+    determines the source's freshness status.
+    """
+
+    STATUS_CHOICES = [
+        ("running", "Running"),
+        ("success", "Success"),
+        ("failed", "Failed"),
+    ]
+
+    source_id = models.CharField(max_length=50, db_index=True)
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="running")
+    rows_ingested = models.IntegerField(default=0)
+    content_hash = models.CharField(max_length=64, null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["source_id", "-finished_at"]),
+            models.Index(fields=["status"]),
+        ]
+        ordering = ["-finished_at"]
+
+    def __str__(self) -> str:
+        return f"{self.source_id} @ {self.started_at} ({self.status})"
+
+
 class Tender(models.Model):
     """A procurement process (tender). One row per source-native tender ID."""
 

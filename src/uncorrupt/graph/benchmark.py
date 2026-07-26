@@ -2,18 +2,39 @@
 
 Implements the acceptance criteria from ADR-005 D3 / spec v0.3 §7-bis:
 
-1. **Laundering collapse**: two attestations tracing to a single origin
-   (via ``derived_from`` chain) count as one.
+1. **Laundering collapse**: corroboration — not edge inclusion — differs
+   between modes. Every edge with at least one attestation is scoreable in
+   both modes. Without collapse, an edge is "corroborated" once it has >=2
+   attestations (naive count). With collapse, it is corroborated only once
+   it has >=2 *independent* origins (following ``derived_from`` to the
+   root). ``laundered_count`` reports edges with >=2 attestations but only
+   1 independent origin — apparent corroboration that is really one source
+   wearing several hats.
 2. **Evidence-source-level holdout**: drop a source, and every edge attested
    *only* by that source drops out.
-3. **Dual reporting**: precision/recall reported both with and without
+3. **Dual reporting**: corroboration reported both with and without
    laundering collapse so the delta is visible.
 
+Precision is scoped to the *tested subgraph*: a false positive is an edge
+between a golden-set entity pair that does not match any golden relationship
+by edge_type. Edges between entity pairs the golden set never references are
+excluded entirely (``untested_edges``) rather than counted as false
+positives — precision answers "of the claims we make about tested entity
+pairs, how many are correct", not "of everything in the graph".
+
+Matching a golden relationship to an edge is entity + edge_type only
+(non-temporal) — see ``_match_golden_to_edge``. Entities are matched by
+registry identifier when the golden entry supplies one (ADR-004 D2),
+falling back to normalised-name comparison otherwise; ``name_only_matches``
+tracks how many true positives relied on the weaker, name-based path.
+
 Additional metrics:
-- Temporal accuracy: fraction of recovered edges whose valid_from/valid_to
-  match the golden relationship's time range (±30 days tolerance).
+- Temporal accuracy: fraction of *matched* edges whose valid_from/valid_to
+  fall within tolerance of the golden relationship's dates. A NULL edge
+  date where the golden has a date is a miss, not a pass
+  (``null_date_matches``).
 - Resolution rate: fraction of golden relationships where both endpoints
-  were resolved to a named entity (not a scoped placeholder).
+  were resolved to a named entity (not an unresolved placeholder).
 """
 
 from __future__ import annotations
@@ -24,6 +45,7 @@ from datetime import date, timedelta
 from django.db.models import QuerySet
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.staging.companies_house import _normalise_name
 
 
 @dataclass(frozen=True)
@@ -37,6 +59,11 @@ class GoldenRelationship:
         valid_from: Expected start date (or None if unknown).
         valid_to: Expected end date (or None if ongoing).
         amount_cents: Expected amount in cents (or None if not applicable).
+        source_registry_scheme: Registry scheme for the source entity, if known.
+        source_registry_id: Registry ID for the source entity, if known. When
+            supplied, matching prefers this over the source_name string.
+        target_registry_scheme: Registry scheme for the target entity, if known.
+        target_registry_id: Registry ID for the target entity, if known.
     """
 
     source_name: str
@@ -45,6 +72,10 @@ class GoldenRelationship:
     valid_from: date | None = None
     valid_to: date | None = None
     amount_cents: int | None = None
+    source_registry_scheme: str | None = None
+    source_registry_id: str | None = None
+    target_registry_scheme: str | None = None
+    target_registry_id: str | None = None
 
 
 @dataclass
@@ -60,14 +91,22 @@ class BenchmarkResult:
     resolution_rate: float
     total_golden: int
     total_recovered: int
+    corroborated_count: int
+    laundered_count: int
+    untested_edges: int
+    null_date_matches: int
+    name_only_matches: int
 
     def __str__(self) -> str:
         return (
             f"precision={self.precision:.3f} recall={self.recall:.3f} "
             f"tp={self.true_positives} fp={self.false_positives} "
-            f"fn={self.false_negatives} "
+            f"fn={self.false_negatives} untested={self.untested_edges} "
             f"temporal_acc={self.temporal_accuracy:.3f} "
+            f"null_dates={self.null_date_matches} "
             f"resolution={self.resolution_rate:.3f} "
+            f"corroborated={self.corroborated_count} laundered={self.laundered_count} "
+            f"name_only_matches={self.name_only_matches} "
             f"(golden={self.total_golden} recovered={self.total_recovered})"
         )
 
@@ -78,7 +117,7 @@ class FullBenchmarkReport:
 
     without_collapse: BenchmarkResult
     with_collapse: BenchmarkResult
-    laundering_delta: float = 0.0
+    laundering_delta: int = 0
 
     def __str__(self) -> str:
         return (
@@ -86,8 +125,8 @@ class FullBenchmarkReport:
             f"  {self.without_collapse}\n"
             f"=== With laundering collapse ===\n"
             f"  {self.with_collapse}\n"
-            f"=== Precision delta (collapse - no collapse) ===\n"
-            f"  {self.laundering_delta:+.3f}"
+            f"=== Corroboration delta (collapse - no collapse) ===\n"
+            f"  {self.laundering_delta:+d}"
         )
 
 
@@ -143,61 +182,120 @@ def _edges_attested_only_by(
     return edge_ids
 
 
-def _match_golden_to_edge(
-    golden: GoldenRelationship,
-    edge: Edge,
-    temporal_tolerance: timedelta,
-) -> bool:
-    """Check if a graph edge matches a golden relationship."""
-    if edge.edge_type != golden.edge_type:
-        return False
+def _match_entity(
+    entity: Entity,
+    name: str,
+    registry_scheme: str | None,
+    registry_id: str | None,
+) -> str | None:
+    """Match an entity to a golden relationship endpoint.
 
-    # Entity matching by name (case-insensitive)
-    source_match = edge.source_entity.name.lower() == golden.source_name.lower()
-    target_match = edge.target_entity.name.lower() == golden.target_name.lower()
-    if not (source_match and target_match):
-        return False
+    Prefers registry identifier when the golden entry supplies one
+    (ADR-004 D2); falls back to normalised-name comparison otherwise.
 
-    # Temporal matching (if golden has dates)
+    Returns the method used ("registry_id" or "name") so name-based matches
+    are visibly a weaker claim, or None if neither matches.
+    """
     if (
-        golden.valid_from is not None
-        and edge.valid_from is not None
-        and abs((edge.valid_from - golden.valid_from).days) > temporal_tolerance.days
+        registry_id
+        and entity.registry_id == registry_id
+        and entity.registry_scheme == registry_scheme
     ):
-        return False
+        return "registry_id"
+    if _normalise_name(entity.name) == _normalise_name(name):
+        return "name"
+    return None
 
-    return not (
-        golden.valid_to is not None
-        and edge.valid_to is not None
-        and abs((edge.valid_to - golden.valid_to).days) > temporal_tolerance.days
+
+def _match_golden_to_edge(golden: GoldenRelationship, edge: Edge) -> str | None:
+    """Check if a graph edge matches a golden relationship's entities + edge_type.
+
+    Matching is deliberately non-temporal — date agreement is measured
+    separately (``_temporal_match`` / ``temporal_accuracy``) so it is a real
+    quality metric rather than a silent recall gate.
+
+    Returns the weakest match method used across both endpoints
+    ("registry_id" if both endpoints matched by identifier, "name" if either
+    fell back to normalised-name comparison), or None if no match.
+    """
+    if edge.edge_type != golden.edge_type:
+        return None
+
+    source_method = _match_entity(
+        edge.source_entity,
+        golden.source_name,
+        golden.source_registry_scheme,
+        golden.source_registry_id,
     )
+    if source_method is None:
+        return None
+
+    target_method = _match_entity(
+        edge.target_entity,
+        golden.target_name,
+        golden.target_registry_scheme,
+        golden.target_registry_id,
+    )
+    if target_method is None:
+        return None
+
+    return "name" if "name" in (source_method, target_method) else "registry_id"
+
+
+def _is_tested_pair(golden: list[GoldenRelationship], edge: Edge) -> bool:
+    """True if edge's entities correspond to some golden relationship's entity
+    pair, regardless of edge_type — i.e. this pair was in scope for testing.
+    """
+    for g in golden:
+        source_method = _match_entity(
+            edge.source_entity, g.source_name, g.source_registry_scheme, g.source_registry_id
+        )
+        if source_method is None:
+            continue
+        target_method = _match_entity(
+            edge.target_entity, g.target_name, g.target_registry_scheme, g.target_registry_id
+        )
+        if target_method is not None:
+            return True
+    return False
 
 
 def _is_resolved(entity: Entity) -> bool:
-    """Check if an entity is resolved (not a scoped placeholder).
+    """Check if an entity is resolved (not an unresolved placeholder).
 
-    Unresolved entities have registry_id starting with a scoped prefix
-    (e.g. "interest:..." or "donation:...") indicating they were created
-    from a single interest declaration without matching to a real entity.
+    Unresolved placeholders carry a ``registry_scheme`` ending in
+    "-UNRESOLVED" (e.g. GB-COH-OFFICER-UNRESOLVED, UK-PARLIAMENT-UNRESOLVED,
+    UK-LORDS-UNRESOLVED), with ``registry_id`` of the form
+    "{scope_id}:{normalised_name}".
     """
-    if not entity.registry_id:
-        return True  # No registry_id — could be a manually created entity
-    scoped_prefixes = ("interest:", "donation:", "officer:", "edge:")
-    return not any(entity.registry_id.startswith(p) for p in scoped_prefixes)
+    if not entity.registry_scheme:
+        return True
+    return not entity.registry_scheme.endswith("-UNRESOLVED")
 
 
 def _temporal_match(golden: GoldenRelationship, edge: Edge, tolerance: timedelta) -> bool:
-    """Check if edge dates match golden dates within tolerance."""
-    if (
-        golden.valid_from is not None
-        and edge.valid_from is not None
-        and abs((edge.valid_from - golden.valid_from).days) > tolerance.days
-    ):
-        return False
-    return not (
-        golden.valid_to is not None
-        and edge.valid_to is not None
-        and abs((edge.valid_to - golden.valid_to).days) > tolerance.days
+    """Check if edge dates match golden dates within tolerance.
+
+    A NULL edge date where the golden has a date is a temporal MISS, not a
+    pass — see ``null_date_matches`` on ``BenchmarkResult``.
+    """
+    if golden.valid_from is not None:
+        if edge.valid_from is None:
+            return False
+        if abs((edge.valid_from - golden.valid_from).days) > tolerance.days:
+            return False
+    if golden.valid_to is not None:
+        if edge.valid_to is None:
+            return False
+        if abs((edge.valid_to - golden.valid_to).days) > tolerance.days:
+            return False
+    return True
+
+
+def _is_null_date_miss(golden: GoldenRelationship, edge: Edge) -> bool:
+    """True if the golden has a date the matched edge lacks (NULL)."""
+    return (golden.valid_from is not None and edge.valid_from is None) or (
+        golden.valid_to is not None and edge.valid_to is None
     )
 
 
@@ -229,7 +327,7 @@ def score_benchmark(
         if edge.pk not in held_out_edge_ids
     ]
 
-    # Score without laundering collapse (each attestation counts independently)
+    # Score without laundering collapse (naive attestation-count corroboration)
     result_without = _score(
         golden_relationships,
         active_edges,
@@ -237,7 +335,7 @@ def score_benchmark(
         collapse_laundering=False,
     )
 
-    # Score with laundering collapse (attestations tracing to same origin = 1)
+    # Score with laundering collapse (independent-origin corroboration)
     result_with = _score(
         golden_relationships,
         active_edges,
@@ -245,7 +343,7 @@ def score_benchmark(
         collapse_laundering=True,
     )
 
-    delta = result_with.precision - result_without.precision
+    delta = result_with.corroborated_count - result_without.corroborated_count
 
     return FullBenchmarkReport(
         without_collapse=result_without,
@@ -262,46 +360,69 @@ def _score(
 ) -> BenchmarkResult:
     """Core scoring logic.
 
-    When collapse_laundering=True, an edge is only "recovered" if it has
-    at least one attestation with an independent origin (derived_from is NULL
-    or traces to a root that is not shared exclusively with laundered attestations).
+    Edge inclusion is identical in both modes: any edge with at least one
+    attestation is scoreable. Laundering collapse changes only
+    *corroboration* — see ``corroborated_count`` / ``laundered_count`` —
+    never which edges are matched against golden relationships.
+
+    Precision is scoped to the tested subgraph: false positives are edges
+    between a golden-set entity pair that don't match any golden
+    relationship by edge_type. Edges between untested entity pairs are
+    excluded entirely (``untested_edges``).
     """
-    # Determine which edges are "independently substantiated"
-    if collapse_laundering:
-        substantiated_edges: list[Edge] = []
-        for edge in edges:
-            origins = _get_independent_origins(edge)
-            if len(origins) >= 1:
-                substantiated_edges.append(edge)
-    else:
-        substantiated_edges = edges
+    substantiated_edges = [edge for edge in edges if len(edge.attestations.all()) > 0]
+
+    corroborated_count = 0
+    laundered_count = 0
+    for edge in substantiated_edges:
+        att_count = len(edge.attestations.all())
+        origins = _get_independent_origins(edge)
+        if collapse_laundering:
+            if len(origins) >= 2:
+                corroborated_count += 1
+        elif att_count >= 2:
+            corroborated_count += 1
+        if att_count >= 2 and len(origins) == 1:
+            laundered_count += 1
 
     # Match golden relationships to edges
     true_positives = 0
-    false_positives = 0
     matched_edge_ids: set[int] = set()
     temporal_matches = 0
+    null_date_matches = 0
     resolved_count = 0
+    name_only_matches = 0
 
     for g in golden:
-        found = False
         for edge in substantiated_edges:
             if edge.pk in matched_edge_ids:
                 continue
-            if _match_golden_to_edge(g, edge, tolerance):
-                found = True
-                matched_edge_ids.add(edge.pk)
-                true_positives += 1
-                if _temporal_match(g, edge, tolerance):
-                    temporal_matches += 1
-                if _is_resolved(edge.source_entity) and _is_resolved(edge.target_entity):
-                    resolved_count += 1
-                break
-        if not found:
-            pass  # false negative
+            method = _match_golden_to_edge(g, edge)
+            if method is None:
+                continue
+            matched_edge_ids.add(edge.pk)
+            true_positives += 1
+            if method == "name":
+                name_only_matches += 1
+            if _temporal_match(g, edge, tolerance):
+                temporal_matches += 1
+            elif _is_null_date_miss(g, edge):
+                null_date_matches += 1
+            if _is_resolved(edge.source_entity) and _is_resolved(edge.target_entity):
+                resolved_count += 1
+            break
+
+    false_positives = 0
+    untested_edges = 0
+    for edge in substantiated_edges:
+        if edge.pk in matched_edge_ids:
+            continue
+        if _is_tested_pair(golden, edge):
+            false_positives += 1
+        else:
+            untested_edges += 1
 
     false_negatives = len(golden) - true_positives
-    false_positives = len(substantiated_edges) - true_positives
 
     precision = (
         true_positives / (true_positives + false_positives)
@@ -316,10 +437,15 @@ def _score(
         precision=precision,
         recall=recall,
         true_positives=true_positives,
-        false_positives=max(false_positives, 0),
+        false_positives=false_positives,
         false_negatives=false_negatives,
         temporal_accuracy=temporal_accuracy,
         resolution_rate=resolution_rate,
         total_golden=len(golden),
         total_recovered=len(substantiated_edges),
+        corroborated_count=corroborated_count,
+        laundered_count=laundered_count,
+        untested_edges=untested_edges,
+        null_date_matches=null_date_matches,
+        name_only_matches=name_only_matches,
     )

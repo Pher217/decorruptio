@@ -168,19 +168,20 @@ class TestSourceHoldout:
 
 @pytest.mark.django_db
 class TestDualReporting:
-    """Acceptance criterion: precision/recall with and without laundering collapse."""
+    """Acceptance criterion: corroboration reported with and without laundering
+    collapse; edge inclusion stays identical between modes."""
 
-    def test_collapse_reduces_false_positive_count(self):
-        """With laundering collapse, edges with laundered attestations may drop,
-        reducing false positives."""
-        # Edge 1: independently substantiated (2 independent origins)
+    def test_laundering_delta_reflects_corroboration_difference(self):
+        """laundering_delta is the difference in corroborated_count between
+        modes, not a precision delta — edge inclusion never changes."""
+        # Edge 1: genuinely corroborated — 2 independent origins
         s1 = Entity.objects.create(entity_type="company", name="Real Corp Ltd")
         t1 = Entity.objects.create(entity_type="political_party", name="Party A")
         edge1 = Edge.objects.create(edge_type="donation", source_entity=s1, target_entity=t1)
         Attestation.objects.create(edge=edge1, source_name="EC", source_reference="r1")
         Attestation.objects.create(edge=edge1, source_name="Parliament", source_reference="r2")
 
-        # Edge 2: laundered (all attestations trace to one origin)
+        # Edge 2: laundered — 2 attestations, 1 independent origin
         s2 = Entity.objects.create(entity_type="company", name="Suspicious Ltd")
         t2 = Entity.objects.create(entity_type="political_party", name="Party B")
         edge2 = Edge.objects.create(edge_type="donation", source_entity=s2, target_entity=t2)
@@ -204,23 +205,186 @@ class TestDualReporting:
 
         report = score_benchmark(golden)
 
-        # Without collapse: both edges count → 1 TP, 1 FP → precision 0.5
-        assert report.without_collapse.true_positives == 1
-        assert report.without_collapse.false_positives == 1
-        assert report.without_collapse.precision == 0.5
+        # Edge inclusion is identical in both modes.
+        assert report.without_collapse.total_recovered == 2
+        assert report.with_collapse.total_recovered == 2
 
-        # With collapse: edge2 has only 1 origin but still 1 origin ≥ 1
-        # so it still counts. The collapse affects the substantiation check.
-        # Edge2 has origins={att_a} → len=1 → still substantiated
-        # So the result is the same here. Let's test with an edge that has
-        # 0 independent origins (impossible normally, but let's test the delta).
-        # Actually the delta matters when an edge has only laundered attestations
-        # and we require ≥2 independent origins. But our current implementation
-        # only requires ≥1. The collapse is about counting, not filtering.
-        # The real delta: without collapse, all edges are "substantiated".
-        # With collapse, edges are substantiated if they have ≥1 independent origin.
-        # Since all edges have ≥1, the delta is 0 here.
-        assert report.laundering_delta == 0.0
+        # Corroboration differs: edge2 is naive-corroborated (2 attestations)
+        # but not independent-origin-corroborated (1 origin).
+        assert report.without_collapse.corroborated_count == 2
+        assert report.with_collapse.corroborated_count == 1
+        assert report.with_collapse.laundered_count == 1
+        assert report.laundering_delta == -1
+
+
+@pytest.mark.django_db
+class TestCorroborationMetrics:
+    """Acceptance criterion: laundering collapse changes corroboration, not
+    edge inclusion (benchmark.py FIX 1)."""
+
+    def test_single_origin_edge_not_corroborated_under_collapse(self):
+        """3 attestations tracing to one origin: naive-corroborated (>=2
+        attestations) but NOT independent-origin-corroborated."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        att1 = Attestation.objects.create(edge=edge, source_name="Source A", source_reference="r1")
+        Attestation.objects.create(
+            edge=edge, source_name="Source B", source_reference="r2", derived_from=att1
+        )
+        Attestation.objects.create(
+            edge=edge, source_name="Source C", source_reference="r3", derived_from=att1
+        )
+
+        report = score_benchmark([])
+
+        assert report.without_collapse.corroborated_count == 1
+        assert report.with_collapse.corroborated_count == 0
+
+    def test_distinct_origin_edge_corroborated_in_both_modes(self):
+        """3 attestations from 3 distinct origins: corroborated in both modes."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        Attestation.objects.create(edge=edge, source_name="Source A", source_reference="r1")
+        Attestation.objects.create(edge=edge, source_name="Source B", source_reference="r2")
+        Attestation.objects.create(edge=edge, source_name="Source C", source_reference="r3")
+
+        report = score_benchmark([])
+
+        assert report.without_collapse.corroborated_count == 1
+        assert report.with_collapse.corroborated_count == 1
+
+    def test_laundered_count_identifies_single_origin_multi_attestation(self):
+        """laundered_count flags edges with >=2 attestations but only 1
+        independent origin — apparent corroboration that is one source."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        att1 = Attestation.objects.create(edge=edge, source_name="Source A", source_reference="r1")
+        Attestation.objects.create(
+            edge=edge, source_name="Source B", source_reference="r2", derived_from=att1
+        )
+
+        report = score_benchmark([])
+
+        assert report.without_collapse.laundered_count == 1
+        assert report.with_collapse.laundered_count == 1
+
+
+@pytest.mark.django_db
+class TestPrecisionScoping:
+    """Acceptance criterion: precision is scoped to the tested subgraph
+    (benchmark.py FIX 2)."""
+
+    def test_precision_unaffected_by_untested_pairs(self):
+        """Edges between entity pairs outside the golden set don't count as
+        false positives — they're excluded as untested_edges."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
+
+        golden = [
+            GoldenRelationship(source_name="Corp Ltd", target_name="Party A", edge_type="donation")
+        ]
+
+        for i in range(20):
+            other_source = Entity.objects.create(entity_type="company", name=f"Other Co {i}")
+            other_target = Entity.objects.create(
+                entity_type="political_party", name=f"Other Party {i}"
+            )
+            other_edge = Edge.objects.create(
+                edge_type="donation", source_entity=other_source, target_entity=other_target
+            )
+            Attestation.objects.create(
+                edge=other_edge, source_name="EC", source_reference=f"r-other-{i}"
+            )
+
+        report = score_benchmark(golden)
+
+        assert report.without_collapse.true_positives == 1
+        assert report.without_collapse.false_positives == 0
+        assert report.without_collapse.untested_edges == 20
+        assert report.without_collapse.precision == 1.0
+
+    def test_wrong_edge_type_on_tested_pair_is_false_positive(self):
+        """An edge between a golden-set entity pair with the wrong edge_type
+        is a false positive, not an untested edge."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=source, target_entity=target
+        )
+        Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
+
+        golden = [
+            GoldenRelationship(source_name="Corp Ltd", target_name="Party A", edge_type="donation")
+        ]
+
+        report = score_benchmark(golden)
+
+        assert report.without_collapse.true_positives == 0
+        assert report.without_collapse.false_positives == 1
+        assert report.without_collapse.untested_edges == 0
+
+
+@pytest.mark.django_db
+class TestRegistryIdMatching:
+    """Acceptance criterion: match by registry identifier when available,
+    falling back to normalised-name comparison (benchmark.py FIX 5)."""
+
+    def test_registry_id_matches_where_name_would_fail(self):
+        """Registry-ID matching succeeds for entities whose names differ in
+        formatting ("PPE Medpro Ltd" vs "PPE MEDPRO LIMITED")."""
+        source = Entity.objects.create(
+            entity_type="company",
+            name="PPE MEDPRO LIMITED",
+            registry_scheme="GB-COH",
+            registry_id="12345678",
+        )
+        target = Entity.objects.create(
+            entity_type="political_party",
+            name="Party A",
+            registry_scheme="UK-PARTY",
+            registry_id="PP1",
+        )
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
+
+        golden = [
+            GoldenRelationship(
+                source_name="PPE Medpro Ltd",
+                target_name="Party A",
+                edge_type="donation",
+                source_registry_scheme="GB-COH",
+                source_registry_id="12345678",
+                target_registry_scheme="UK-PARTY",
+                target_registry_id="PP1",
+            )
+        ]
+
+        report = score_benchmark(golden)
+
+        assert report.without_collapse.true_positives == 1
+        assert report.without_collapse.name_only_matches == 0
+
+    def test_name_fallback_when_no_registry_id_supplied(self):
+        """Without a registry identifier on the golden entry, matching falls
+        back to normalised-name comparison and is recorded as such."""
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
+        Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
+
+        golden = [
+            GoldenRelationship(source_name="Corp Ltd", target_name="Party A", edge_type="donation")
+        ]
+
+        report = score_benchmark(golden)
+
+        assert report.without_collapse.true_positives == 1
+        assert report.without_collapse.name_only_matches == 1
 
 
 @pytest.mark.django_db
@@ -259,7 +423,8 @@ class TestTemporalAccuracy:
         assert report.without_collapse.temporal_accuracy == 1.0
 
     def test_temporal_mismatch_outside_tolerance(self):
-        """Edge dates outside tolerance → no temporal match."""
+        """Edge dates outside tolerance → still a match (matching is
+        non-temporal), but temporal_accuracy drops below 1.0."""
         from datetime import date
 
         source = Entity.objects.create(entity_type="company", name="Corp Ltd")
@@ -282,8 +447,37 @@ class TestTemporalAccuracy:
         ]
 
         report = score_benchmark(golden, temporal_tolerance=timedelta(days=30))
-        assert report.without_collapse.true_positives == 0  # Dates don't match
-        assert report.without_collapse.recall == 0.0
+        assert report.without_collapse.true_positives == 1
+        assert report.without_collapse.recall == 1.0
+        assert report.without_collapse.temporal_accuracy == 0.0
+
+    def test_null_valid_from_counts_as_temporal_miss(self):
+        """Edge with NULL valid_from against a golden with a date is a
+        temporal miss, not a pass — tracked via null_date_matches."""
+        from datetime import date
+
+        source = Entity.objects.create(entity_type="company", name="Corp Ltd")
+        target = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(
+            edge_type="donation",
+            source_entity=source,
+            target_entity=target,
+        )
+        Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
+
+        golden = [
+            GoldenRelationship(
+                source_name="Corp Ltd",
+                target_name="Party A",
+                edge_type="donation",
+                valid_from=date(2020, 1, 5),
+            )
+        ]
+
+        report = score_benchmark(golden)
+        assert report.without_collapse.true_positives == 1
+        assert report.without_collapse.temporal_accuracy == 0.0
+        assert report.without_collapse.null_date_matches == 1
 
 
 @pytest.mark.django_db
@@ -326,11 +520,12 @@ class TestResolutionRate:
             registry_scheme="GB-COH",
             registry_id="12345678",
         )
-        # Unresolved: scoped registry_id
+        # Unresolved: registry_scheme ends in -UNRESOLVED
         target = Entity.objects.create(
             entity_type="political_party",
             name="Party A",
-            registry_id="interest:12345",
+            registry_scheme="UK-PARLIAMENT-UNRESOLVED",
+            registry_id="12345:party a",
         )
         edge = Edge.objects.create(edge_type="donation", source_entity=source, target_entity=target)
         Attestation.objects.create(edge=edge, source_name="EC", source_reference="r1")
@@ -347,9 +542,12 @@ class TestResolutionRate:
         assert report.without_collapse.resolution_rate == 0.0
 
     def test_is_resolved_scoped_entity(self):
-        """Entities with scoped registry_id prefixes are unresolved."""
+        """Entities whose registry_scheme ends in -UNRESOLVED are unresolved."""
         scoped = Entity.objects.create(
-            entity_type="company", name="Unknown Corp", registry_id="interest:abc"
+            entity_type="company",
+            name="Unknown Corp",
+            registry_scheme="GB-COH-OFFICER-UNRESOLVED",
+            registry_id="12345678:unknown corp",
         )
         assert not _is_resolved(scoped)
 

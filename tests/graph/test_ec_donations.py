@@ -75,6 +75,40 @@ class TestEcDonationsIngest:
         assert attestation.match_confidence == 1.0
         assert attestation.match_method == "identifier"
 
+    def test_unpadded_company_number_still_resolves(self, tmp_path):
+        """An unpadded CompanyRegistrationNumber (as EC supplies it) still resolves to
+        the zero-padded Company row (as CH stores it) — the padding-bug regression test."""
+        Company.objects.create(
+            company_number="07015428",
+            company_name="Example Donor Ltd",
+            normalised_name="EXAMPLE DONOR LTD",
+        )
+        csv_path = _write_csv(
+            tmp_path,
+            [
+                {
+                    "ECRef": "C0501020",
+                    "RegulatedEntityName": "Conservative and Unionist Party",
+                    "RegulatedEntityType": "Political Party",
+                    "Value": "£7,500.00",
+                    "AcceptedDate": "17/01/2020",
+                    "DonorName": "Example Donor Ltd",
+                    "DonorStatus": "Company",
+                    "CompanyRegistrationNumber": "7015428",
+                    "ReceivedDate": "02/01/2020",
+                    "RegulatedEntityId": "52",
+                }
+            ],
+        )
+
+        summary = ingest_ec_donations_csv(csv_path)
+
+        assert summary["matched"] == 1
+        attestation = Attestation.objects.get(source_reference="C0501020")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+        assert attestation.edge.source_entity.company_number == "07015428"
+
     def test_ambiguous_donor_name_creates_no_edge(self, tmp_path):
         """Two companies sharing a normalised name must never be guessed (uniqueness guard)."""
         Company.objects.create(

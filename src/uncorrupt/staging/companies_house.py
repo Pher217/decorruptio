@@ -10,6 +10,7 @@ Company-level fields only — no officers, no PSC, no personal data (scope bound
 from __future__ import annotations
 
 import csv
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ from typing import Any
 from django.db import transaction
 
 from uncorrupt.staging.models import Award, Company, SupplierResolution
+
+_PREFIXED_NUMBER_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
 # CH bulk CSV column names (as of 2024 snapshot — may change, verify on download)
 CH_COLUMNS = {
@@ -39,6 +42,48 @@ def _normalise_name(name: str) -> str:
     Suffix stripping is tier 3 (deferred) because it risks false positives.
     """
     return " ".join(name.upper().split())
+
+
+def normalise_company_number(value: str | None) -> str | None:
+    """Normalise a UK company number to Companies House's canonical 8-character form.
+
+    External sources (e.g. Electoral Commission, Parliament) supply company
+    numbers unpadded (`"7015428"`); Companies House itself stores them
+    zero-padded to 8 characters (`"07015428"`) — verified against the CH
+    bulk snapshot, where every one of 5.7M rows is exactly 8 characters.
+    Without this, an exact-string join between an external identifier and
+    `Company.company_number` silently misses.
+
+    Rules:
+    - Strip whitespace, uppercase.
+    - Numeric-only values shorter than 8 chars are zero-padded to 8.
+    - A leading alpha prefix (SC, NI, OC, ...) is split from the numeric
+      remainder, which is zero-padded so prefix + digits totals 8 chars —
+      never zfill the whole string, which would corrupt the prefix.
+    - Already-8-character values pass through unchanged.
+    - Values longer than 8 chars, or that don't fit the patterns above, are
+      returned stripped/uppercased but otherwise unchanged — let the lookup
+      miss rather than invent a wrong number.
+    - Empty/None returns None.
+    """
+    if not value:
+        return None
+    v = value.strip().upper()
+    if not v:
+        return None
+    if len(v) == 8:
+        return v
+    if len(v) > 8:
+        return v
+    if v.isdigit():
+        return v.zfill(8)
+    match = _PREFIXED_NUMBER_RE.match(v)
+    if match:
+        prefix, digits = match.groups()
+        pad_width = 8 - len(prefix)
+        if pad_width > len(digits):
+            return prefix + digits.zfill(pad_width)
+    return v
 
 
 def ingest_ch_bulk_csv(
@@ -203,7 +248,8 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
             # actually exists in our CH snapshot. If not, record the attempt but
             # count as unmatched so indicators don't silently skip it.
             if scheme == "GB-COH" and sid:
-                company = Company.objects.filter(company_number=sid).first()
+                normalised_sid = normalise_company_number(sid)
+                company = Company.objects.filter(company_number=normalised_sid).first()
                 if company:
                     SupplierResolution.objects.update_or_create(
                         source_id=source_id,
@@ -212,7 +258,7 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
                             "supplier_id_scheme": scheme,
                             "supplier_id": sid,
                             "company": company,
-                            "company_number": sid,
+                            "company_number": normalised_sid,
                             "match_confidence": 1.0,
                             "match_method": "identifier",
                             "normalisation_note": None,

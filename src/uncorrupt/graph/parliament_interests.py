@@ -89,7 +89,7 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.companies_house import _normalise_name
+from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
 INTERESTS_API_BASE = "https://interests-api.parliament.uk/api/v1/Interests"
@@ -482,7 +482,8 @@ def _resolve_counterparty_entity(
     name (governing principle: duplication over merging).
     """
     if company_number:
-        company = Company.objects.filter(company_number=company_number).first()
+        normalised_number = normalise_company_number(company_number)
+        company = Company.objects.filter(company_number=normalised_number).first()
         if company:
             entity, _ = Entity.objects.get_or_create(
                 entity_type="company",

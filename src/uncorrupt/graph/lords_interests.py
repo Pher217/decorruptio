@@ -52,7 +52,7 @@ from bs4 import BeautifulSoup, Tag
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.companies_house import _normalise_name
+from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
 LORDS_REGISTER_URL = (
@@ -271,7 +271,8 @@ def _resolve_counterparty(
     Returns None for ambiguous-name case (2+ companies).
     """
     if company_number:
-        company = Company.objects.filter(company_number=company_number).first()
+        normalised_number = normalise_company_number(company_number)
+        company = Company.objects.filter(company_number=normalised_number).first()
         if company:
             entity, _ = Entity.objects.get_or_create(
                 entity_type="company",

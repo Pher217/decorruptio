@@ -135,6 +135,19 @@ class TestChOfficersIngest:
         assert attestation.match_confidence == 1.0
         assert attestation.match_method == "identifier"
 
+    def test_unpadded_company_number_still_resolves(self, tmp_path):
+        """An unpadded company number still resolves to the zero-padded Company row
+        (as CH stores it) — the padding-bug regression test."""
+        Company.objects.create(company_number="07015428", company_name="Example Ltd")
+        _write_cache(tmp_path, "7015428", [RAW_OFFICER_ITEM])
+
+        summary = ingest_company_officers(["7015428"], tmp_path)
+
+        assert summary["companies_unmatched"] == 0
+        attestation = Attestation.objects.get(source_reference="abc123def456")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+
     def test_unmatched_company_number_is_counted_and_skipped(self, tmp_path):
         """A company_number not present in staging.Company creates no edges."""
         _write_cache(tmp_path, "99999999", [RAW_OFFICER_ITEM])

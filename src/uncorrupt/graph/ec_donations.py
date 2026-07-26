@@ -42,7 +42,7 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.companies_house import _normalise_name
+from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
 logger = logging.getLogger(__name__)
@@ -231,7 +231,7 @@ def _resolve_donor_company(row: dict[str, str]) -> tuple[Company | None, float, 
     if donor_status not in ORGANISATION_DONOR_STATUSES:
         return None, 0.0, "identifier"
 
-    company_number = (row.get("CompanyRegistrationNumber") or "").strip()
+    company_number = normalise_company_number(row.get("CompanyRegistrationNumber"))
     if company_number:
         company = Company.objects.filter(company_number=company_number).first()
         if company:

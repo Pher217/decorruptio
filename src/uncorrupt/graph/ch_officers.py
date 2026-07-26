@@ -60,7 +60,7 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.companies_house import _normalise_name
+from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -317,7 +317,9 @@ def ingest_company_officers(
                 companies_unmatched += 1
                 continue
 
-            company = Company.objects.filter(company_number=company_number).first()
+            company = Company.objects.filter(
+                company_number=normalise_company_number(company_number)
+            ).first()
             if company is None:
                 companies_unmatched += 1
                 continue

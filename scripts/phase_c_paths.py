@@ -100,8 +100,26 @@ def surname(person_name: str) -> str:
     return tokens[-1].lower() if tokens else ""
 
 
-def resolve_supplier(name: str, ch_cache: dict) -> Entity | None:
-    """Registry ID first, exact normalised name second. Never a fuzzy guess."""
+def resolve_supplier(
+    name: str, ch_cache: dict, company_number: str | None = None
+) -> Entity | None:
+    """Registry ID first, exact normalised name second. Never a fuzzy guess.
+
+    The cohort CSV carries its own `company_number` for many rows; a registry
+    identifier sourced with the row beats anything we could infer from a name,
+    so it is tried before the cache and before name matching.
+    """
+    if company_number and company_number.strip():
+        cn = normalise_company_number(company_number)
+        found = Entity.objects.filter(company_number=cn).first()
+        if found:
+            return found
+        found = Entity.objects.filter(
+            registry_scheme="GB-COH", registry_id=cn
+        ).first()
+        if found:
+            return found
+
     cached = ch_cache.get(name.strip())
     if cached and cached.get("company_number"):
         cn = normalise_company_number(cached["company_number"])
@@ -119,6 +137,29 @@ def resolve_supplier(name: str, ch_cache: dict) -> Entity | None:
     candidates = [e for e in nearby if normalise_name(e.name) == target]
     # Uniqueness guard: 2+ candidates means we cannot say which, so we say none.
     return candidates[0] if len(candidates) == 1 else None
+
+
+_NOT_A_PERSON = re.compile(
+    r"mailbox|cabinet office|buy cell|buy team|not available|direct approach|"
+    r"^\s*$|team|unit|department|dhsc|nhs|dit\b",
+    re.IGNORECASE,
+)
+_PERSONISH = re.compile(r"\b(Lord|Baroness|Lady|Sir|Dame|MP|Mr|Mrs|Ms|Dr)\b", re.I)
+
+
+def _names_a_person(value: str) -> bool:
+    """Does this referrer cell name an identifiable individual?
+
+    29 of the 52 cohort rows name a civil servant, and 11 are mailboxes or
+    teams. Civil servants file no register of interests, so those rows can
+    never be tested against register data no matter how good the pipeline is.
+    Counting them in the denominator overstates the test's power -- which is
+    what "0 of 52" did.
+    """
+    value = (value or "").strip()
+    if not value or _NOT_A_PERSON.search(value):
+        return bool(_PERSONISH.search(value))
+    return True
 
 
 def resolve_referrer(name: str, people_by_surname: dict) -> list[Entity]:
@@ -214,12 +255,32 @@ def main() -> None:
 
     counts = defaultdict(int)
     for row in rows:
-        supplier_name = (row.get("supplier") or "").strip()
-        referrer_name = (row.get("actual_referrer") or "").strip()
+        supplier_name = (row.get("supplier_name") or "").strip()
+        # `source_of_referral` is the person who ORIGINATED the referral;
+        # `actual_referrer` is the administrative channel it arrived through.
+        # For PPE Medpro these are "Baroness Mone" and "Office of Lord Agnew"
+        # respectively. The hypothesis is about the originator's relationship
+        # to the supplier, so that column is primary — testing the channel
+        # instead measures which private office handled the paperwork.
+        referrer_name = (row.get("source_of_referral") or "").strip()
+        referrer_field = "source_of_referral"
+        if not _names_a_person(referrer_name):
+            fallback = (row.get("actual_referrer") or "").strip()
+            if _names_a_person(fallback):
+                referrer_name, referrer_field = fallback, "actual_referrer"
         counts["total"] += 1
 
-        supplier = resolve_supplier(supplier_name, ch_cache)
-        referrers = resolve_referrer(referrer_name, people_by_surname)
+        if not _names_a_person(referrer_name):
+            counts["referrer_not_a_person"] += 1
+
+        supplier = resolve_supplier(
+            supplier_name, ch_cache, row.get("company_number")
+        )
+        referrers = (
+            resolve_referrer(referrer_name, people_by_surname)
+            if _names_a_person(referrer_name)
+            else []
+        )
         if supplier:
             counts["supplier_resolved"] += 1
         if referrers:
@@ -230,6 +291,7 @@ def main() -> None:
                 {
                     "supplier": supplier_name,
                     "referrer": referrer_name,
+                    "referrer_field": referrer_field,
                     "status": "unresolved",
                     "supplier_resolved": bool(supplier),
                     "referrer_candidates": len(referrers),
@@ -274,6 +336,7 @@ def main() -> None:
         "referrer_resolved",
         "both_resolved",
         "unresolved",
+        "referrer_not_a_person",
         "path_found",
         "undated_only",
         "no_path",

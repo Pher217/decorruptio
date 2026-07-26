@@ -11,10 +11,15 @@ Verifies the core invariants:
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from uncorrupt.graph.models import Edge, Entity
-from uncorrupt.graph.parliament_interests import ingest_parliament_interests_json
+from uncorrupt.graph.parliament_interests import (
+    fetch_parliament_interests,
+    ingest_parliament_interests_json,
+    list_registers,
+)
 from uncorrupt.staging.models import Company
 
 MEMBER = {
@@ -107,7 +112,7 @@ class TestParliamentInterestsIngest:
                 [
                     _field("PayerName", "Employer Ltd"),
                     _field("PayerIsPrivateIndividual", False, "Boolean"),
-                    _field("EndDate", "2026-06-19", "DateOnly"),
+                    _field("EndDate", "2026-08-19", "DateOnly"),
                     _field("Value", "4556.33", "Decimal", "GBP"),
                 ],
                 registration_date="2026-07-13",
@@ -118,7 +123,7 @@ class TestParliamentInterestsIngest:
         ingest_parliament_interests_json(json_path)
 
         edge = Edge.objects.get(source_reference="16306")
-        assert edge.valid_to.isoformat() == "2026-06-19"
+        assert edge.valid_to.isoformat() == "2026-08-19"
 
     def test_ambiguous_counterparty_name_creates_no_edge(self, tmp_path):
         """Two companies sharing a normalised name must never be guessed (uniqueness guard)."""
@@ -325,3 +330,234 @@ class TestParliamentInterestsIngest:
         assert member_entity.entity_type == "person"
         assert member_entity.name == "Wes Streeting"
         assert member_entity.role_description == "MP for Ilford North"
+
+    def test_unresolved_same_named_counterparties_stay_distinct_across_interests(self, tmp_path):
+        """Two different interests naming an unresolvable 'Acme Ltd' must never merge.
+
+        Merging would attach one MP's declared interest to an entity shared
+        with an unrelated interest that happens to name the same string —
+        duplication is the correct outcome when identity can't be proven.
+        """
+        items = [
+            _interest(
+                17001,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Acme Ltd"),
+                    _field("PayerIsPrivateIndividual", False, "Boolean"),
+                ],
+            ),
+            _interest(
+                17002,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Acme Ltd"),
+                    _field("PayerIsPrivateIndividual", False, "Boolean"),
+                ],
+            ),
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 2
+        edge_1 = Edge.objects.get(source_reference="17001")
+        edge_2 = Edge.objects.get(source_reference="17002")
+        assert edge_1.target_entity.pk != edge_2.target_entity.pk
+        assert edge_1.target_entity.registry_scheme == "UK-PARLIAMENT-UNRESOLVED"
+
+    def test_unresolvable_company_number_is_retained_in_properties(self, tmp_path):
+        """A supplied-but-unresolvable company number is kept, not discarded."""
+        items = [
+            _interest(
+                17010,
+                "Donations and other support (including loans) for activities as an MP",
+                [
+                    _field("DonorCompanyName", "Untracked Donor Ltd"),
+                    _field("DonorCompanyIdentifier", "99999999"),
+                    _field("DonorStatus", "Company"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 1
+        edge = Edge.objects.get(source_reference="17010")
+        assert edge.properties["declared_company_number"] == "99999999"
+        assert edge.target_entity.registry_scheme == "UK-PARLIAMENT-UNRESOLVED"
+
+    def test_inverted_interval_end_before_start_is_not_stored(self, tmp_path):
+        """An EndDate before registrationDate is bad data, not a valid claim."""
+        Company.objects.create(
+            company_number="00000011",
+            company_name="Employer Two Ltd",
+            normalised_name="EMPLOYER TWO LTD",
+        )
+        items = [
+            _interest(
+                17020,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Employer Two Ltd"),
+                    _field("PayerIsPrivateIndividual", False, "Boolean"),
+                    _field("EndDate", "2026-06-19", "DateOnly"),
+                ],
+                registration_date="2026-07-13",
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["inverted_interval"] == 1
+        edge = Edge.objects.get(source_reference="17020")
+        assert edge.valid_to is None
+        assert edge.properties["end_date_before_registration_date"] == "2026-06-19"
+
+    def test_unknown_donor_status_is_skipped_not_treated_as_organisation(self, tmp_path):
+        """A DonorName with no positive organisation classification is skipped (fail-closed)."""
+        items = [
+            _interest(
+                17030,
+                "Donations and other support (including loans) for activities as an MP",
+                [
+                    _field("DonorName", "Ambiguous Donor"),
+                    _field("DonorStatus", "Other"),
+                    _field("Value", "1000.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["skipped_unclassified_counterparty"] == 1
+        assert summary["matched"] == 0
+        assert Edge.objects.filter(source_reference="17030").count() == 0
+        assert not Entity.objects.filter(name="Ambiguous Donor").exists()
+
+    def test_payer_with_no_private_individual_classification_is_skipped(self, tmp_path):
+        """A PayerName with PayerIsPrivateIndividual missing must not default to organisation."""
+        items = [
+            _interest(
+                17031,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Unclassified Payer"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["skipped_unclassified_counterparty"] == 1
+        assert not Entity.objects.filter(name="Unclassified Payer").exists()
+
+    def test_value_band_parses_structured_min_bound(self, tmp_path):
+        """A 'more than £X' band parses into value_band_min_cents without inventing a max."""
+        items = [
+            _interest(
+                17040,
+                "Shareholdings",
+                [
+                    _field(
+                        "ShareholdingThreshold",
+                        "(ii) Other shareholdings, valued at more than £70,000",
+                    ),
+                    _field("OrganisationName", "Band Systems Limited"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        ingest_parliament_interests_json(json_path)
+
+        edge = Edge.objects.get(source_reference="17040")
+        assert edge.amount_cents is None
+        assert edge.properties["value_band_min_cents"] == 7000000
+        assert "value_band_max_cents" not in edge.properties
+
+    def test_value_band_with_no_monetary_figure_parses_no_bounds(self, tmp_path):
+        """A percentage-based band never invents monetary bounds."""
+        items = [
+            _interest(
+                17041,
+                "Shareholdings",
+                [
+                    _field(
+                        "ShareholdingThreshold",
+                        "(i) Shareholdings: over 15% of issued share capital",
+                    ),
+                    _field("OrganisationName", "Percent Holdings Ltd"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        ingest_parliament_interests_json(json_path)
+
+        edge = Edge.objects.get(source_reference="17041")
+        assert "value_band_min_cents" not in edge.properties
+        assert "value_band_max_cents" not in edge.properties
+        assert (
+            edge.properties["value_band"] == "(i) Shareholdings: over 15% of issued share capital"
+        )
+
+
+class TestParliamentInterestsFetch:
+    def test_fetch_uses_valid_sort_order(self, tmp_path, monkeypatch):
+        """The fetch must never send the invalid PublishingDateAscending sort value."""
+        captured_urls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_urls.append(str(request.url))
+            return httpx.Response(200, json={"items": []})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        fetch_parliament_interests(tmp_path, client=client)
+
+        assert captured_urls
+        for url in captured_urls:
+            assert "SortOrder=PublishingDateAscending" not in url
+        assert "SortOrder=PublishingDateDescending" in captured_urls[0]
+
+    def test_fetch_passes_register_id_when_supplied(self, tmp_path, monkeypatch):
+        """A supplied register_id is forwarded to the API as RegisterId."""
+        captured_urls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_urls.append(str(request.url))
+            return httpx.Response(200, json={"items": []})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        fetch_parliament_interests(tmp_path, register_id=804, client=client)
+
+        assert "RegisterId=804" in captured_urls[0]
+
+    def test_list_registers_paginates_and_parses_items(self, tmp_path):
+        """list_registers enumerates published register documents via the Registers endpoint."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "totalResults": 2,
+                    "items": [
+                        {"id": 804, "publishedDate": "2026-07-13", "type": "Commons"},
+                        {"id": 803, "publishedDate": "2026-06-29", "type": "Commons"},
+                    ],
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        registers = list_registers(client=client)
+
+        assert len(registers) == 2
+        assert registers[0].register_id == 804
+        assert registers[0].published_date == "2026-07-13"

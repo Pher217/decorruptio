@@ -43,16 +43,41 @@ number resolves with zero name matching (confidence 1.0); a unique exact
 name match to `staging.Company` resolves at confidence 0.9; 2+ candidates
 sharing a normalised name is never guessed (no edge, counted separately).
 Unlike EC donations, a named counterparty that doesn't resolve to a known
-company (no number given, and either 0 exact-name matches or the interest
-carries no company-number field at all) is still recorded as a generically
-named organisation (`regulated_entity`, confidence 0.5, method "name_only")
-— the register names it, so it is kept, just without a stronger identifier.
+company is still recorded — but never as a shared node keyed on the bare
+name (that would merge unrelated organisations that happen to share a
+name). It is scoped to the interest that named it
+(`registry_scheme="UK-PARLIAMENT-UNRESOLVED"`,
+`registry_id=f"{interest_id}:{normalised_name}"`, confidence 0.5, method
+"name_only") — duplication over merging is the correct outcome when
+identity cannot be proven. If a company number *was* supplied but isn't
+present in `staging.Company`, it is retained in
+`Edge.properties["declared_company_number"]` rather than discarded — it
+remains the strongest identifier we have even though we can't resolve it.
+
+API request shape (verified against
+https://interests-api.parliament.uk/swagger/v1/swagger.json on 2026-07-26):
+`SortOrder` only accepts `PublishingDateDescending` or `CategoryAscending`
+— `PublishingDateAscending` (previously sent) is rejected with an HTTP 400
+on every request, silently breaking every fetch. Historical data
+retrievability was verified live: `RegisteredFrom`/`RegisteredTo` filter
+the full interests corpus by the interest's own `registrationDate`
+(confirmed retrieving 75 items registered in 2020) — no `RegisterId` is
+required to reach 2020 data via this path. `RegisterId` selects a specific
+*published register document* instead (a periodic snapshot), which is a
+different axis; `/api/v1/Registers` only lists documents back to
+2024-03-18, so a "2020 register" does not exist to select — `RegisterId`
+cannot be used to reach 2020 data at all. `fetch_parliament_interests`
+still accepts an optional `register_id` (enumerable via
+`list_registers()`) for callers who want to pin one specific published
+snapshot, but the benchmark's 2020 data is reached via
+`registered_from`/`registered_to`, which this module already exposed.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -68,9 +93,16 @@ from uncorrupt.staging.companies_house import _normalise_name
 from uncorrupt.staging.models import Company
 
 INTERESTS_API_BASE = "https://interests-api.parliament.uk/api/v1/Interests"
+REGISTERS_API_BASE = "https://interests-api.parliament.uk/api/v1/Registers"
 SOURCE_NAME = "UK Parliament Register of Interests"
 
 FAMILY_CATEGORY_MARKER = "family members"
+
+# Verified against https://interests-api.parliament.uk/swagger/v1/swagger.json
+# (2026-07-26): InterestsSortOrder only accepts these two values.
+# "PublishingDateAscending" is NOT in the enum and was rejected with an
+# HTTP 400 on every request.
+_VALID_SORT_ORDER = "PublishingDateDescending"
 
 
 @dataclass(frozen=True)
@@ -85,10 +117,59 @@ class FetchResult:
     content_hash: str
 
 
+@dataclass(frozen=True)
+class RegisterInfo:
+    """A published register document, as listed by `/api/v1/Registers`."""
+
+    register_id: int
+    published_date: str
+    house_type: str
+
+
+def list_registers(client: httpx.Client | None = None, max_retries: int = 5) -> list[RegisterInfo]:
+    """Enumerate published register documents via `/api/v1/Registers`.
+
+    Each register is a periodic snapshot publication — a different axis
+    from `registered_from`/`registered_to`, which filter by the interest's
+    own `registrationDate` across the whole corpus. As of 2026-07-26 the
+    earliest published register listed here is 2024-03-18; there is no
+    register covering 2020, so `register_id` cannot be used to reach 2020
+    interests — use `registered_from`/`registered_to` for that.
+    """
+    owns_client = client is None
+    client = client or httpx.Client(timeout=30.0)
+    try:
+        registers: list[RegisterInfo] = []
+        skip = 0
+        take = 100
+        while True:
+            params = {"Skip": skip, "Take": take}
+            url = httpx.URL(REGISTERS_API_BASE, params=params)
+            payload = _fetch_json_with_backoff(client, url, max_retries)
+            page_items = payload.get("items") or []
+            registers.extend(
+                RegisterInfo(
+                    register_id=item["id"],
+                    published_date=item["publishedDate"],
+                    house_type=item["type"],
+                )
+                for item in page_items
+            )
+            total_results = payload.get("totalResults", len(registers))
+            skip += len(page_items)
+            if not page_items or skip >= total_results:
+                break
+        return registers
+    finally:
+        if owns_client:
+            client.close()
+
+
 def fetch_parliament_interests(
     output_dir: str | Path,
     registered_from: date | None = None,
     registered_to: date | None = None,
+    register_id: int | None = None,
     page_size: int = 20,
     max_retries: int = 5,
     polite_delay_seconds: float = 1.0,
@@ -102,6 +183,13 @@ def fetch_parliament_interests(
     on the same page. Fetches with `ExpandChildInterests=true` so payment-level
     child interests (e.g. individual employment payments) arrive nested under
     their parent in one pass.
+
+    `registered_from`/`registered_to` filter by the interest's own
+    registrationDate across the full corpus (this is how historical data,
+    e.g. 2020 interests, is reached). `register_id` instead pins one
+    specific published register document (enumerable via
+    `list_registers()`) — a different, narrower axis; it does not reach
+    further back than that register's own coverage.
 
     Writes the raw JSON items plus a provenance record (source URL template,
     retrieval timestamp, content hash) into `output_dir`. Callers are expected
@@ -121,12 +209,14 @@ def fetch_parliament_interests(
 
     base_params: dict[str, Any] = {
         "ExpandChildInterests": "true",
-        "SortOrder": "PublishingDateAscending",
+        "SortOrder": _VALID_SORT_ORDER,
     }
     if registered_from is not None:
         base_params["RegisteredFrom"] = registered_from.isoformat()
     if registered_to is not None:
         base_params["RegisteredTo"] = registered_to.isoformat()
+    if register_id is not None:
+        base_params["RegisterId"] = register_id
 
     try:
         while True:
@@ -150,6 +240,7 @@ def fetch_parliament_interests(
     retrieved_at = datetime.now(UTC)
     source_url_template = (
         f"{INTERESTS_API_BASE}?RegisteredFrom={registered_from}&RegisteredTo={registered_to}"
+        f"&RegisterId={register_id}"
     )
     provenance = {
         "source_url_template": source_url_template,
@@ -160,6 +251,7 @@ def fetch_parliament_interests(
             "from": registered_from.isoformat() if registered_from else None,
             "to": registered_to.isoformat() if registered_to else None,
         },
+        "register_id": register_id,
     }
     provenance_path.write_text(json.dumps(provenance, indent=2))
 
@@ -173,21 +265,28 @@ def fetch_parliament_interests(
     )
 
 
-def _fetch_page_with_backoff(
+def _fetch_json_with_backoff(
     client: httpx.Client, url: httpx.URL, max_retries: int
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     delay = 2.0
     for _attempt in range(max_retries):
         response = client.get(url)
         if response.status_code == 200:
-            payload = response.json()
-            return list(payload.get("items") or [])
+            result: dict[str, Any] = response.json()
+            return result
         if response.status_code == 429 or response.status_code >= 500:
             time.sleep(delay)
             delay *= 2
             continue
         response.raise_for_status()
     raise RuntimeError(f"Parliament interests fetch failed after {max_retries} retries: {url}")
+
+
+def _fetch_page_with_backoff(
+    client: httpx.Client, url: httpx.URL, max_retries: int
+) -> list[dict[str, Any]]:
+    payload = _fetch_json_with_backoff(client, url, max_retries)
+    return list(payload.get("items") or [])
 
 
 def _is_family_category(category_name: str) -> bool:
@@ -238,13 +337,44 @@ def _parse_date(value: str | None) -> date | None:
         return None
 
 
+_BAND_BETWEEN_RE = re.compile(r"between\s*£([\d,]+)\s*and\s*£([\d,]+)", re.IGNORECASE)
+_BAND_MORE_THAN_RE = re.compile(r"more than\s*£([\d,]+)", re.IGNORECASE)
+_BAND_LESS_THAN_RE = re.compile(r"less than\s*£([\d,]+)", re.IGNORECASE)
+
+
+def _pounds_to_cents(value: str) -> int:
+    return int((Decimal(value.replace(",", "")) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _parse_value_band_bounds(band_text: str) -> tuple[int | None, int | None]:
+    """Parse a free-text value band into integer-cent bounds where it parses cleanly.
+
+    Never invents a midpoint: "more than £X" yields a floor with no ceiling,
+    "less than £X" a ceiling with no floor, "between £X and £Y" both. Bands
+    that carry no monetary figure at all (e.g. a shareholding-percentage
+    threshold) parse to (None, None) — the verbatim text is still kept.
+    """
+    between = _BAND_BETWEEN_RE.search(band_text)
+    if between:
+        return _pounds_to_cents(between.group(1)), _pounds_to_cents(between.group(2))
+    more_than = _BAND_MORE_THAN_RE.search(band_text)
+    if more_than:
+        return _pounds_to_cents(more_than.group(1)), None
+    less_than = _BAND_LESS_THAN_RE.search(band_text)
+    if less_than:
+        return None, _pounds_to_cents(less_than.group(1))
+    return None, None
+
+
 def _extract_money(fields: list[dict[str, Any]]) -> tuple[int | None, str | None, dict[str, Any]]:
     """Returns (amount_cents, currency, extra_properties).
 
     An exact `Value` field of type `Decimal` is parsed via `Decimal` into
     integer cents. A shareholding value band (`ShareholdingThreshold`) is
-    stored verbatim in `extra_properties["value_band"]` with `amount_cents`
-    left null — no midpoint is ever invented.
+    stored verbatim in `extra_properties["value_band"]`, and — where it
+    parses cleanly — also as structured `value_band_min_cents` /
+    `value_band_max_cents` bounds. `amount_cents` is never populated from a
+    band, and no midpoint is ever invented.
     """
     value_field = _raw_field(fields, "Value")
     if (
@@ -263,56 +393,93 @@ def _extract_money(fields: list[dict[str, Any]]) -> tuple[int | None, str | None
 
     band_field = _raw_field(fields, "ShareholdingThreshold")
     if band_field is not None and band_field.get("value"):
-        return None, None, {"value_band": band_field["value"]}
+        band_text = band_field["value"]
+        extra: dict[str, Any] = {"value_band": band_text}
+        min_cents, max_cents = _parse_value_band_bounds(band_text)
+        if min_cents is not None:
+            extra["value_band_min_cents"] = min_cents
+        if max_cents is not None:
+            extra["value_band_max_cents"] = max_cents
+        return None, None, extra
 
     return None, None, {}
 
 
+# Statuses that positively identify an organisation counterparty — verified
+# live against https://interests-api.parliament.uk on 2026-07-26 (CategoryId
+# 3, "Donations..."). "Other" is a real value the API returns and is
+# deliberately excluded: it is not a positive organisation classification.
+PARLIAMENT_ORGANISATION_DONOR_STATUSES = frozenset(
+    {
+        "Company",
+        "Trade Union",
+        "Building society",
+        "Unincorporated association",
+        "Friendly society",
+    }
+)
+
+
 def _extract_counterparty_name(
     values: dict[str, Any],
-) -> tuple[str | None, str | None, bool]:
-    """Returns (name, company_number, is_private_individual).
+) -> tuple[str | None, str | None, bool, bool]:
+    """Returns (name, company_number, is_private_individual, is_unclassified).
 
-    `name=None` means no nameable counterparty was found on this interest
-    (e.g. land/property has none) — the caller records no edge. A private
-    individual is signalled separately so it can be counted distinctly from
-    "no counterparty at all".
+    Fail-closed (mirrors the EC donations allowlist pattern): a counterparty
+    is only ever named when it is POSITIVELY classified as an organisation.
+    `name=None` + both flags False means no nameable counterparty was found
+    on this interest at all (e.g. land/property has none). `is_private_individual`
+    signals a positively-identified individual. `is_unclassified` signals a
+    named counterparty whose classification is missing/unexpected — it is
+    never assumed to be an organisation just because a name was present.
     """
-    if values.get("DonorStatus") == "Individual":
-        return None, None, True
+    donor_status = values.get("DonorStatus")
 
     donor_company_name = values.get("DonorCompanyName")
     if donor_company_name:
-        return donor_company_name, values.get("DonorCompanyIdentifier"), False
+        if donor_status in PARLIAMENT_ORGANISATION_DONOR_STATUSES:
+            return donor_company_name, values.get("DonorCompanyIdentifier"), False, False
+        if donor_status == "Individual":
+            return None, None, True, False
+        return None, None, False, True
 
-    if values.get("PayerIsPrivateIndividual") is True:
-        return None, None, True
-
+    payer_is_private = values.get("PayerIsPrivateIndividual")
     payer_name = values.get("PayerName")
     if payer_name:
-        return payer_name, None, False
+        if payer_is_private is False:
+            return payer_name, None, False, False
+        if payer_is_private is True:
+            return None, None, True, False
+        return None, None, False, True
 
     organisation_name = values.get("OrganisationName")
     if organisation_name:
-        return organisation_name, None, False
+        return organisation_name, None, False, False
 
     donor_name = values.get("DonorName")
     if donor_name:
-        return donor_name, None, False
+        if donor_status in PARLIAMENT_ORGANISATION_DONOR_STATUSES:
+            return donor_name, None, False, False
+        if donor_status == "Individual":
+            return None, None, True, False
+        return None, None, False, True
 
-    return None, None, False
+    return None, None, False, False
 
 
 def _resolve_counterparty_entity(
-    name: str, company_number: str | None
-) -> tuple[Entity, float, str] | None:
+    name: str, company_number: str | None, interest_id: int
+) -> tuple[Entity, float, str, dict[str, Any]] | None:
     """Resolve a named counterparty to an Entity.
 
     Returns `None` only for the ambiguous-name case (2+ companies share the
     normalised name) — that is a uniqueness-guard refusal to guess, never a
     fallback. Every other named counterparty resolves to *some* Entity: a
     matched `Company` (confidence 1.0 by number, 0.9 by unique exact name) or
-    a generically named organisation (confidence 0.5, "name_only").
+    an entity scoped to THIS interest (confidence 0.5, "name_only") — never a
+    shared node keyed on the bare name, which would merge unrelated
+    organisations across different interests/members that happen to share a
+    name (governing principle: duplication over merging).
     """
     if company_number:
         company = Company.objects.filter(company_number=company_number).first()
@@ -326,13 +493,16 @@ def _resolve_counterparty_entity(
                     "registry_id": company.company_number,
                 },
             )
-            return entity, 1.0, "identifier"
+            return entity, 1.0, "identifier", {}
         entity, _ = Entity.objects.get_or_create(
             entity_type="regulated_entity",
-            name=name,
-            registry_id=None,
+            registry_scheme="UK-PARLIAMENT-UNRESOLVED",
+            registry_id=f"{interest_id}:{_normalise_name(name)}",
+            defaults={"name": name},
         )
-        return entity, 0.5, "name_only"
+        # The declared number didn't resolve locally, but it's the
+        # strongest identifier we have — keep it rather than discarding it.
+        return entity, 0.5, "name_only", {"declared_company_number": company_number}
 
     normalised = _normalise_name(name)
     matches = Company.objects.filter(normalised_name=normalised)
@@ -348,16 +518,17 @@ def _resolve_counterparty_entity(
                 "registry_id": company.company_number,
             },
         )
-        return entity, 0.9, "exact_name"
+        return entity, 0.9, "exact_name", {}
     if match_count >= 2:
         return None
 
     entity, _ = Entity.objects.get_or_create(
         entity_type="regulated_entity",
-        name=name,
-        registry_id=None,
+        registry_scheme="UK-PARLIAMENT-UNRESOLVED",
+        registry_id=f"{interest_id}:{normalised}",
+        defaults={"name": name},
     )
-    return entity, 0.5, "name_only"
+    return entity, 0.5, "name_only", {}
 
 
 def _role_description(member: dict[str, Any]) -> str:
@@ -386,7 +557,8 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
     """Ingest a previously-downloaded Parliament interests JSON dump.
 
     Returns summary stats: {matched, unmatched_counterparty, skipped_family,
-    skipped_private_individual, skipped_no_counterparty, total}.
+    skipped_private_individual, skipped_unclassified_counterparty,
+    skipped_no_counterparty, inverted_interval, total}.
     """
     json_path = Path(json_path)
     items = json.loads(json_path.read_text())
@@ -395,7 +567,9 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
     unmatched_counterparty = 0
     skipped_family = 0
     skipped_private_individual = 0
+    skipped_unclassified_counterparty = 0
     skipped_no_counterparty = 0
+    inverted_interval = 0
     total = 0
 
     with transaction.atomic():
@@ -420,24 +594,37 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
                 fields = leaf.get("fields") or []
                 values = _fields_by_name(fields)
 
-                name, company_number, is_private = _extract_counterparty_name(values)
+                name, company_number, is_private, is_unclassified = _extract_counterparty_name(
+                    values
+                )
                 if is_private:
                     skipped_private_individual += 1
+                    continue
+                if is_unclassified:
+                    skipped_unclassified_counterparty += 1
                     continue
                 if not name:
                     skipped_no_counterparty += 1
                     continue
 
-                resolved = _resolve_counterparty_entity(name, company_number)
+                interest_id = leaf["id"]
+                resolved = _resolve_counterparty_entity(name, company_number, interest_id)
                 if resolved is None:
                     unmatched_counterparty += 1
                     continue
-                counterparty_entity, confidence, method = resolved
+                counterparty_entity, confidence, method, resolve_properties = resolved
 
-                amount_cents, currency, extra_properties = _extract_money(fields)
+                amount_cents, currency, money_properties = _extract_money(fields)
                 valid_from = _parse_date(leaf.get("registrationDate"))
                 valid_to = _parse_date(values.get("EndDate"))
-                interest_id = leaf["id"]
+
+                properties = {**resolve_properties, **money_properties}
+                if valid_to is not None and valid_from is not None and valid_to < valid_from:
+                    # An inverted interval is bad data, not a real claim —
+                    # never store it as if it were valid.
+                    inverted_interval += 1
+                    properties["end_date_before_registration_date"] = valid_to.isoformat()
+                    valid_to = None
 
                 Edge.objects.get_or_create(
                     edge_type="declared_interest",
@@ -453,7 +640,7 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
                         "match_method": method,
                         "amount_cents": amount_cents,
                         "currency": currency,
-                        "properties": extra_properties,
+                        "properties": properties,
                     },
                 )
                 matched += 1
@@ -463,6 +650,8 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
         "unmatched_counterparty": unmatched_counterparty,
         "skipped_family": skipped_family,
         "skipped_private_individual": skipped_private_individual,
+        "skipped_unclassified_counterparty": skipped_unclassified_counterparty,
         "skipped_no_counterparty": skipped_no_counterparty,
+        "inverted_interval": inverted_interval,
         "total": total,
     }

@@ -115,36 +115,38 @@ def fetch_ec_donations_csv(
 
     header: list[str] | None = None
     rows: list[list[str]] = []
-    start = 0
+
+    # The EC CSV export endpoint IGNORES `start` and returns the complete
+    # result set for the date range in one response. Verified 2026-07-27:
+    # start=0 and start=1000 returned byte-identical 5,745,843-byte bodies
+    # (24,242 lines) for 2018-01-01..2024-12-31.
+    #
+    # This is why the previous paginating implementation could never finish:
+    # every "page" came back full (24,241 rows >= page_size), so the
+    # `len(page_data) < page_size` break was unreachable, `start` incremented
+    # forever, and the same 24k rows accumulated in memory on every pass. A
+    # run was killed after 20 minutes having produced no output at all.
+    #
+    # One request is therefore both correct and complete. If the endpoint ever
+    # starts honouring `start`, this must become a loop again — the guard
+    # below is what would catch that, by reporting a suspiciously round count.
+    params = {
+        "rows": page_size,
+        "query": "",
+        "sort": "AcceptedDate",
+        "order": "desc",
+        "date": "Received",
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+    }
+    query = [*params.items(), *[("et", e) for e in entity_types]]
+    url = httpx.URL(EC_API_BASE, params=query)
 
     try:
-        while True:
-            params = {
-                "start": start,
-                "rows": page_size,
-                "query": "",
-                "sort": "AcceptedDate",
-                "order": "desc",
-                "date": "Received",
-                "from": from_date.isoformat(),
-                "to": to_date.isoformat(),
-            }
-            query = [*params.items(), *[("et", e) for e in entity_types]]
-            url = httpx.URL(EC_API_BASE, params=query)
-
-            page_rows = _fetch_page_with_backoff(client, url, max_retries)
-            if not page_rows:
-                break
-
-            page_header, *page_data = page_rows
-            if header is None:
-                header = page_header
-            rows.extend(page_data)
-
-            if len(page_data) < page_size:
-                break
-            start += page_size
-            time.sleep(polite_delay_seconds)
+        all_rows = _fetch_page_with_backoff(client, url, max_retries)
+        if all_rows:
+            header, *data = all_rows
+            rows.extend(data)
     finally:
         if owns_client:
             client.close()

@@ -45,7 +45,11 @@ class Entity(models.Model):
 
     # Registry identification — the join key (ADR-004 D2)
     registry_scheme = models.CharField(max_length=50, null=True, blank=True)
-    registry_id = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+    # 255, not 50: unresolved placeholders are composite scoped keys of the form
+    # "{scope_id}:{normalised_name}" (see ch_officers / parliament_interests /
+    # lords_interests). Organisation names routinely exceed 50 chars, which
+    # raised DataError: value too long for type character varying(50).
+    registry_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
 
     # Link to staging.Company when entity_type == "company"
     company_number = models.CharField(max_length=20, null=True, blank=True, db_index=True)
@@ -131,6 +135,7 @@ class Edge(models.Model):
         ("declared_interest", "Declared financial interest"),
         ("supplier_of", "Supplier of public contract"),
         ("associate_of", "Professional or personal association"),
+        ("ownership", "Corporate ownership / control (parent of subsidiary)"),
     ]
 
     edge_type = models.CharField(max_length=30, choices=EDGE_TYPES, db_index=True)

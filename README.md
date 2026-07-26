@@ -10,9 +10,12 @@ Publish reproducible transparency data.** Risk indicators for investigation —
 
 ## Status
 
-Phase-1 scaffold. The structure is complete and importable; most pipeline bodies
-are stubs (`NotImplementedError`) with the interfaces and guardrails real. The
-first thing to build is the **Phase-1 A1 walking skeleton** (see below).
+Phase 1 — building the **relationship-recovery benchmark** (spec v0.2). The four
+data-source ingesters (EC donations, Parliament interests, Companies House
+officers, Lords register) are live and write into `Entity` / `Edge` /
+`Attestation` graph models. Indicators i001–i005 and the connectors for Ukraine,
+Colombia, and UK procurement are also in place. No Dagster, no MinIO, no
+Vite/React dashboard — those were dropped per ADR-005 D6.
 
 ## The guardrails are executable, not prose
 
@@ -33,14 +36,23 @@ flags into ~134 actions). So the guardrails are enforced in code and CI:
 - **`src/uncorrupt/vault/`** — keyed-HMAC tokenizer; refuses to run without a key,
   never returns a raw ID.
 
-## Architecture (7 layers → a Dagster DAG)
+## Architecture (6 layers → Django ORM + cron)
 
 ```
-ingest (connectors) → staging (raw+clean) → normalize (OCDS + FtM + mapping)
-  → resolve* → graph* → indicators → [HUMAN REVIEW GATE]* → publish (tier-a)
+L1 Connectors (httpx fetch)
+  → L2 Staging (Django ORM → PostgreSQL: Postgres JSONB + hashed local files)
+  → L3 Indicators (Django ORM queries; Indicator ABC, i001–i005)
+  → L4 Flags (Django model with provenance + version stamp)
+  → L5 Review Workspace (DRF API + Django admin)
+  → L6 Publication (tiered: open data export / vetted feed)
 ```
-`*` = stubbed seam for a later phase (Phase 2–5). Two first-class extension points:
-**connectors** (`src/uncorrupt/connectors/`) and **indicators**
+
+Scheduled via cron + Django management commands — no Dagster, no MinIO, no
+object store. FtM-*shaped* models live in the Django ORM, but the project does
+**not** depend on the FollowTheMoney library, Aleph, or nomenklatura, and OCP
+indicators are not used (the project ships its own `Indicator` ABC with
+i001–i005). Two first-class extension points: **connectors**
+(`src/uncorrupt/connectors/`) and **indicators**
 (`src/uncorrupt/indicators/`), both discovered via `pyproject.toml` entry points.
 
 ## Scaling split (why the layout looks like this)
@@ -55,25 +67,48 @@ ingest (connectors) → staging (raw+clean) → normalize (OCDS + FtM + mapping)
 ## Quickstart
 
 ```bash
-uv sync --extra dev          # install (Python 3.12)
-uv run uncorrupt validate-registry   # load + validate sources/*.yml
-uv run pytest                # runs the guardrail suite
-make up                      # postgres + minio + dagster (docker compose)
-make demo                    # Phase-1 A1 skeleton end-to-end (once bodies are implemented)
+uv sync --extra dev                      # install (Python 3.12)
+uv run uncorrupt validate-registry       # load + validate sources/*.yml
+uv run ruff check .                      # lint
+uv run ruff format --check .             # format check
+uv run mypy                              # type check
+uv run pytest -q                         # runs the guardrail + unit suite
 ```
 
-## Phase-1 "definition of done"
+Postgres is optional for the test suite (tests use the Django test settings);
+`make up` starts a local Postgres via `docker compose` if you want to run the
+ingesters against a real database. See the `Makefile` for the full target list.
 
-`make up && make demo` runs Dagster end-to-end: **EU TED via Kingfisher → raw →
-clean → OCDS + FtM → 3–5 EU-validated indicators → published tier-a aggregates →
-dashboard renders them**, with every record provenance-stamped and every guardrail
-test green in CI.
+## Phase-1 focus — the relationship-recovery benchmark
+
+Ingest four data sources — **EC donations**, **Parliament interests**, **CH
+officers**, and the **Lords register** — into `Entity` / `Edge` / `Attestation`
+graph models, then demonstrate that the graph can recover independently
+substantiated relationships:
+
+- Build **10–20 independently substantiated positive relationships** (edges
+  corroborated by ≥2 attestations from different sources).
+- Score **atomic claims**: precision/recall on edge recovery, temporal accuracy
+  (`Edge.valid_from`/`valid_to` vs. the attested real-world window), and
+  resolution rates (how often a donor/counterparty resolves to a real company
+  without a guess).
+
+This supersedes the old "kill experiment" Phase-1 DoD (`make up && make demo`
+running Dagster end-to-end), which spec v0.2 retired along with Dagster, MinIO,
+and the Vite/React dashboard.
 
 ## Stack
 
-FollowTheMoney · OpenAleph (spike, kept off the default path) · OpenSanctions
-nomenklatura (Phase 2) · OCDS + OCP Kingfisher/Cardinal · Splink (Phase 2) ·
-Dagster · Postgres + MinIO · Vite/React dashboard.
+Django 5.2 + Django REST Framework · PostgreSQL (Postgres JSONB + hashed local
+files; **monetary values as integer cents, never floats**) · httpx for HTTP
+fetching · cron + Django management commands for scheduling · Django admin +
+DRF API for review/publication. Lint/format: ruff. Types: mypy + django-stubs.
+Tests: pytest + pytest-django.
+
+FtM-*shaped* models in the Django ORM — **not** a dependency on the
+FollowTheMoney library, Aleph, or nomenklatura. OCP indicators are not used; the
+project has its own `Indicator` ABC (i001–i005). Splink-style entity resolution
+is Phase 2.
 
 ## License
 

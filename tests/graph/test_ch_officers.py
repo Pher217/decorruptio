@@ -23,7 +23,7 @@ from uncorrupt.graph.ch_officers import (
     fetch_company_officers,
     ingest_company_officers,
 )
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.models import Company
 
 RAW_OFFICER_ITEM = {
@@ -66,7 +66,7 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["12410514"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         assert edge.valid_from.isoformat() == "2015-03-01"
 
     def test_resigned_on_maps_to_valid_to(self, tmp_path):
@@ -76,7 +76,7 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["12410514"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         assert edge.valid_to.isoformat() == "2019-06-30"
 
     def test_still_serving_officer_has_null_valid_to(self, tmp_path):
@@ -87,7 +87,7 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["00000010"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         assert edge.valid_to is None
 
     def test_officer_with_no_id_recorded_at_reduced_confidence(self, tmp_path):
@@ -110,8 +110,9 @@ class TestChOfficersIngest:
         assert summary["officers_no_id"] == 1
         person = Entity.objects.get(entity_type="person", name="JONES, Alice")
         edge = Edge.objects.get(source_entity=person)
-        assert edge.match_confidence < 1.0
-        assert edge.match_method != "identifier"
+        attestation = edge.attestations.get()
+        assert attestation.match_confidence < 1.0
+        assert attestation.match_method != "identifier"
 
     def test_officer_role_stored_in_properties(self, tmp_path):
         """The officer role (director, secretary, etc.) is stored on Edge.properties."""
@@ -120,7 +121,7 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["12410514"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         assert edge.properties["officer_role"] == "director"
 
     def test_company_matched_by_number_has_full_confidence(self, tmp_path):
@@ -130,9 +131,9 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["12410514"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
-        assert edge.match_confidence == 1.0
-        assert edge.match_method == "identifier"
+        attestation = Attestation.objects.get(source_reference="abc123def456")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
 
     def test_unmatched_company_number_is_counted_and_skipped(self, tmp_path):
         """A company_number not present in staging.Company creates no edges."""
@@ -151,7 +152,7 @@ class TestChOfficersIngest:
         ingest_company_officers(["12410514"], tmp_path)
 
         person = Entity.objects.get(entity_type="person", registry_id="abc123def456")
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         serialized = json.dumps(
             {"person_properties": person.properties, "edge_properties": edge.properties}
         )
@@ -206,7 +207,8 @@ class TestChOfficersIngest:
         ingest_company_officers(["00000032"], tmp_path)
 
         edge = Edge.objects.get(source_entity__name="DOE, Jane")
-        assert edge.match_method == "name_company_scoped"
+        attestation = edge.attestations.get()
+        assert attestation.match_method == "name_company_scoped"
 
     def test_appointment_self_link_used_as_source_reference(self, tmp_path):
         """Reappointments (same officer_id) at the same company must stay distinct edges."""
@@ -226,10 +228,10 @@ class TestChOfficersIngest:
         summary = ingest_company_officers(["12410514"], tmp_path)
 
         assert summary["edges_created"] == 2
-        assert Edge.objects.filter(
+        assert Attestation.objects.filter(
             source_reference="/company/12410514/appointments/appt-1"
         ).exists()
-        assert Edge.objects.filter(
+        assert Attestation.objects.filter(
             source_reference="/company/12410514/appointments/appt-2"
         ).exists()
 
@@ -240,7 +242,7 @@ class TestChOfficersIngest:
 
         ingest_company_officers(["12410514"], tmp_path)
 
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         assert edge.properties["source_reference_scope"] == "officer_id_not_appointment"
 
     def test_unparseable_resigned_on_is_not_read_as_still_serving(self, tmp_path):
@@ -267,7 +269,7 @@ class TestChOfficersIngest:
         ingest_company_officers(["12410514"], tmp_path)
 
         person = Entity.objects.get(entity_type="person", registry_id="abc123def456")
-        edge = Edge.objects.get(source_reference="abc123def456")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
         serialized = json.dumps(
             {"person_properties": person.properties, "edge_properties": edge.properties}
         )

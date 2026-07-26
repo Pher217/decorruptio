@@ -41,7 +41,7 @@ from typing import Any
 import httpx
 from django.db import transaction
 
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name
 from uncorrupt.staging.models import Company
 
@@ -335,39 +335,38 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
                     valid_from = _parse_ec_date(row.get("AcceptedDate") or "")
                 ec_ref = (row.get("ECRef") or "").strip()
 
-                edge_fields = {
-                    "valid_from": valid_from,
-                    "source_name": SOURCE_NAME,
-                    "source_url": (
-                        f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
-                        if ec_ref
-                        else None
-                    ),
-                    "match_confidence": confidence,
-                    "match_method": method,
-                    "amount_cents": amount_cents,
-                    "currency": "GBP",
-                }
+                # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                edge, edge_created = Edge.objects.update_or_create(
+                    edge_type="donation",
+                    source_entity=donor_entity,
+                    target_entity=recipient_entity,
+                    valid_from=valid_from,
+                    defaults={
+                        "amount_cents": amount_cents,
+                        "currency": "GBP",
+                    },
+                )
 
-                edge_lookup: dict[str, Any] = {
-                    "edge_type": "donation",
-                    "source_entity": donor_entity,
-                    "target_entity": recipient_entity,
+                # Attestation = THE EVIDENCE
+                att_lookup: dict[str, Any] = {
+                    "edge": edge,
+                    "source_name": SOURCE_NAME,
                 }
                 if ec_ref:
-                    edge_lookup["source_reference"] = ec_ref
-                else:
-                    # No EC reference: distinct donations between the same
-                    # pair must stay distinct rather than collapsing into
-                    # one edge — key on the claim itself.
-                    edge_lookup["source_reference"] = None
-                    edge_lookup["valid_from"] = valid_from
-                    edge_lookup["amount_cents"] = amount_cents
-                    del edge_fields["valid_from"]
-                    del edge_fields["amount_cents"]
-
-                _, created = Edge.objects.update_or_create(**edge_lookup, defaults=edge_fields)
-                if created:
+                    att_lookup["source_reference"] = ec_ref
+                Attestation.objects.get_or_create(
+                    **att_lookup,
+                    defaults={
+                        "source_url": (
+                            f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
+                            if ec_ref
+                            else None
+                        ),
+                        "match_confidence": confidence,
+                        "match_method": method,
+                    },
+                )
+                if edge_created:
                     matched += 1
 
     return {

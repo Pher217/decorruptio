@@ -1,9 +1,9 @@
-"""Tests for the graph models (Entity, Alias, Edge).
+"""Tests for the graph models (Entity, Alias, Edge, Attestation).
 
 Verifies the core invariants of the relationship-recovery graph:
 - Registry ID uniqueness (ADR-004 D2: resolve by ID, never by name)
 - Temporal provenance on every edge
-- Source citation required on every edge
+- Source citation required on every attestation
 - Entity type constraints
 - Alias association
 """
@@ -11,7 +11,7 @@ Verifies the core invariants of the relationship-recovery graph:
 import pytest
 from django.db import IntegrityError
 
-from uncorrupt.graph.models import Alias, Edge, Entity
+from uncorrupt.graph.models import Alias, Attestation, Edge, Entity
 
 
 @pytest.mark.django_db
@@ -132,6 +132,8 @@ class TestAlias:
 
 @pytest.mark.django_db
 class TestEdge:
+    """Tests for Edge and Attestation — an Edge is a claim, an Attestation is its citation."""
+
     def _create_pair(self):
         source = Entity.objects.create(
             entity_type="person",
@@ -155,14 +157,18 @@ class TestEdge:
             target_entity=recipient,
             valid_from="2020-04-01",
             valid_to="2020-04-01",
-            source_name="Electoral Commission",
-            source_url="https://example.com/ec/12345",
-            source_reference="EC-12345",
             amount_cents=5000000,
             currency="GBP",
         )
+        Attestation.objects.create(
+            edge=edge,
+            source_name="Electoral Commission",
+            source_url="https://example.com/ec/12345",
+            source_reference="EC-12345",
+        )
         assert edge.edge_type == "donation"
-        assert edge.source_name == "Electoral Commission"
+        attestation = edge.attestations.get()
+        assert attestation.source_name == "Electoral Commission"
         assert edge.amount_cents == 5000000
         assert edge.currency == "GBP"
 
@@ -173,7 +179,6 @@ class TestEdge:
             edge_type="donation",
             source_entity=donor,
             target_entity=recipient,
-            source_name="Electoral Commission",
             amount_cents=1234567,
             currency="GBP",
         )
@@ -181,30 +186,36 @@ class TestEdge:
         assert fetched.amount_cents == 1234567
         assert isinstance(fetched.amount_cents, int)
 
-    def test_edge_defaults_to_identifier_match_full_confidence(self):
+    def test_attestation_defaults_to_identifier_match_full_confidence(self):
         source, target = self._create_pair()
         edge = Edge.objects.create(
             edge_type="officer_of",
             source_entity=source,
             target_entity=target,
+        )
+        attestation = Attestation.objects.create(
+            edge=edge,
             source_name="Companies House",
         )
-        assert edge.match_confidence == 1.0
-        assert edge.match_method == "identifier"
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
 
-    def test_tier2_name_matched_edge_records_lower_confidence(self):
-        """An edge built from tier-2 name resolution must declare its weaker provenance."""
+    def test_tier2_name_matched_attestation_records_lower_confidence(self):
+        """An attestation built from tier-2 name resolution must declare its weaker provenance."""
         source, target = self._create_pair()
         edge = Edge.objects.create(
             edge_type="donation",
             source_entity=source,
             target_entity=target,
+        )
+        attestation = Attestation.objects.create(
+            edge=edge,
             source_name="Electoral Commission",
             match_confidence=0.9,
             match_method="exact_name",
         )
-        assert edge.match_confidence < 1.0
-        assert edge.match_method == "exact_name"
+        assert attestation.match_confidence < 1.0
+        assert attestation.match_method == "exact_name"
 
     def test_create_officer_edge(self):
         person, company = self._create_pair()
@@ -213,9 +224,12 @@ class TestEdge:
             source_entity=person,
             target_entity=company,
             valid_from="2020-05-12",
+            properties={"officer_role": "director"},
+        )
+        Attestation.objects.create(
+            edge=edge,
             source_name="Companies House",
             source_reference="CH-12410514-officer-1",
-            properties={"officer_role": "director"},
         )
         assert edge.edge_type == "officer_of"
         assert edge.valid_to is None
@@ -228,6 +242,9 @@ class TestEdge:
             target_entity=supplier,
             valid_from="2020-04-01",
             valid_to="2020-10-01",
+        )
+        Attestation.objects.create(
+            edge=edge,
             source_name="DHSC High Priority Lane",
             source_reference="DHSC-HPL-row-42",
         )
@@ -235,25 +252,31 @@ class TestEdge:
         assert edge.source_entity == referrer
         assert edge.target_entity == supplier
 
-    def test_edge_source_name_required(self):
-        """Every edge must carry a source citation — this is the core of Phase 1."""
+    def test_attestation_source_name_required(self):
+        """Every attestation must carry a source citation — this is the core of Phase 1."""
         referrer, supplier = self._create_pair()
+        edge = Edge.objects.create(
+            edge_type="referred_to_lane",
+            source_entity=referrer,
+            target_entity=supplier,
+        )
         with pytest.raises(IntegrityError):
-            Edge.objects.create(
-                edge_type="referred_to_lane",
-                source_entity=referrer,
-                target_entity=supplier,
+            Attestation.objects.create(
+                edge=edge,
                 source_name="",  # empty string, not null — must be rejected
             )
 
-    def test_edge_match_confidence_out_of_range_rejected(self):
+    def test_attestation_match_confidence_out_of_range_rejected(self):
         """match_confidence must be within [0, 1] — a probability, not an arbitrary float."""
         referrer, supplier = self._create_pair()
+        edge = Edge.objects.create(
+            edge_type="referred_to_lane",
+            source_entity=referrer,
+            target_entity=supplier,
+        )
         with pytest.raises(IntegrityError):
-            Edge.objects.create(
-                edge_type="referred_to_lane",
-                source_entity=referrer,
-                target_entity=supplier,
+            Attestation.objects.create(
+                edge=edge,
                 source_name="Test",
                 match_confidence=1.5,
             )
@@ -266,7 +289,6 @@ class TestEdge:
                 edge_type="referred_to_lane",
                 source_entity=referrer,
                 target_entity=supplier,
-                source_name="Test",
                 valid_from="2020-04-01",
                 valid_to="2020-01-01",
             )
@@ -278,20 +300,22 @@ class TestEdge:
             source_entity=source,
             target_entity=target,
             valid_from="2020-01-01",
-            source_name="Electoral Commission",
         )
+        Attestation.objects.create(edge=edge, source_name="Electoral Commission")
+        attestation_pk = edge.attestations.first().pk
         source.delete()
         assert Edge.objects.filter(pk=edge.pk).count() == 0
+        assert Attestation.objects.filter(pk=attestation_pk).count() == 0
 
     def test_outgoing_and_incoming_relations(self):
         source, target = self._create_pair()
-        Edge.objects.create(
+        edge = Edge.objects.create(
             edge_type="donation",
             source_entity=source,
             target_entity=target,
             valid_from="2020-01-01",
-            source_name="EC",
         )
+        Attestation.objects.create(edge=edge, source_name="EC")
         assert source.outgoing_edges.count() == 1
         assert target.incoming_edges.count() == 1
         assert source.incoming_edges.count() == 0
@@ -306,8 +330,8 @@ class TestEdge:
             target_entity=target,
             valid_from="2019-06-01",
             valid_to="2021-01-15",
-            source_name="Companies House",
         )
+        Attestation.objects.create(edge=edge, source_name="Companies House")
         assert edge.valid_from is not None
         assert edge.valid_to is not None
         assert edge.valid_from < edge.valid_to
@@ -324,6 +348,6 @@ class TestEdge:
             edge_type="associate_of",
             source_entity=entity,
             target_entity=entity,
-            source_name="Test",
         )
+        Attestation.objects.create(edge=edge, source_name="Test")
         assert edge.source_entity == edge.target_entity

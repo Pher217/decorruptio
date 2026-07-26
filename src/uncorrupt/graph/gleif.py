@@ -15,12 +15,20 @@ entity, never a natural person. No person fields exist in this dataset.
 Cross-linking (the high-value part): a GLEIF record's `entity.jurisdiction`
 is the jurisdiction of incorporation; `entity.registeredAs` is the entity's
 number at its national company registry, and `entity.registeredAt.id` is
-the registering authority's GLEIF Registration Authority (RA) code. For
-jurisdiction "GB", `registeredAs` is a Companies House number. External
-sources supply it unpadded, so it goes through
-`uncorrupt.staging.companies_house.normalise_company_number` before joining
+the registering authority's GLEIF Registration Authority (RA) code.
+Jurisdiction "GB" alone is NOT sufficient to conclude `registeredAs` is a
+Companies House number — GLEIF lists dozens of other GB registration
+authorities (Charity Commission, FCA, Pensions Regulator, GLEIF's own
+"not on the list" placeholders RA999999/RA888888, ...) whose number
+formats can coincidentally pad to a real, unrelated Companies House
+number. Cross-linking therefore additionally gates on
+`entity.registeredAt.id` being one of the three Companies House RA codes
+(see `COMPANIES_HOUSE_RA_CODES`) before the number goes through
+`uncorrupt.staging.companies_house.normalise_company_number` and joins
 `staging.Company` — the same padding fix used for EC donations and CH
-officers.
+officers. GB records from any other authority still become Entities (they
+are legitimate global entities) but keep `company_number` NULL; the
+authority code and raw number are preserved in `properties` either way.
 """
 
 from __future__ import annotations
@@ -49,6 +57,21 @@ REGISTRY_SCHEME = "GLEIF-LEI"
 
 # GLEIF's API caps page[size] at 200; larger values return HTTP 400.
 MAX_PAGE_SIZE = 200
+
+# GLEIF Registration Authority codes for Companies House — confirmed live
+# against https://api.gleif.org/api/v1/registration-authorities/{code}
+# (queried 2026-07-26). Companies House runs one register across three
+# jurisdictions, each with its own RA code and number prefix convention:
+#   RA000585 = Companies House, England and Wales (no prefix, e.g. "07015428")
+#   RA000587 = Companies House, Scotland (SC/SL/SO prefix, e.g. "SC286832")
+#   RA000586 = Companies House, Northern Ireland (NI prefix, e.g. "NI006176")
+# All three feed the same "Basic Company Data" bulk snapshot ingested into
+# staging.Company, so all three are valid cross-link sources. Every other GB
+# RA code (e.g. RA000592 Financial Conduct Authority, RA000590 Scottish
+# Charity Regulator, RA000591 The Pensions Regulator, RA999999/RA888888
+# GLEIF's "authority not on the list" placeholders) issues numbers from a
+# different register and must never be treated as a Companies House number.
+COMPANIES_HOUSE_RA_CODES = frozenset({"RA000585", "RA000586", "RA000587"})
 
 
 @dataclass(frozen=True)
@@ -175,13 +198,20 @@ def _fetch_page_with_backoff(
     raise RuntimeError(f"GLEIF fetch failed after {max_retries} retries: {url}")
 
 
-def _resolve_gb_company(jurisdiction: str, registered_as: str | None) -> Company | None:
+def _resolve_gb_company(
+    jurisdiction: str, registered_at: str | None, registered_as: str | None
+) -> Company | None:
     """Resolve a GLEIF record's local registration number to a staging.Company.
 
-    Only attempted for jurisdiction GB (Companies House numbers). Never
-    guesses — a miss is a null `company_number`, not an invented match.
+    Only attempted for jurisdiction GB *and* a registering authority that is
+    actually Companies House (`COMPANIES_HOUSE_RA_CODES`) — jurisdiction
+    alone does not identify the register the number came from, and a number
+    from a different GB authority (FCA, Charity Commission, Pensions
+    Regulator, GLEIF's unknown-authority placeholders, ...) can coincidentally
+    pad to an unrelated real company. Never guesses — a miss is a null
+    `company_number`, not an invented match.
     """
-    if jurisdiction != "GB" or not registered_as:
+    if jurisdiction != "GB" or registered_at not in COMPANIES_HOUSE_RA_CODES or not registered_as:
         return None
     normalised = normalise_company_number(registered_as)
     if not normalised:
@@ -193,13 +223,17 @@ def ingest_gleif(jsonl_path: str | Path) -> dict[str, Any]:
     """Ingest a previously-downloaded GLEIF JSONL slice into graph Entity rows.
 
     Returns summary stats: {created, updated, skipped_no_lei, gb_linked,
-    countries, total}.
+    gb_other_authority, countries, total}. `gb_linked` counts GB records
+    cross-linked via a Companies House RA code; `gb_other_authority` counts
+    GB records with a registration number from a different GB authority
+    (correctly left unlinked, but still recorded in `properties`).
     """
     jsonl_path = Path(jsonl_path)
     created = 0
     updated = 0
     skipped_no_lei = 0
     gb_linked = 0
+    gb_other_authority = 0
     countries: set[str] = set()
     total = 0
 
@@ -231,10 +265,12 @@ def ingest_gleif(jsonl_path: str | Path) -> dict[str, Any]:
             elif jurisdiction:
                 countries.add(jurisdiction)
 
-            company = _resolve_gb_company(jurisdiction, registered_as)
+            company = _resolve_gb_company(jurisdiction, registered_at, registered_as)
             company_number = company.company_number if company else None
             if company is not None:
                 gb_linked += 1
+            elif jurisdiction == "GB" and registered_as:
+                gb_other_authority += 1
 
             properties = {
                 "jurisdiction": jurisdiction or None,
@@ -267,6 +303,7 @@ def ingest_gleif(jsonl_path: str | Path) -> dict[str, Any]:
         "updated": updated,
         "skipped_no_lei": skipped_no_lei,
         "gb_linked": gb_linked,
+        "gb_other_authority": gb_other_authority,
         "countries": len(countries),
         "total": total,
     }

@@ -53,7 +53,10 @@ def main() -> None:
     print(
         f"Ingested: {summary['created']} created, {summary['updated']} updated, "
         f"{summary['skipped_no_lei']} skipped (no LEI), "
-        f"{summary['gb_linked']} GB records linked to staging.Company, "
+        f"{summary['gb_linked']} GB records linked to staging.Company "
+        f"(Companies House RA codes only), "
+        f"{summary['gb_other_authority']} GB records from a non-Companies-House "
+        f"authority left unlinked (authority + number preserved in properties), "
         f"{summary['countries']} countries represented "
         f"(of {summary['total']} records)",
         flush=True,

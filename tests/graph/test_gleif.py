@@ -20,7 +20,11 @@ from uncorrupt.graph.models import Entity
 from uncorrupt.staging.models import Company
 
 
-def _gb_record(lei: str = "984500BG7783FREB4988", registered_as: str = "7015428") -> dict:
+def _gb_record(
+    lei: str = "984500BG7783FREB4988",
+    registered_as: str = "7015428",
+    registered_at: str = "RA000585",
+) -> dict:
     return {
         "type": "lei-records",
         "id": lei,
@@ -33,7 +37,7 @@ def _gb_record(lei: str = "984500BG7783FREB4988", registered_as: str = "7015428"
                 "category": "GENERAL",
                 "legalForm": {"id": "H0PO"},
                 "status": "ACTIVE",
-                "registeredAt": {"id": "RA000585"},
+                "registeredAt": {"id": registered_at},
                 "registeredAs": registered_as,
             },
             "registration": {"status": "ISSUED"},
@@ -88,6 +92,72 @@ class TestGleifIngest:
         assert summary["gb_linked"] == 1
         entity = Entity.objects.get(registry_scheme="GLEIF-LEI", registry_id="984500BG7783FREB4988")
         assert entity.company_number == "07015428"
+
+    def test_gb_record_from_non_companies_house_authority_does_not_link(self, tmp_path):
+        """A GB record whose number is from another authority (here: FCA, RA000592)
+        must not link even though it would pad to a real Companies House number —
+        the authority, not the jurisdiction, identifies which register issued it.
+        """
+        Company.objects.create(
+            company_number="00636217",
+            company_name="Unrelated Real Company Ltd",
+            normalised_name="UNRELATED REAL COMPANY LTD",
+        )
+        jsonl_path = _write_jsonl(
+            tmp_path,
+            [_gb_record(registered_as="636217", registered_at="RA000592")],
+        )
+
+        summary = ingest_gleif(jsonl_path)
+
+        assert summary["created"] == 1
+        assert summary["gb_linked"] == 0
+        assert summary["gb_other_authority"] == 1
+        entity = Entity.objects.get(registry_scheme="GLEIF-LEI", registry_id="984500BG7783FREB4988")
+        assert entity.company_number is None
+        assert entity.properties["local_registration_authority"] == "RA000592"
+        assert entity.properties["local_registration_number"] == "636217"
+
+    def test_gb_record_from_placeholder_authority_does_not_link(self, tmp_path):
+        """A GB record under GLEIF's 'authority not on the list' placeholder
+        (RA999999) never links — the authority is unknown, so it cannot be
+        assumed to be Companies House.
+        """
+        Company.objects.create(
+            company_number="00636217",
+            company_name="Unrelated Real Company Ltd",
+            normalised_name="UNRELATED REAL COMPANY LTD",
+        )
+        jsonl_path = _write_jsonl(
+            tmp_path,
+            [_gb_record(registered_as="636217", registered_at="RA999999")],
+        )
+
+        summary = ingest_gleif(jsonl_path)
+
+        assert summary["gb_linked"] == 0
+        entity = Entity.objects.get(registry_scheme="GLEIF-LEI", registry_id="984500BG7783FREB4988")
+        assert entity.company_number is None
+
+    def test_gb_record_from_companies_house_scotland_links(self, tmp_path):
+        """RA000587 (Companies House Scotland) is a Companies House authority
+        and must link, same as RA000585 (England and Wales).
+        """
+        Company.objects.create(
+            company_number="SC286832",
+            company_name="Aberdeen Group Plc",
+            normalised_name="ABERDEEN GROUP PLC",
+        )
+        jsonl_path = _write_jsonl(
+            tmp_path,
+            [_gb_record(registered_as="SC286832", registered_at="RA000587")],
+        )
+
+        summary = ingest_gleif(jsonl_path)
+
+        assert summary["gb_linked"] == 1
+        entity = Entity.objects.get(registry_scheme="GLEIF-LEI", registry_id="984500BG7783FREB4988")
+        assert entity.company_number == "SC286832"
 
     def test_non_gb_record_has_no_company_number(self, tmp_path):
         """A non-GB record creates an Entity with no company_number — never wrongly linked."""

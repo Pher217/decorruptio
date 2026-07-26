@@ -28,7 +28,7 @@ from typing import Any
 import django
 import httpx
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
 # Base-rate suppression threshold — shared with curate_flags.py (single source of truth)

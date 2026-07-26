@@ -83,9 +83,20 @@ def surname(person_name: str) -> str:
     This is deliberately crude and OVER-matches; a hit found this way is a
     candidate, and the count it produces is a ceiling on true matches, not a
     claim about any individual.
+
+    Peerage names carry a TERRITORIAL DESIGNATION after "of" -- "Lord Agnew of
+    Oulton", "Baroness Mone of Mayfair". Taking the last token would yield
+    "oulton" and "mayfair", which never match the "Agnew"/"Mone" an external
+    table writes. Found by positive controls: 14 of 15 resolution failures
+    were this.
     """
-    tokens = [t for t in re.split(r"[^A-Za-z]+", person_name or "") if len(t) > 1]
-    tokens = [t for t in tokens if t.lower() not in {"of", "the", "lord", "lady"}]
+    name = re.split(r"\s+of\s+", person_name or "", maxsplit=1, flags=re.IGNORECASE)[0]
+    tokens = [t for t in re.split(r"[^A-Za-z]+", name) if len(t) > 1]
+    tokens = [
+        t
+        for t in tokens
+        if t.lower() not in {"of", "the", "lord", "lady", "baroness", "baron", "sir", "dame"}
+    ]
     return tokens[-1].lower() if tokens else ""
 
 
@@ -134,13 +145,24 @@ def other_end(edge: Edge, entity_id: int) -> int:
 
 
 def find_paths(
-    start_ids: set[int], goal_id: int, adj: dict[int, list[Edge]], max_hops: int
+    start_ids: set[int],
+    goal_id: int,
+    adj: dict[int, list[Edge]],
+    max_hops: int,
+    cutoff: date = AWARD_CUTOFF,
 ) -> tuple[list[list[Edge]], list[list[Edge]]]:
     """Return (pre_award_paths, undated_paths) up to `max_hops` edges.
 
     A path is pre-award only if EVERY edge on it has a `valid_from` strictly
     before the cutoff. A path with any undated edge is returned separately so
     it can be reported honestly rather than counted as a recovery.
+
+    Note on why the split matters more than it looks: only 0.4% of
+    `declared_interest` edges carry a `valid_from` at all (the Lords register
+    publishes no start dates), against 92.3% of `officer_of`. A pre-award test
+    is therefore unsatisfiable through register-of-interests data no matter how
+    real the relationship is. Callers measuring *retrieval* rather than
+    *temporal admissibility* should pass `cutoff=date.max`.
     """
     pre_award: list[list[Edge]] = []
     undated: list[list[Edge]] = []
@@ -155,7 +177,7 @@ def find_paths(
             new_path = [*path, edge]
             if nxt == goal_id:
                 dates = [e.valid_from for e in new_path]
-                if all(d is not None and d < AWARD_CUTOFF for d in dates):
+                if all(d is not None and d < cutoff for d in dates):
                     pre_award.append(new_path)
                 else:
                     undated.append(new_path)

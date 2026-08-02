@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,6 +68,8 @@ _ALLOWED_APPOINTED_TO_FIELDS = ("company_number", "company_name", "company_statu
 
 # CH allows 600 requests / 5 minutes. Stay under it.
 _THROTTLE_SECONDS = 0.55
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_appointment(item: dict[str, Any]) -> dict[str, Any]:
@@ -155,13 +158,55 @@ def fetch_officer_appointments(
     return counts
 
 
+def _canonical_company_entity(company: Company) -> Entity:
+    """The Companies House node for a company, creating it if absent.
+
+    A plain `get_or_create(company_number=...)` raises MultipleObjectsReturned
+    here: GLEIF publishes more than one LEI record for the same UK company
+    (observed on 5 company numbers, one pair carrying different names -- a
+    rename with a stale LEI record left behind). Those GLEIF entities are
+    legitimately distinct claims and must NOT be merged (governing principle:
+    duplicate over merge), so we cannot pick one arbitrarily.
+
+    A Companies-House-sourced appointment belongs on the Companies House node,
+    so that is what we resolve to -- creating it when only GLEIF records exist.
+    """
+    coh = Entity.objects.filter(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+    ).first()
+    if coh:
+        return coh
+    entity, _ = Entity.objects.get_or_create(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+        defaults={
+            "name": company.company_name,
+            "company_number": company.company_number,
+        },
+    )
+    return entity
+
+
 def ingest_officer_appointments(
-    officer_ids: list[str], input_dir: str | Path
+    officer_ids: list[str],
+    input_dir: str | Path,
+    batch_size: int = 500,
+    progress_every: int = 2000,
 ) -> dict[str, int]:
     """Turn cached appointment lists into `officer_of` edges.
 
+    Commits every `batch_size` officers rather than wrapping all 21k in one
+    transaction. A single atomic block over ~200k get_or_create pairs holds
+    locks for the whole run, grows without bound, and loses everything if the
+    client dies at minute 20 -- which is exactly what happened twice. Because
+    every write is a `get_or_create`, a partially-completed run is safe to
+    re-run: it resumes rather than duplicating.
+
     Returns {edges_created, officers_processed, appointments_seen,
-    company_unmatched, officer_missing}.
+    company_unmatched, officer_missing, inconsistent_dates}.
     """
     input_dir = Path(input_dir)
     stats = {
@@ -170,101 +215,128 @@ def ingest_officer_appointments(
         "appointments_seen": 0,
         "company_unmatched": 0,
         "officer_missing": 0,
+        "inconsistent_dates": 0,
     }
 
-    with transaction.atomic():
-        for officer_id in officer_ids:
-            json_path = input_dir / f"{officer_id}.json"
-            if not json_path.exists():
-                continue
+    for start in range(0, len(officer_ids), batch_size):
+        batch = officer_ids[start : start + batch_size]
+        with transaction.atomic():
+            for officer_id in batch:
+                json_path = input_dir / f"{officer_id}.json"
+                if not json_path.exists():
+                    continue
 
-            person = Entity.objects.filter(
-                entity_type="person",
-                registry_scheme="GB-COH-OFFICER",
-                registry_id=officer_id,
-            ).first()
-            if person is None:
-                # Expansion is scoped to people a prior ingest already
-                # recorded; we never create a person here.
-                stats["officer_missing"] += 1
-                continue
+                person = Entity.objects.filter(
+                    entity_type="person",
+                    registry_scheme="GB-COH-OFFICER",
+                    registry_id=officer_id,
+                ).first()
+                if person is None:
+                    # Expansion is scoped to people a prior ingest already
+                    # recorded; we never create a person here.
+                    stats["officer_missing"] += 1
+                    continue
 
-            stats["officers_processed"] += 1
-            provenance_path = input_dir / f"{officer_id}.provenance.json"
-            observed_at = None
-            if provenance_path.exists():
-                try:
-                    observed_at = datetime.fromisoformat(
-                        json.loads(provenance_path.read_text())["retrieved_at"]
+                stats["officers_processed"] += 1
+                provenance_path = input_dir / f"{officer_id}.provenance.json"
+                observed_at = None
+                if provenance_path.exists():
+                    try:
+                        observed_at = datetime.fromisoformat(
+                            json.loads(provenance_path.read_text())["retrieved_at"]
+                        )
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        observed_at = None
+
+                for item in json.loads(json_path.read_text()):
+                    stats["appointments_seen"] += 1
+                    appointed_to = item.get("appointed_to") or {}
+                    raw_number = appointed_to.get("company_number")
+                    if not raw_number:
+                        stats["company_unmatched"] += 1
+                        continue
+
+                    company_number = normalise_company_number(raw_number)
+                    company = Company.objects.filter(company_number=company_number).first()
+                    if company is None:
+                        stats["company_unmatched"] += 1
+                        continue
+
+                    company_entity = _canonical_company_entity(company)
+
+                    properties: dict[str, Any] = {}
+                    role = (item.get("officer_role") or "").strip()
+                    if role:
+                        properties["officer_role"] = role
+
+                    resigned_raw = item.get("resigned_on")
+                    valid_to = _parse_ch_date(resigned_raw) if resigned_raw else None
+                    if resigned_raw and valid_to is None:
+                        # Present but unparseable: ended, date unknown. Never
+                        # read as still serving — that would make a lapsed
+                        # directorship look like a live one in a path search.
+                        properties["resigned_on_unparsed"] = resigned_raw
+                        properties["resignation_status"] = "ended_date_unknown"
+
+                    valid_from = _parse_ch_date(item.get("appointed_on"))
+
+                    # Companies House contains appointments that resigned BEFORE
+                    # they were appointed (real example: appointed 1993-02-22,
+                    # resigned 1993-02-02). The relationship is real -- the person
+                    # WAS an officer -- but the dates are internally inconsistent,
+                    # so we assert no temporal claim at all rather than guessing
+                    # which date is wrong or silently swapping them. Keeping
+                    # valid_from while dropping valid_to would be worse: it would
+                    # read as a still-live directorship in a pre-award path search.
+                    if valid_from and valid_to and valid_to < valid_from:
+                        properties["appointed_on_raw"] = item.get("appointed_on")
+                        properties["resigned_on_raw"] = resigned_raw
+                        properties["date_status"] = "inconsistent_source_dates"
+                        valid_from = None
+                        valid_to = None
+                        stats["inconsistent_dates"] += 1
+
+                    edge, created = Edge.objects.get_or_create(
+                        edge_type="officer_of",
+                        source_entity=person,
+                        target_entity=company_entity,
+                        valid_from=valid_from,
+                        valid_to=valid_to,
+                        defaults={"properties": properties},
                     )
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    observed_at = None
+                    if created:
+                        stats["edges_created"] += 1
 
-            for item in json.loads(json_path.read_text()):
-                stats["appointments_seen"] += 1
-                appointed_to = item.get("appointed_to") or {}
-                raw_number = appointed_to.get("company_number")
-                if not raw_number:
-                    stats["company_unmatched"] += 1
-                    continue
+                    source_reference = (
+                        _parse_appointment_self_link(item)
+                        or f"{officer_id}:{company_number}"
+                    )
+                    att_defaults: dict[str, Any] = {
+                        "source_url": f"{CH_API_BASE}/officers/{officer_id}/appointments",
+                        "match_confidence": 1.0,
+                        "match_method": "identifier",
+                    }
+                    if observed_at:
+                        att_defaults["observed_at"] = observed_at
+                    Attestation.objects.get_or_create(
+                        edge=edge,
+                        source_name=SOURCE_NAME,
+                        source_reference=source_reference,
+                        defaults=att_defaults,
+                    )
 
-                company_number = normalise_company_number(raw_number)
-                company = Company.objects.filter(company_number=company_number).first()
-                if company is None:
-                    stats["company_unmatched"] += 1
-                    continue
-
-                company_entity, _ = Entity.objects.get_or_create(
-                    entity_type="company",
-                    company_number=company.company_number,
-                    defaults={
-                        "name": company.company_name,
-                        "registry_scheme": "GB-COH",
-                        "registry_id": company.company_number,
-                    },
-                )
-
-                properties: dict[str, Any] = {}
-                role = (item.get("officer_role") or "").strip()
-                if role:
-                    properties["officer_role"] = role
-
-                resigned_raw = item.get("resigned_on")
-                valid_to = _parse_ch_date(resigned_raw) if resigned_raw else None
-                if resigned_raw and valid_to is None:
-                    # Present but unparseable: ended, date unknown. Never
-                    # read as still serving — that would make a lapsed
-                    # directorship look like a live one in a path search.
-                    properties["resigned_on_unparsed"] = resigned_raw
-                    properties["resignation_status"] = "ended_date_unknown"
-
-                edge, created = Edge.objects.get_or_create(
-                    edge_type="officer_of",
-                    source_entity=person,
-                    target_entity=company_entity,
-                    valid_from=_parse_ch_date(item.get("appointed_on")),
-                    valid_to=valid_to,
-                    defaults={"properties": properties},
-                )
-                if created:
-                    stats["edges_created"] += 1
-
-                source_reference = (
-                    _parse_appointment_self_link(item)
-                    or f"{officer_id}:{company_number}"
-                )
-                att_defaults: dict[str, Any] = {
-                    "source_url": f"{CH_API_BASE}/officers/{officer_id}/appointments",
-                    "match_confidence": 1.0,
-                    "match_method": "identifier",
-                }
-                if observed_at:
-                    att_defaults["observed_at"] = observed_at
-                Attestation.objects.get_or_create(
-                    edge=edge,
-                    source_name=SOURCE_NAME,
-                    source_reference=source_reference,
-                    defaults=att_defaults,
-                )
+        if stats["officers_processed"] and (
+            stats["officers_processed"] % progress_every < batch_size
+        ):
+            logger.info(
+                "appointments: %d officers, %d edges",
+                stats["officers_processed"],
+                stats["edges_created"],
+            )
+            print(
+                f"  {stats['officers_processed']:,} officers / "
+                f"{stats['edges_created']:,} edges",
+                flush=True,
+            )
 
     return stats

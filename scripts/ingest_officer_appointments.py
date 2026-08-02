@@ -61,7 +61,8 @@ def main() -> None:
         f"{stats['officers_processed']} officers "
         f"({stats['appointments_seen']} appointments seen, "
         f"{stats['company_unmatched']} unmatched companies, "
-        f"{stats['officer_missing']} officers not in graph)"
+        f"{stats['officer_missing']} officers not in graph, "
+        f"{stats['inconsistent_dates']} with inconsistent source dates)"
     )
 
 

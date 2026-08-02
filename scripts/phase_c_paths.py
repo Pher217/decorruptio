@@ -89,13 +89,32 @@ def surname(person_name: str) -> str:
     "oulton" and "mayfair", which never match the "Agnew"/"Mone" an external
     table writes. Found by positive controls: 14 of 15 resolution failures
     were this.
+
+    Companies House writes officers as "SURNAME, Forenames, Title", so the
+    LAST token there is a forename or a title, not the family name --
+    "LEWIS, John Patrick, Sir" would index under "patrick". When a comma is
+    present the surname is everything before the first one.
+
+    Post-nominals ("MP", "QC", "OBE") must also be stripped: "Matt Hancock MP"
+    otherwise resolves to "mp", and every MP in a cohort collapses onto
+    whichever entity happens to parse the same way. That produced four phantom
+    matches in Phase C, all pointing at one unrelated officer record.
     """
-    name = re.split(r"\s+of\s+", person_name or "", maxsplit=1, flags=re.IGNORECASE)[0]
+    raw = person_name or ""
+    if "," in raw:
+        raw = raw.split(",", 1)[0]
+    name = re.split(r"\s+of\s+", raw, maxsplit=1, flags=re.IGNORECASE)[0]
     tokens = [t for t in re.split(r"[^A-Za-z]+", name) if len(t) > 1]
     tokens = [
         t
         for t in tokens
-        if t.lower() not in {"of", "the", "lord", "lady", "baroness", "baron", "sir", "dame"}
+        if t.lower()
+        not in {
+            "of", "the", "lord", "lady", "baroness", "baron", "sir", "dame",
+            # post-nominals and honorifics that are never a family name
+            "mp", "msp", "qc", "kc", "obe", "cbe", "mbe", "dbe", "kbe", "gbe",
+            "phd", "prof", "dr", "mr", "mrs", "ms", "rt", "hon", "esq",
+        }
     ]
     return tokens[-1].lower() if tokens else ""
 
@@ -208,8 +227,23 @@ def find_paths(
     pre_award: list[list[Edge]] = []
     undated: list[list[Edge]] = []
 
+    def cost(edge: Edge) -> int:
+        """`same_as` is an IDENTITY assertion, not a relationship.
+
+        Stepping from "Lord Agnew of Oulton" (parliament) to "AGNEW, Theodore
+        Thomas More, Lord" (Companies House) does not put another person
+        between the two ends -- it is the same human recorded twice. Charging
+        it a hop would make every cross-register path cost one more than the
+        relationship it actually represents, and with a 2-hop budget that
+        alone would hide every shared directorship a peer has.
+        """
+        return 0 if edge.edge_type == "same_as" else 1
+
+    def spent(path: list[Edge]) -> int:
+        return sum(cost(e) for e in path)
+
     def walk(node: int, path: list[Edge], seen: set[int]) -> None:
-        if len(path) >= max_hops:
+        if spent(path) >= max_hops:
             return
         for edge in adj.get(node, ()):
             nxt = other_end(edge, node)
@@ -217,8 +251,11 @@ def find_paths(
                 continue
             new_path = [*path, edge]
             if nxt == goal_id:
-                dates = [e.valid_from for e in new_path]
-                if all(d is not None and d < cutoff for d in dates):
+                # An identity assertion has no temporal validity to test --
+                # it is not a claim about a period. Requiring a valid_from on
+                # it would reject every cross-register path outright.
+                dates = [e.valid_from for e in new_path if cost(e)]
+                if dates and all(d is not None and d < cutoff for d in dates):
                     pre_award.append(new_path)
                 else:
                     undated.append(new_path)

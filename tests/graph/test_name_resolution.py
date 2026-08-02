@@ -54,3 +54,27 @@ def test_single_token_name_survives():
     WHEN extracted
     THEN it is returned lowercased."""
     assert surname("Adebowale") == "adebowale"
+
+
+def test_post_nominal_is_not_the_surname():
+    """GIVEN an MP written with a post-nominal
+    WHEN the surname is extracted
+    THEN it is the family name, not "mp".
+
+    Every MP in a cohort otherwise collapses onto the same key — this produced
+    four phantom matches in Phase C, all pointing at one unrelated officer.
+    """
+    assert surname("Matt Hancock MP") == "hancock"
+    assert surname("Dr Julian Lewis MP") == "lewis"
+
+
+def test_companies_house_comma_format_uses_the_leading_surname():
+    """GIVEN the CH "SURNAME, Forenames, Title" format
+    WHEN the surname is extracted
+    THEN it is the part before the first comma, not the last token.
+
+    "LEWIS, John Patrick, Sir" indexed under "patrick" before this fix, so all
+    21,082 officer entities were keyed by a forename.
+    """
+    assert surname("LEWIS, John Patrick, Sir") == "lewis"
+    assert surname("AGNEW, Theodore Thomas More, Lord") == "agnew"

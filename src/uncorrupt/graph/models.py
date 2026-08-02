@@ -136,6 +136,7 @@ class Edge(models.Model):
         ("supplier_of", "Supplier of public contract"),
         ("associate_of", "Professional or personal association"),
         ("ownership", "Corporate ownership / control (parent of subsidiary)"),
+        ("same_as", "Asserted identity between two registry records"),
     ]
 
     edge_type = models.CharField(max_length=30, choices=EDGE_TYPES, db_index=True)

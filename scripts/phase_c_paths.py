@@ -54,9 +54,7 @@ VIP_CH_CACHE = "experiments/vip_ch_cache.json"
 # rather than inventing a per-row date we cannot source.
 AWARD_CUTOFF = date(2020, 3, 1)
 
-_SUFFIXES = re.compile(
-    r"\b(LIMITED|LTD|PLC|LLP|LP|GROUP|HOLDINGS|INTERNATIONAL|UK|THE|AND|CO)\b"
-)
+_SUFFIXES = re.compile(r"\b(LIMITED|LTD|PLC|LLP|LP|GROUP|HOLDINGS|INTERNATIONAL|UK|THE|AND|CO)\b")
 
 
 def normalise_company_number(cn: str) -> str:
@@ -110,18 +108,40 @@ def surname(person_name: str) -> str:
         for t in tokens
         if t.lower()
         not in {
-            "of", "the", "lord", "lady", "baroness", "baron", "sir", "dame",
+            "of",
+            "the",
+            "lord",
+            "lady",
+            "baroness",
+            "baron",
+            "sir",
+            "dame",
             # post-nominals and honorifics that are never a family name
-            "mp", "msp", "qc", "kc", "obe", "cbe", "mbe", "dbe", "kbe", "gbe",
-            "phd", "prof", "dr", "mr", "mrs", "ms", "rt", "hon", "esq",
+            "mp",
+            "msp",
+            "qc",
+            "kc",
+            "obe",
+            "cbe",
+            "mbe",
+            "dbe",
+            "kbe",
+            "gbe",
+            "phd",
+            "prof",
+            "dr",
+            "mr",
+            "mrs",
+            "ms",
+            "rt",
+            "hon",
+            "esq",
         }
     ]
     return tokens[-1].lower() if tokens else ""
 
 
-def resolve_supplier(
-    name: str, ch_cache: dict, company_number: str | None = None
-) -> Entity | None:
+def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = None) -> Entity | None:
     """Registry ID first, exact normalised name second. Never a fuzzy guess.
 
     The cohort CSV carries its own `company_number` for many rows; a registry
@@ -133,9 +153,7 @@ def resolve_supplier(
         found = Entity.objects.filter(company_number=cn).first()
         if found:
             return found
-        found = Entity.objects.filter(
-            registry_scheme="GB-COH", registry_id=cn
-        ).first()
+        found = Entity.objects.filter(registry_scheme="GB-COH", registry_id=cn).first()
         if found:
             return found
 
@@ -150,9 +168,7 @@ def resolve_supplier(
     target = normalise_name(name)
     if not target:
         return None
-    nearby = Entity.objects.filter(
-        entity_type="company", name__icontains=name.strip()[:15]
-    )[:200]
+    nearby = Entity.objects.filter(entity_type="company", name__icontains=name.strip()[:15])[:200]
     candidates = [e for e in nearby if normalise_name(e.name) == target]
     # Uniqueness guard: 2+ candidates means we cannot say which, so we say none.
     return candidates[0] if len(candidates) == 1 else None
@@ -197,11 +213,7 @@ def build_adjacency() -> dict[int, list[Edge]]:
 
 
 def other_end(edge: Edge, entity_id: int) -> int:
-    return (
-        edge.target_entity_id
-        if edge.source_entity_id == entity_id
-        else edge.source_entity_id
-    )
+    return edge.target_entity_id if edge.source_entity_id == entity_id else edge.source_entity_id
 
 
 def find_paths(
@@ -310,9 +322,7 @@ def main() -> None:
         if not _names_a_person(referrer_name):
             counts["referrer_not_a_person"] += 1
 
-        supplier = resolve_supplier(
-            supplier_name, ch_cache, row.get("company_number")
-        )
+        supplier = resolve_supplier(supplier_name, ch_cache, row.get("company_number"))
         referrers = (
             resolve_referrer(referrer_name, people_by_surname)
             if _names_a_person(referrer_name)
@@ -337,9 +347,7 @@ def main() -> None:
             continue
 
         counts["both_resolved"] += 1
-        pre_award, undated = find_paths(
-            {r.id for r in referrers}, supplier.id, adj, args.max_hops
-        )
+        pre_award, undated = find_paths({r.id for r in referrers}, supplier.id, adj, args.max_hops)
         if pre_award:
             counts["path_found"] += 1
             status = "path_found"

@@ -4,40 +4,39 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('staging', '0003_add_ingest_run'),
+        ("staging", "0003_add_ingest_run"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='company',
-            name='accounts_next_due',
+            model_name="company",
+            name="accounts_next_due",
             field=models.DateField(blank=True, null=True),
         ),
         migrations.AddField(
-            model_name='company',
-            name='company_category',
+            model_name="company",
+            name="company_category",
             field=models.CharField(blank=True, max_length=100, null=True),
         ),
         migrations.AddField(
-            model_name='company',
-            name='dissolution_date',
+            model_name="company",
+            name="dissolution_date",
             field=models.DateField(blank=True, null=True),
         ),
         migrations.AddField(
-            model_name='company',
-            name='sic_codes_list',
+            model_name="company",
+            name="sic_codes_list",
             field=models.JSONField(blank=True, default=list),
         ),
         migrations.AlterField(
-            model_name='company',
-            name='company_status',
+            model_name="company",
+            name="company_status",
             field=models.CharField(blank=True, max_length=100, null=True),
         ),
         migrations.AlterField(
-            model_name='company',
-            name='incorporation_date',
+            model_name="company",
+            name="incorporation_date",
             field=models.DateField(blank=True, db_index=True, null=True),
         ),
     ]

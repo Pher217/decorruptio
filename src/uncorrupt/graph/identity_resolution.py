@@ -102,9 +102,7 @@ def parse_officer_name(name: str) -> dict[str, Any]:
             forename = first[0].lower()
         if title is None and len(parts) >= 2:
             trailing = [
-                t
-                for t in re.split(r"[^A-Za-z'\-]+", parts[-1])
-                if t.lower() in _ALL_TITLES
+                t for t in re.split(r"[^A-Za-z'\-]+", parts[-1]) if t.lower() in _ALL_TITLES
             ]
             if trailing:
                 title = trailing[0].lower()
@@ -139,9 +137,9 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
     }
 
     officers = list(
-        Entity.objects.filter(
-            entity_type="person", registry_scheme="GB-COH-OFFICER"
-        ).only("id", "name")
+        Entity.objects.filter(entity_type="person", registry_scheme="GB-COH-OFFICER").only(
+            "id", "name"
+        )
     )
     by_surname: dict[str, list[tuple[Entity, dict[str, Any]]]] = {}
     for officer in officers:
@@ -150,9 +148,7 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
             by_surname.setdefault(parsed["surname"], []).append((officer, parsed))
 
     observed_at = datetime.now(UTC)
-    members = Entity.objects.filter(
-        entity_type="person", registry_scheme="UK-PARLIAMENT-MEMBER"
-    )
+    members = Entity.objects.filter(entity_type="person", registry_scheme="UK-PARLIAMENT-MEMBER")
 
     with transaction.atomic():
         for member in members:
@@ -172,9 +168,7 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
                 continue
 
             if parsed["forename"]:
-                matched = [
-                    (o, op) for o, op in candidates if op["forename"] == parsed["forename"]
-                ]
+                matched = [(o, op) for o, op in candidates if op["forename"] == parsed["forename"]]
                 confidence = CONFIDENCE_WITH_FORENAME
                 tier = "surname_forename_title"
             else:

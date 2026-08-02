@@ -4,15 +4,27 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('graph', '0006_alter_edge_edge_type'),
+        ("graph", "0006_alter_edge_edge_type"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='edge',
-            name='edge_type',
-            field=models.CharField(choices=[('donation', 'Political donation'), ('officer_of', 'Officer / director of company'), ('referred_to_lane', 'Referred supplier to VIP lane'), ('declared_interest', 'Declared financial interest'), ('supplier_of', 'Supplier of public contract'), ('associate_of', 'Professional or personal association'), ('ownership', 'Corporate ownership / control (parent of subsidiary)'), ('same_as', 'Asserted identity between two registry records')], db_index=True, max_length=30),
+            model_name="edge",
+            name="edge_type",
+            field=models.CharField(
+                choices=[
+                    ("donation", "Political donation"),
+                    ("officer_of", "Officer / director of company"),
+                    ("referred_to_lane", "Referred supplier to VIP lane"),
+                    ("declared_interest", "Declared financial interest"),
+                    ("supplier_of", "Supplier of public contract"),
+                    ("associate_of", "Professional or personal association"),
+                    ("ownership", "Corporate ownership / control (parent of subsidiary)"),
+                    ("same_as", "Asserted identity between two registry records"),
+                ],
+                db_index=True,
+                max_length=30,
+            ),
         ),
     ]

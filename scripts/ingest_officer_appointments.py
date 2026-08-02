@@ -40,9 +40,9 @@ def main() -> None:
     args = parser.parse_args()
 
     officer_ids = list(
-        Entity.objects.filter(
-            entity_type="person", registry_scheme="GB-COH-OFFICER"
-        ).values_list("registry_id", flat=True)
+        Entity.objects.filter(entity_type="person", registry_scheme="GB-COH-OFFICER").values_list(
+            "registry_id", flat=True
+        )
     )
     if args.limit:
         officer_ids = officer_ids[: args.limit]
@@ -50,10 +50,7 @@ def main() -> None:
 
     if not args.skip_fetch:
         counts = fetch_officer_appointments(officer_ids, args.output_dir)
-        print(
-            f"fetched {counts['fetched']}, cached {counts['cached']}, "
-            f"failed {counts['failed']}"
-        )
+        print(f"fetched {counts['fetched']}, cached {counts['cached']}, failed {counts['failed']}")
 
     stats = ingest_officer_appointments(officer_ids, args.output_dir)
     print(

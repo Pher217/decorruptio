@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('graph', '0004_attestation_refactor'),
+        ("graph", "0004_attestation_refactor"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='entity',
-            name='registry_id',
+            model_name="entity",
+            name="registry_id",
             field=models.CharField(blank=True, db_index=True, max_length=255, null=True),
         ),
     ]

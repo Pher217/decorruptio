@@ -77,9 +77,7 @@ def test_backfill_join_key_is_zero_padded(db):
     THEN it matches the stored row — the padding bug that produced zero joins."""
     Company.objects.create(company_number="07015428", company_name="Test Co")
     assert normalise_company_number("7015428") == "07015428"
-    assert Company.objects.filter(
-        company_number=normalise_company_number("7015428")
-    ).exists()
+    assert Company.objects.filter(company_number=normalise_company_number("7015428")).exists()
 
 
 def test_sic_codes_list_defaults_to_empty_list(db):

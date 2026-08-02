@@ -115,8 +115,7 @@ def main() -> None:
                     incorporation_date=parse_ch_date(row.get("IncorporationDate")),
                     company_status=(row.get("CompanyStatus") or "").strip() or None,
                     company_category=(row.get("CompanyCategory") or "").strip() or None,
-                    accounts_category=(row.get("Accounts.AccountCategory") or "").strip()
-                    or None,
+                    accounts_category=(row.get("Accounts.AccountCategory") or "").strip() or None,
                     accounts_next_due=parse_ch_date(row.get("Accounts.NextDueDate")),
                     dissolution_date=parse_ch_date(row.get("DissolutionDate")),
                     sic_codes_list=collect_sic(row),

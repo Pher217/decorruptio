@@ -69,9 +69,7 @@ def main() -> None:
         ).order_by("id")
     )
     companies = list(
-        Entity.objects.filter(
-            entity_type="company", registry_scheme="GB-COH"
-        ).order_by("id")
+        Entity.objects.filter(entity_type="company", registry_scheme="GB-COH").order_by("id")
     )
     if not people or not companies:
         raise SystemExit("no candidate pool — is the graph populated?")
@@ -85,11 +83,10 @@ def main() -> None:
         company = companies[(i * 13) % len(companies)]
         i += 1
         # A "negative" must have no DIRECT edge either way.
-        if Edge.objects.filter(
-            source_entity=person, target_entity=company
-        ).exists() or Edge.objects.filter(
-            source_entity=company, target_entity=person
-        ).exists():
+        if (
+            Edge.objects.filter(source_entity=person, target_entity=company).exists()
+            or Edge.objects.filter(source_entity=company, target_entity=person).exists()
+        ):
             continue
         pairs.append((person, company))
 

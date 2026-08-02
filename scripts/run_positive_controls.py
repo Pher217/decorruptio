@@ -152,9 +152,7 @@ def main() -> None:
             {p.id for p in person_candidates}, goal.id, adj, args.max_hops, date.max
         )
         any_paths = dated + undated
-        pre_award, _ = find_paths(
-            {p.id for p in person_candidates}, goal.id, adj, args.max_hops
-        )
+        pre_award, _ = find_paths({p.id for p in person_candidates}, goal.id, adj, args.max_hops)
 
         if any_paths:
             retrieved += 1

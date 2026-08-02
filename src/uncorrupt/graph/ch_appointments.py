@@ -124,9 +124,7 @@ def fetch_officer_appointments(
                         "items_per_page": items_per_page,
                         "start_index": start_index,
                     }
-                    page = _fetch_page_with_backoff(
-                        client, source_url, params, max_retries
-                    )
+                    page = _fetch_page_with_backoff(client, source_url, params, max_retries)
                     page_items = page.get("items", [])
                     items.extend(page_items)
                     total = page.get("total_results", len(items))
@@ -308,8 +306,7 @@ def ingest_officer_appointments(
                         stats["edges_created"] += 1
 
                     source_reference = (
-                        _parse_appointment_self_link(item)
-                        or f"{officer_id}:{company_number}"
+                        _parse_appointment_self_link(item) or f"{officer_id}:{company_number}"
                     )
                     att_defaults: dict[str, Any] = {
                         "source_url": f"{CH_API_BASE}/officers/{officer_id}/appointments",
@@ -334,8 +331,7 @@ def ingest_officer_appointments(
                 stats["edges_created"],
             )
             print(
-                f"  {stats['officers_processed']:,} officers / "
-                f"{stats['edges_created']:,} edges",
+                f"  {stats['officers_processed']:,} officers / {stats['edges_created']:,} edges",
                 flush=True,
             )
 

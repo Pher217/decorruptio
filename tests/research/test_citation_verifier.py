@@ -17,19 +17,44 @@ Verifies the core invariants the tool exists for (see
   fetch) is EXTRACTION_UNRELIABLE, and NEVER ABSENT -- an extraction failure
   is not evidence about the claim either (ADR-008's principle, applied
   beyond the PDF case it names)
+- A quote in an unpunctuated table region, a quote spanning many sentences
+  (a block quote), and a quote beyond the character-scan bound are all
+  found via the whole-text sliding window, never ABSENT -- matching only on
+  sentence *shape* silently defeats all three, and a smaller table scoring
+  worse than a larger one (non-monotone) was a confirmed real defect in an
+  earlier version of the fix
+- PDF extraction is delegated to `uncorrupt.extraction.pdf.extract_pdf_bytes`
+  (pypdf text layer, OCR quality-gated fallback); a PDF whose text layer
+  decoded for some pages but not others is never ABSENT, and a genuinely
+  complete PDF's real absence is still ABSENT
 - No code path (including the optional LLM adjudication hook) can promote
   an ABSENT (or EXTRACTION_UNRELIABLE, or UNFETCHABLE) result into a pass
 """
 
 import json
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 
 import httpx
+from pypdf import PdfReader, PdfWriter
 
+from tests.extraction.pdf_fixtures import build_blank_pdf, build_text_pdf
 from uncorrupt.research.citation_verifier import (
     CitationStatus,
     verify_citation,
 )
+
+
+def _merge_pdfs(*pdf_byte_blobs: bytes) -> bytes:
+    """Concatenate pre-built single-PDF byte blobs into one multi-page PDF."""
+    writer = PdfWriter()
+    for blob in pdf_byte_blobs:
+        for page in PdfReader(BytesIO(blob)).pages:
+            writer.add_page(page)
+    buf = BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
 
 ARTICLE_TEXT = (
     "The committee published its findings today. "
@@ -365,25 +390,22 @@ class TestLlmAdjudicationCannotPromoteAbsent:
 
 
 class TestPdfExtraction:
-    def test_pdf_quote_verified_via_pdftotext_when_available(self, monkeypatch):
-        """GIVEN a URL serving a PDF and pdftotext installed WHEN verified THEN the
-        PDF bytes are shelled out to pdftotext and the extracted text is checked
-        for the quote."""
-        import uncorrupt.research.citation_verifier as verifier_module
+    """PDF extraction is delegated to `uncorrupt.extraction.pdf.extract_pdf_bytes`
+    (pypdf text layer, OCR quality-gated fallback) -- see the "PDF
+    extraction" section of the module docstring for why this module does
+    not maintain a second, parallel PDF-reliability heuristic. These tests
+    cover how `verify_citation` maps that layer's `ExtractionResult` onto
+    its own five-status model."""
 
-        monkeypatch.setattr(verifier_module.shutil, "which", lambda _name: "/usr/bin/pdftotext")
-
-        class FakeCompletedProcess:
-            returncode = 0
-            stdout = ARTICLE_TEXT.encode("utf-8")
-
-        monkeypatch.setattr(
-            verifier_module.subprocess, "run", lambda *a, **k: FakeCompletedProcess()
-        )
+    def test_pdf_quote_verified_via_real_text_layer_extraction(self):
+        """GIVEN a URL serving a real, valid single-page PDF whose embedded
+        text layer contains the quote WHEN verified THEN the PDF bytes are
+        read through the shared extraction layer and the quote is found."""
+        pdf_bytes = build_text_pdf([VERBATIM_QUOTE])
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
-                200, content=b"%PDF-fake-bytes", headers={"content-type": "application/pdf"}
+                200, content=pdf_bytes, headers={"content-type": "application/pdf"}
             )
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -396,29 +418,205 @@ class TestPdfExtraction:
 
         assert result.status == CitationStatus.VERBATIM
 
-    def test_pdf_without_pdftotext_installed_is_unfetchable_with_clear_reason(self, monkeypatch):
-        """GIVEN a URL serving a PDF and pdftotext NOT installed WHEN verified THEN
-        the status is UNFETCHABLE and the detail clearly names the missing tool,
-        rather than silently reporting ABSENT."""
-        import uncorrupt.research.citation_verifier as verifier_module
-
-        monkeypatch.setattr(verifier_module.shutil, "which", lambda _name: None)
+    def test_pdf_that_cannot_be_parsed_at_all_is_unfetchable_with_clear_reason(self):
+        """GIVEN a URL serving bytes that are not a valid PDF at all (e.g. a
+        mislabelled error page) WHEN verified THEN the status is UNFETCHABLE
+        with a reason naming the parse failure, never ABSENT -- the
+        extraction machinery itself failed before any quality question
+        could even be asked."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
-                200, content=b"%PDF-fake-bytes", headers={"content-type": "application/pdf"}
+                200, content=b"not a pdf at all", headers={"content-type": "application/pdf"}
             )
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
 
         result = verify_citation(
-            "https://example.test/letter.pdf",
+            "https://example.test/broken.pdf",
             VERBATIM_QUOTE,
             client=client,
         )
 
         assert result.status == CitationStatus.UNFETCHABLE
-        assert "pdftotext" in result.detail
+        assert "pdf_extraction_failed" in result.detail
+
+    def test_extraction_layer_backend_unavailable_is_mapped_to_unfetchable(self, monkeypatch):
+        """GIVEN the shared extraction layer reports BACKEND_UNAVAILABLE (the
+        text layer failed its own quality gate and no OCR backend is
+        available) WHEN verified THEN the status is UNFETCHABLE, never
+        ABSENT -- the tool could not obtain any text to check at all, which
+        is a retrieval problem, not an unreliable-but-present extraction.
+        The extraction layer's real OCR-availability check depends on what
+        is installed on the machine running the test, so this stubs
+        `extract_pdf_bytes` directly to make the mapping deterministic."""
+        import uncorrupt.research.citation_verifier as verifier_module
+        from uncorrupt.extraction.types import ExtractionResult, ExtractionStatus
+
+        fake_result = ExtractionResult(
+            status=ExtractionStatus.BACKEND_UNAVAILABLE,
+            text="",
+            page_count=3,
+            char_count=0,
+            source_format="pdf",
+            method=None,
+            quality=None,
+            error="text layer failed the quality gate and no OCR backend is available",
+        )
+        monkeypatch.setattr(verifier_module, "extract_pdf_bytes", lambda data: fake_result)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"%PDF-fake", headers={"content-type": "application/pdf"}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/scanned.pdf",
+            VERBATIM_QUOTE,
+            client=client,
+        )
+
+        assert result.status == CitationStatus.UNFETCHABLE
+        assert "pdf_extraction_backend_unavailable" in result.detail
+
+    def test_extraction_layer_extraction_unreliable_is_mapped_through_not_absent(self, monkeypatch):
+        """GIVEN the shared extraction layer classifies a PDF as
+        EXTRACTION_UNRELIABLE (text layer AND OCR both failed its quality
+        gate) WHEN verified for a quote genuinely absent from the
+        (unreliable) recovered text THEN citation_verifier's status is
+        EXTRACTION_UNRELIABLE, never ABSENT -- the extraction layer's own
+        verdict is honoured, not recomputed by a second heuristic here."""
+        import uncorrupt.research.citation_verifier as verifier_module
+        from uncorrupt.extraction.quality import QualityAssessment
+        from uncorrupt.extraction.types import ExtractionResult, ExtractionStatus
+
+        fake_quality = QualityAssessment(
+            chars_per_page=12.0,
+            alnum_ratio=0.4,
+            word_shape_ratio=0.3,
+            passed=False,
+            reason="alnum_ratio 0.40 < 0.5",
+        )
+        fake_result = ExtractionResult(
+            status=ExtractionStatus.EXTRACTION_UNRELIABLE,
+            text="g@rbl3d 0cr 0utput th@t f@1led the qu@l1ty g@te",
+            page_count=3,
+            char_count=48,
+            source_format="pdf",
+            method="tesseract",
+            quality=fake_quality,
+            error="OCR fallback also failed the quality gate",
+        )
+        monkeypatch.setattr(verifier_module, "extract_pdf_bytes", lambda data: fake_result)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"%PDF-fake", headers={"content-type": "application/pdf"}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/scanned2.pdf",
+            ABSENT_QUOTE,
+            client=client,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+        assert "pdf_extraction_unreliable" in result.detail
+
+
+class TestPdfPartialExtractionNeverAbsent:
+    """S1: a PDF whose text layer decoded for some pages but not others (a
+    real cover/TOC page followed by scanned-image or otherwise-undecoded
+    body pages) must never read as ABSENT, even though its front matter
+    alone can be long enough to clear a plain min-text-length backstop.
+    Uses real PDFs built via `pypdf` (`tests/extraction/pdf_fixtures`) run
+    through the actual `uncorrupt.extraction.pdf` quality gate, not a
+    monkeypatched stub -- this is the end-to-end proof that routing through
+    the shared extraction layer resolves the defect."""
+
+    def test_pdf_with_real_front_matter_but_failed_body_pages_is_not_absent(self):
+        """GIVEN a real PDF whose page 1 has a substantial real text layer
+        (well over 200 characters even after normalisation -- enough to
+        clear a plain min-text-length backstop on its own) and whose
+        remaining 6 pages have no text layer at all (simulating scanned-image
+        body pages) WHEN verified for a quote that would only be in the
+        unscanned body THEN the status is not ABSENT. In this CI environment
+        (no OCR extras installed, matching `.github/workflows/ci.yml`) the
+        text layer fails the extraction layer's quality gate and no OCR
+        backend is available to attempt recovery, so the status is
+        UNFETCHABLE -- the tool could not obtain any text to check at all."""
+        front_matter = (
+            "Annual Report and Accounts 2013-14. This document sets out the governance "
+            "arrangements, the financial statements, and the remuneration disclosures for "
+            "the department during the reporting period under review by the audit "
+            "committee and external auditors this year."
+        )
+        pdf_bytes = _merge_pdfs(build_text_pdf([front_matter]), build_blank_pdf(6))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=pdf_bytes, headers={"content-type": "application/pdf"}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/report.pdf",
+            "The minister confirmed the contract was awarded following a fair process.",
+            client=client,
+        )
+
+        assert result.status == CitationStatus.UNFETCHABLE
+
+    def test_fully_extracted_multi_page_pdf_with_genuinely_absent_quote_is_still_absent(self):
+        """GIVEN a real, multi-page PDF whose text layer is genuinely
+        complete and passes the extraction layer's quality gate on every
+        page WHEN verified for a quote that is genuinely absent from it THEN
+        the status is still ABSENT -- the negative control proving S1's fix
+        (routing PDF reliability through the shared extraction layer) does
+        not swallow the defect-detection this tool exists for on a document
+        that really was fully read."""
+        pages_text = [
+            (
+                "This is a substantial page of real prose content about departmental "
+                "governance and financial oversight during the reporting period under "
+                "review by officials."
+            )
+            * 2,
+            (
+                "This is a second substantial page of real prose content describing "
+                "procurement processes and contract award decisions made during the "
+                "year in question here."
+            )
+            * 2,
+            (
+                "This is a third substantial page of real prose content covering audit "
+                "findings and recommendations for improved financial controls going "
+                "forward into next year."
+            )
+            * 2,
+        ]
+        pdf_bytes = build_text_pdf(pages_text)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=pdf_bytes, headers={"content-type": "application/pdf"}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/full-report.pdf",
+            "The minister resigned after admitting he had lied to Parliament about the "
+            "contract entirely.",
+            client=client,
+        )
+
+        assert result.status == CitationStatus.ABSENT
 
 
 class TestCaching:
@@ -586,58 +784,59 @@ class TestExtractionUnreliable:
 
 
 class TestScanTruncation:
-    """C5: the fuzzy-match scan is bounded by `_MAX_SENTENCES_CONSIDERED` so
-    one huge document cannot make verification pathologically slow -- but a
-    scan that stops early must never be read as proof the quote is absent
+    """C5: the fuzzy-match scan is bounded by `_MAX_CHARS_CONSIDERED`
+    characters, not a sentence count -- a sentence-count cap made ABSENT
+    unreachable above a fixed page count regardless of how many characters
+    that represented, which is exactly the size of this project's primary
+    sources (Hansard volumes, inquiry reports, NAO reports with appendices).
+    A scan that stops early must never be read as proof the quote is absent
     from the part of the document it never reached."""
 
-    def test_quote_beyond_the_scan_window_is_not_absent_and_reports_truncation(self, monkeypatch):
-        """GIVEN the sentence-scan window is capped at 5 sentences and the real
-        quote (differing only in case) sits at sentence index 8, beyond the cap
-        WHEN verified THEN the status is EXTRACTION_UNRELIABLE, never ABSENT,
-        and `result.truncated` is True -- a scan that never reached the quote
-        cannot prove it is missing."""
+    def test_quote_just_past_the_scan_boundary_is_not_absent_and_reports_truncation(
+        self, monkeypatch
+    ):
+        """GIVEN the character-scan bound is capped at 200 characters and the
+        real quote (differing only in case) sits just past that boundary --
+        not many multiples beyond it -- WHEN verified THEN the status is
+        EXTRACTION_UNRELIABLE, never ABSENT, and `result.truncated` is True.
+        Placing the quote close to the boundary, rather than deep inside the
+        truncated region, is the sharper test: it catches an off-by-a-large-
+        margin truncation check that a deep-inside placement would miss."""
         import uncorrupt.research.citation_verifier as verifier_module
 
-        monkeypatch.setattr(verifier_module, "_MAX_SENTENCES_CONSIDERED", 5)
+        monkeypatch.setattr(verifier_module, "_MAX_CHARS_CONSIDERED", 200)
 
-        sentences = [
-            f"Filler sentence number {i} about routine committee business." for i in range(10)
-        ]
         real_quote = "The minister confirmed the contract was awarded without competitive tender."
-        sentences[8] = real_quote
-        doc = " ".join(sentences)
+        filler = "x" * 210  # pushes real_quote's start to just past the 200-char boundary
+        doc = filler + " " + real_quote
         claimed_quote = real_quote.upper()  # differs only in case -- not an exact VERBATIM match
 
         result = verify_citation(
-            "https://example.test/long-report",
+            "https://example.test/near-boundary",
             claimed_quote,
             fetched_text=doc,
         )
 
         assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
-        assert result.status != CitationStatus.ABSENT
         assert result.truncated is True
 
-    def test_near_match_found_inside_the_window_still_reports_truncated_true(self, monkeypatch):
-        """GIVEN the sentence-scan window is capped at 5 sentences and a
-        paraphrase-quality match sits inside that window (sentence index 2)
-        WHEN verified THEN the status is NEAR as normal, but `result.truncated`
-        is still True -- the document had more sentences than were scanned, so
-        callers should know a better match could exist further in even though
-        one was already found."""
+    def test_near_match_found_inside_the_boundary_still_reports_truncated_true(self, monkeypatch):
+        """GIVEN the character-scan bound is capped at 200 and a
+        paraphrase-quality match sits well inside that window WHEN verified
+        THEN the status is NEAR as normal, but `result.truncated` is still
+        True -- the document had more characters than were scanned, so
+        callers should know a better match could exist further in even
+        though one was already found."""
         import uncorrupt.research.citation_verifier as verifier_module
 
-        monkeypatch.setattr(verifier_module, "_MAX_SENTENCES_CONSIDERED", 5)
+        monkeypatch.setattr(verifier_module, "_MAX_CHARS_CONSIDERED", 200)
 
-        sentences = [
-            f"Filler sentence number {i} about routine committee business." for i in range(10)
-        ]
-        sentences[2] = VERBATIM_QUOTE
-        doc = " ".join(sentences)
+        doc = (
+            VERBATIM_QUOTE + " " + ("y" * 250)
+        )  # quote well within 200 chars; doc exceeds it overall
 
         result = verify_citation(
-            "https://example.test/long-report-2",
+            "https://example.test/near-boundary-2",
             PARAPHRASE_QUOTE,
             fetched_text=doc,
         )
@@ -647,10 +846,11 @@ class TestScanTruncation:
 
     def test_genuine_absence_in_a_long_document_under_the_scan_cap_is_still_absent(self):
         """GIVEN a document with many more sentences than a short paragraph, but
-        fewer than the default scan cap, and a quote genuinely absent from it
-        WHEN verified THEN the status is still ABSENT and `result.truncated` is
-        False -- the truncation fix must not swallow the defect-detection this
-        tool exists for when the scan wasn't actually truncated."""
+        fewer characters than the default scan cap, and a quote genuinely
+        absent from it WHEN verified THEN the status is still ABSENT and
+        `result.truncated` is False -- the truncation fix must not swallow
+        the defect-detection this tool exists for when the scan wasn't
+        actually truncated."""
         sentences = [
             f"The committee reviewed procurement record number {i} for the year in detail."
             for i in range(60)
@@ -667,21 +867,61 @@ class TestScanTruncation:
         assert result.truncated is False
 
 
-class TestUnpunctuatedRegionMatching:
-    """C6: a punctuation-free run (a table, a list, a heading block) never
-    hits a `[.!?]` sentence boundary, so it collapses into one giant
-    "sentence" candidate whose SequenceMatcher ratio against a short quote
-    collapses toward zero regardless of content -- the ratio is bounded by
-    combined length. A sliding quote-length window must still find a
-    near-identical row inside it."""
+class TestWholeTextSlidingWindowMatching:
+    """C6: gating candidate generation on segment *shape* (an unpunctuated
+    run judged "long enough" to be a table) rather than running the sliding
+    window against the raw text was itself the bug -- it was non-monotone (a
+    SMALL table scored worse, and could fall to ABSENT, while a large one
+    scored fine) and it never fired at all for a quote spanning many
+    sentences (a block quote), since no single sentence-split segment was
+    ever long enough to trigger it. `_best_fuzzy_match` now always slides a
+    quote-length window across the whole text regardless of punctuation or
+    sentence structure, which fixes both."""
 
-    def test_quote_in_unpunctuated_table_region_is_found_as_near_not_absent(self):
-        """GIVEN a document containing an unpunctuated table of ~400 rows (no
-        `[.!?]` anywhere in the block, so it is one giant sentence) and a
-        claimed quote that reproduces one row with a single-character
-        difference WHEN verified THEN the status is NEAR with high similarity,
-        never ABSENT -- the sliding-window fallback finds the near-identical
-        row instead of scoring the whole table as one candidate."""
+    def test_quote_in_a_small_unpunctuated_table_region_is_found_as_near_not_absent(self):
+        """GIVEN a document containing an unpunctuated table of only 3 rows
+        (no `[.!?]` anywhere in the block) and a claimed quote that
+        reproduces the last row with a single-character difference WHEN
+        verified THEN the status is NEAR with high similarity, never ABSENT.
+        A small table is the common real shape (a short HTML `<table>` or
+        `<ul>` rendered by `get_text(separator=" ")`) -- the earlier,
+        segment-length-gated version of this fix classified this exact case
+        as ABSENT (confirmed: similarity 0.435) even though the 400-row
+        version passed, which is the non-monotone defect this test exists to
+        catch: a smaller table must not be MORE likely to read as
+        fabricated than a larger one."""
+        rows = [
+            f"Company{i} LTD | Officer{i} Smith | Appointed {2000 + i % 20}-01-01 "
+            f"| Status Active | Ref {i:05d}"
+            for i in range(3)
+        ]
+        table_block = " ".join(rows)
+        doc = (
+            "Normal prose sentence one. Normal prose sentence two. "
+            + table_block
+            + " Normal prose sentence three."
+        )
+        # "Ltd" vs the table's "LTD" -- not an exact substring of the table row.
+        claimed_quote = (
+            "Company2 Ltd | Officer2 Smith | Appointed 2002-01-01 | Status Active | Ref 00002"
+        )
+
+        result = verify_citation(
+            "https://example.test/small-officer-register-table",
+            claimed_quote,
+            fetched_text=doc,
+        )
+
+        assert result.status == CitationStatus.NEAR
+        assert result.similarity is not None
+        assert result.similarity > 0.9
+
+    def test_quote_in_a_large_unpunctuated_table_region_is_found_as_near_not_absent(self):
+        """GIVEN a document containing an unpunctuated table of ~400 rows and
+        a claimed quote that reproduces one row with a single-character
+        difference WHEN verified THEN the status is NEAR with high
+        similarity, never ABSENT -- a large table must keep working, not
+        just the boundary case above."""
         rows = [
             f"Company{i} LTD | Officer{i} Smith | Appointed {2000 + i % 20}-01-01 "
             f"| Status Active | Ref {i:05d}"
@@ -694,73 +934,59 @@ class TestUnpunctuatedRegionMatching:
             + " Normal prose sentence three."
         )
         claimed_quote = (
-            "Company217 Ltd | Officer217 Smith | Appointed 2017-01-01 "
-            "| Status Active | Ref 00217"
-        )  # "Ltd" vs the table's "LTD" -- not an exact substring of the table row
+            "Company217 Ltd | Officer217 Smith | Appointed 2017-01-01 | Status Active | Ref 00217"
+        )
 
         result = verify_citation(
-            "https://example.test/officer-register-table",
+            "https://example.test/large-officer-register-table",
             claimed_quote,
             fetched_text=doc,
         )
 
         assert result.status == CitationStatus.NEAR
-        assert result.status != CitationStatus.ABSENT
         assert result.similarity is not None
         assert result.similarity > 0.9
 
-
-class TestPartialPdfExtraction:
-    """S1: a PDF whose text layer decoded for some pages (e.g. a cover page or
-    table of contents) but not others (scanned-image body pages) can clear the
-    plain min-text-length backstop on total length alone, and PDFs have no
-    `raw_markup` for the text-to-markup ratio signal to apply either. Per
-    ADR-008, a failed text layer must never read as quote-absent."""
-
-    def test_pdf_with_real_front_matter_but_failed_body_pages_is_extraction_unreliable(
-        self, monkeypatch
-    ):
-        """GIVEN a PDF whose extracted text has >200 normalised characters of
-        real front-matter text on page 1, followed by several pages whose text
-        layer produced nothing (simulating scanned-image body pages) WHEN
-        verified for a quote that would only be on one of the failed pages THEN
-        the status is EXTRACTION_UNRELIABLE, never ABSENT -- the per-page
-        signal catches what the plain length backstop misses."""
-        import uncorrupt.research.citation_verifier as verifier_module
-
-        monkeypatch.setattr(verifier_module.shutil, "which", lambda _name: "/usr/bin/pdftotext")
-
-        # >200 characters even after whitespace normalisation, so the plain
-        # EXTRACTION_UNRELIABLE_MIN_TEXT_LENGTH backstop alone would not fire.
-        front_matter = (
-            "Annual Report and Accounts 2013-14. This document sets out the governance "
-            "arrangements, the financial statements, and the remuneration disclosures for "
-            "the department during the reporting period under review by the audit "
-            "committee and external auditors this year."
+    def test_quote_spanning_eight_sentences_is_found_as_near_not_absent(self):
+        """GIVEN a claimed quote reproducing 8 consecutive sentences of a
+        block quote from the source, differing by one word, WHEN verified
+        THEN the status is NEAR, never ABSENT. The sentence-window candidate
+        generator caps at 3-sentence runs, so a longer block quote (exactly
+        the shape a `label_source_quote` takes when it reproduces a
+        committee report's block quote) relies entirely on the whole-text
+        sliding window, not sentence segmentation, to be found."""
+        block_sentences = [
+            "The committee found that the minister failed to disclose the conflict of "
+            "interest in a timely manner.",
+            "This failure persisted over several months despite repeated internal "
+            "warnings from officials.",
+            "The report concludes that existing governance arrangements were inadequate "
+            "to prevent the breach.",
+            "Recommendations include stronger declaration requirements and independent "
+            "oversight of ministerial conduct.",
+            "The committee further notes that similar issues have arisen in previous "
+            "inquiries into departmental conduct.",
+            "Officials were unable to explain why escalation procedures were not "
+            "followed at the time.",
+            "The department has since introduced new training for staff involved in "
+            "procurement decisions.",
+            "No further disciplinary action is recommended given the remedial steps "
+            "already taken by the department.",
+        ]
+        prose = " ".join(block_sentences)
+        doc = (
+            "Introductory sentence about the inquiry context. "
+            + prose
+            + " Concluding sentence about next steps."
         )
-        raw_pdf_text = "\x0c".join([front_matter, "", "", "", "", "", ""])
-
-        class FakeCompletedProcess:
-            returncode = 0
-            stdout = raw_pdf_text.encode("utf-8")
-
-        monkeypatch.setattr(
-            verifier_module.subprocess, "run", lambda *a, **k: FakeCompletedProcess()
-        )
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200, content=b"%PDF-fake-bytes", headers={"content-type": "application/pdf"}
-            )
-
-        client = httpx.Client(transport=httpx.MockTransport(handler))
+        claimed_quote = " ".join(block_sentences).replace("minister", "minster", 1)
 
         result = verify_citation(
-            "https://example.test/report.pdf",
-            "The minister confirmed the contract was awarded following a fair process.",
-            client=client,
+            "https://example.test/committee-report-block-quote",
+            claimed_quote,
+            fetched_text=doc,
         )
 
-        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
-        assert result.status != CitationStatus.ABSENT
-        assert "partial" in (result.detail or "")
+        assert result.status == CitationStatus.NEAR
+        assert result.similarity is not None
+        assert result.similarity > 0.7

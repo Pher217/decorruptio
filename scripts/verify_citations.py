@@ -115,6 +115,7 @@ def verify_manifest(
                     "similarity": result.similarity,
                     "best_match": result.best_match,
                     "detail": result.detail,
+                    "truncated": result.truncated,
                 }
             )
     finally:
@@ -136,6 +137,8 @@ def _print_report(reports: list[dict[str, Any]]) -> Counter:
             line += f" (similarity={similarity:.2f})" if similarity is not None else ""
         if r["status"] in ("UNFETCHABLE", "EXTRACTION_UNRELIABLE", "SKIPPED"):
             line += f" -- {r.get('detail')}"
+        if r.get("truncated"):
+            line += " [TRUNCATED SCAN]"
         print(line)
     print()
     print("Summary:", dict(counts))

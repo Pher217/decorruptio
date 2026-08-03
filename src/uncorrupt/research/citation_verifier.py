@@ -37,13 +37,14 @@ Five outcomes, deliberately not collapsed into pass/fail:
                       page) but the extracted content is not plausibly the
                       document's substance: a JavaScript-rendered results
                       page whose real content never appears in the static
-                      HTML, a scanned/image-only PDF with no real text layer,
-                      a PDF whose text layer decoded for some pages (e.g. a
-                      cover page) but not others, or any other extraction
-                      failure wearing the costume of evidence. Also covers a
+                      HTML, a scanned/image-only PDF, or a PDF whose text
+                      layer decoded for some pages but not others (see
+                      `uncorrupt.extraction.pdf.extract_pdf_bytes`, which
+                      does the actual PDF quality-vs-OCR decision for this
+                      module -- see "PDF extraction" below). Also covers a
                       fuzzy-match scan that was truncated by
-                      `_MAX_SENTENCES_CONSIDERED` before it could reach a
-                      candidate match -- a scan that stopped early cannot
+                      `_MAX_CHARS_CONSIDERED` before it could cover the
+                      whole document -- a scan that stopped early cannot
                       prove a quote's absence either. Same principle as
                       ADR-008's document case ("an image-only PDF or failed
                       text layer must become EXTRACTION_UNRELIABLE, not
@@ -58,12 +59,43 @@ Five outcomes, deliberately not collapsed into pass/fail:
                       in a properly-extracted, fully-scanned document still
                       reports ABSENT.
   * UNFETCHABLE   -- the document could not be retrieved as real content:
-                      blocked domain, HTTP error, network failure, a PDF with
-                      no `pdftotext` available, or a Cloudflare/JS challenge
-                      page served with a 200. This is explicitly NOT the same
-                      as ABSENT -- a quote is not "missing" just because the
-                      fetcher was blocked, and conflating the two would erase
-                      the exact distinction this tool exists to preserve.
+                      blocked domain, HTTP error, network failure, a PDF that
+                      could not be parsed or whose text layer failed the
+                      quality gate with no OCR backend available, or a
+                      Cloudflare/JS challenge page served with a 200. This is
+                      explicitly NOT the same as ABSENT -- a quote is not
+                      "missing" just because the fetcher was blocked, and
+                      conflating the two would erase the exact distinction
+                      this tool exists to preserve.
+
+PDF extraction: delegated entirely to `uncorrupt.extraction.pdf.extract_pdf_bytes`
+(pypdf text layer, OCR quality-gated fallback -- see that module and
+`uncorrupt.extraction.quality`) rather than a second, bespoke PDF-reliability
+heuristic maintained in parallel here. An earlier version of this module
+shelled out to `pdftotext` and judged partial extraction from raw per-page
+form-feed counts; that duplicated (and, on inspection, disagreed with) the
+extraction layer's own measured chars-per-page/alnum-ratio/word-shape-ratio
+gate, so it was removed in favour of the one canonical decision.
+
+Known limitations, not fixed by this module:
+
+  * Two-column PDF layouts. `pypdf`'s reading order can interleave the two
+    columns' text on one logical line, so a quote's characters are present
+    and in the right order but padded by the neighbouring column's text --
+    this can still read as ABSENT even though the quote is genuinely in the
+    document. No column-detection or layout-aware extraction is attempted
+    here; a false ABSENT from a two-column source should be spot-checked by
+    hand before being treated as a confirmed defect.
+  * Fabricated values inside an otherwise-real table row. The sliding-window
+    fallback that finds a near-identical row for a genuine table quote (see
+    `_sliding_char_windows`) will also find a high-similarity match for a
+    quote that reproduces a real row's *shape* with a fabricated *value* --
+    e.g. a real company/date/amount row with one figure changed reads as
+    NEAR, not ABSENT, because the surrounding characters still match. Fuzzy
+    matching on tabular data cannot distinguish "this exact row exists" from
+    "a row shaped like this exists" -- a human must still read `best_match`
+    against `claimed_quote` for table-sourced NEAR results, the same as any
+    other NEAR result.
 
 Keep EXTRACTION_UNRELIABLE and UNFETCHABLE straight: UNFETCHABLE means the
 request itself did not succeed (or was never attempted, e.g. a known-blocked
@@ -93,9 +125,6 @@ import hashlib
 import json
 import logging
 import re
-import shutil
-import subprocess
-import tempfile
 import time
 import unicodedata
 from collections.abc import Callable
@@ -107,6 +136,9 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+from uncorrupt.extraction.pdf import extract_pdf_bytes
+from uncorrupt.extraction.types import ExtractionStatus
 
 logger = logging.getLogger(__name__)
 
@@ -244,40 +276,21 @@ _DASH_CHARS: dict[str, str] = {
 _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
-# Bound on how much of a document is fuzzy-matched against, so one huge
-# article/PDF cannot make verification pathologically slow. Benchmarked
-# against a real ~150-page government annual report (1,956 sentences,
-# ~420KB of extracted text): a full unbounded scan took ~0.6s, so this cap
-# is generous headroom for a single real source document (NAO/PAC/inquiry
-# PDFs routinely run to a few thousand sentences), not a practical ceiling.
-# Exceeding it is still safe: `verify_citation` never returns ABSENT when
-# the scan was truncated (see `truncated` on `CitationVerification`) --
-# it reports EXTRACTION_UNRELIABLE instead, because a scan that stopped
-# early cannot prove a quote's absence.
-_MAX_SENTENCES_CONSIDERED = 4000
-
-# A sentence-split segment longer than this (and longer than twice the
-# quote) is almost certainly not real prose -- it is an unpunctuated
-# table/list/heading block that the `[.!?]`-based splitter never broke up.
-# difflib.SequenceMatcher.ratio() against a short quote collapses toward
-# zero on a giant blob regardless of whether the quote is inside it,
-# because the ratio is bounded by combined length -- see
-# `_sliding_char_windows` for the fallback this triggers.
-_UNPUNCTUATED_BLOCK_MIN_LENGTH = 300
-
-# `pdftotext` inserts a form-feed between pages. A PDF is treated as a
-# partial extraction (real text on some pages, nothing plausible on most
-# others -- a text-layer failure on the body while front matter/cover
-# pages came through fine) only once it has at least this many pages --
-# a single- or two-page PDF has no meaningful "distribution" to judge.
-_PDF_PARTIAL_EXTRACTION_MIN_TOTAL_PAGES = 3
-# A page with fewer non-whitespace characters than this is counted as
-# "empty" for the partial-extraction signal (a genuinely blank page, or
-# one whose text layer never decoded).
-_PDF_PAGE_MIN_CHARS = 40
-# If at least this fraction of pages are "empty" (and at least one page is
-# not), the extraction is partial rather than the document being short.
-_PDF_PARTIAL_EXTRACTION_MIN_EMPTY_PAGE_FRACTION = 0.5
+# Bound on how many characters of a document are fuzzy-matched against, so
+# one huge document cannot make verification pathologically slow. A
+# character bound, not a sentence-count bound: a sentence-count cap made
+# ABSENT unreachable above a fixed page count regardless of how many
+# characters that represented (measured: ~150-200 pages), which is exactly
+# the size of Hansard volumes, inquiry reports and NAO reports with
+# appendices -- this project's primary sources. Measured on real ~400-1100KB
+# government documents: a full scan (sentence-window candidates plus the
+# whole-text sliding window in `_best_fuzzy_match`) costs roughly 2-7s, so
+# this bound is headroom for a single large real source, not a practical
+# ceiling reached by ordinary documents. Exceeding it is still safe:
+# `verify_citation` never returns ABSENT when the scan was truncated (see
+# `truncated` on `CitationVerification`) -- it reports EXTRACTION_UNRELIABLE
+# instead, because a scan that stopped early cannot prove a quote's absence.
+_MAX_CHARS_CONSIDERED = 2_000_000
 
 
 class CitationStatus(StrEnum):
@@ -295,8 +308,8 @@ class CitationVerification:
     """Result of checking one (url, claimed_quote) pair.
 
     `truncated` is True when the fuzzy-match scan only covered the first
-    `_MAX_SENTENCES_CONSIDERED` sentences of a longer document -- see
-    `_split_sentence_windows`. It is never True together with ABSENT: a
+    `_MAX_CHARS_CONSIDERED` characters of a longer document -- see
+    `_best_fuzzy_match`. It is never True together with ABSENT: a
     truncated scan that found no match reports EXTRACTION_UNRELIABLE
     instead, since it cannot prove the quote is absent from the part of
     the document it never saw.
@@ -323,12 +336,11 @@ class _FetchOutcome:
     the extracted-text-length backstop covers image-only PDFs instead) and
     for plain text.
 
-    `partial_extraction_reason` is set only for PDFs whose per-page text
-    distribution shows a partial extraction (see
-    `_pdf_partial_extraction_reason`) -- e.g. a real cover/TOC page
-    followed by pages whose text layer never decoded, which would
-    otherwise clear the plain min-text-length backstop on total length
-    alone.
+    `pdf_unreliable_reason` is set only when a PDF's text came back through
+    `uncorrupt.extraction.pdf.extract_pdf_bytes` with
+    `ExtractionStatus.EXTRACTION_UNRELIABLE` (text layer AND OCR both failed
+    the quality gate) -- the extraction layer's own verdict, not a second
+    heuristic computed here.
     """
 
     ok: bool
@@ -337,7 +349,7 @@ class _FetchOutcome:
     status_code: int | None = None
     reason: str | None = None
     raw_markup: str | None = None
-    partial_extraction_reason: str | None = None
+    pdf_unreliable_reason: str | None = None
 
 
 def _normalize(text: str) -> str:
@@ -376,49 +388,49 @@ def _extract_html_text(html: str) -> str:
     return soup.get_text(separator=" ")
 
 
-def _extract_pdf_text(raw_bytes: bytes) -> str | None:
-    """Shell out to `pdftotext`. Returns None if the binary is not installed."""
-    if shutil.which("pdftotext") is None:
-        return None
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-        tmp.write(raw_bytes)
-        tmp.flush()
-        try:
-            result = subprocess.run(
-                ["pdftotext", "-layout", tmp.name, "-"],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.decode("utf-8", errors="replace")
+def _extract_pdf_outcome(raw_bytes: bytes, status_code: int) -> _FetchOutcome:
+    """Extract PDF text via the shared `uncorrupt.extraction.pdf` layer
+    (pypdf text layer, OCR quality-gated fallback) rather than a second,
+    bespoke PDF-reliability heuristic maintained in parallel here -- see the
+    "PDF extraction" section of the module docstring.
 
-
-def _pdf_partial_extraction_reason(raw_pdf_text: str) -> str | None:
-    """Detect a PDF whose text layer extracted for some pages but not
-    others -- e.g. a real cover/TOC page followed by scanned-image or
-    otherwise-undecoded body pages. Per ADR-008, a failed text layer must
-    never read as quote-absent; the plain min-text-length backstop only
-    catches near-EMPTY extractions, so a substantial front-matter page can
-    mask a body that never came through at all. `pdftotext` inserts a
-    form-feed (`\\x0c`) between pages, which survives here because this is
-    called before whitespace normalisation collapses it.
+    BACKEND_UNAVAILABLE (no pypdf, or the text layer failed the quality gate
+    and no OCR backend is available) and FAILED (the bytes could not be
+    parsed as a PDF at all, e.g. a challenge page mislabelled as one) both
+    map to `ok=False` -- the tool could not obtain any text to check at all,
+    which is the UNFETCHABLE case, not "checked and unreliable". TEXT_LAYER
+    and OCR (`result.is_reliable`) map straight through. EXTRACTION_UNRELIABLE
+    (text layer AND OCR both failed the quality gate) still returns the
+    (unreliable) text with `ok=True` plus `pdf_unreliable_reason` set -- the
+    same "only ever escalates what would otherwise be ABSENT" contract as
+    every other EXTRACTION_UNRELIABLE signal in this module, so a quote that
+    genuinely is verbatim/near in that text still classifies correctly.
     """
-    pages = raw_pdf_text.split("\x0c")
-    if len(pages) > 1 and not pages[-1].strip():
-        pages = pages[:-1]  # trailing page break, not a real extra page
-    if len(pages) < _PDF_PARTIAL_EXTRACTION_MIN_TOTAL_PAGES:
-        return None
-    empty_pages = sum(1 for p in pages if len(p.strip()) < _PDF_PAGE_MIN_CHARS)
-    non_empty_pages = len(pages) - empty_pages
-    if non_empty_pages == 0:
-        return None  # nothing extracted at all -- the plain length backstop covers this
-    if empty_pages / len(pages) >= _PDF_PARTIAL_EXTRACTION_MIN_EMPTY_PAGE_FRACTION:
-        return f"pdf_partial_extraction:{non_empty_pages}_of_{len(pages)}_pages_have_text"
-    return None
+    result = extract_pdf_bytes(raw_bytes)
+
+    if result.status in (ExtractionStatus.BACKEND_UNAVAILABLE, ExtractionStatus.FAILED):
+        return _FetchOutcome(
+            ok=False,
+            status_code=status_code,
+            reason=f"pdf_extraction_{result.status.value}:{result.error}",
+        )
+
+    text = result.text
+    if _looks_like_challenge_page(text, text):
+        return _FetchOutcome(ok=False, status_code=status_code, reason="challenge_page_detected")
+
+    pdf_unreliable_reason = None
+    if result.status == ExtractionStatus.EXTRACTION_UNRELIABLE:
+        quality_reason = result.quality.reason if result.quality else result.error
+        pdf_unreliable_reason = f"pdf_extraction_unreliable:{quality_reason}"
+
+    return _FetchOutcome(
+        ok=True,
+        text=text,
+        content_type="application/pdf",
+        status_code=status_code,
+        pdf_unreliable_reason=pdf_unreliable_reason,
+    )
 
 
 def _extract_outcome(
@@ -428,24 +440,7 @@ def _extract_outcome(
     is_pdf = "application/pdf" in content_type_lower or url.lower().split("?")[0].endswith(".pdf")
 
     if is_pdf:
-        text = _extract_pdf_text(raw_bytes)
-        if text is None:
-            return _FetchOutcome(
-                ok=False,
-                status_code=status_code,
-                reason="pdftotext_not_available: install poppler (pdftotext) to verify PDF sources",
-            )
-        if _looks_like_challenge_page(text, text):
-            return _FetchOutcome(
-                ok=False, status_code=status_code, reason="challenge_page_detected"
-            )
-        return _FetchOutcome(
-            ok=True,
-            text=text,
-            content_type="application/pdf",
-            status_code=status_code,
-            partial_extraction_reason=_pdf_partial_extraction_reason(text),
-        )
+        return _extract_pdf_outcome(raw_bytes, status_code)
 
     try:
         decoded = raw_bytes.decode("utf-8")
@@ -578,50 +573,43 @@ def _fetch_url(
     return _extract_outcome(raw_bytes, content_type, url, response.status_code)
 
 
-def _split_sentence_windows(
-    text: str, max_sentences: int | None = None
-) -> tuple[list[str], list[str], bool]:
+def _split_sentence_windows(text: str) -> list[str]:
     """Sentence-and-short-run candidates for fuzzy matching against a quote.
 
     Windows of 1, 2 and 3 consecutive sentences so a quote spanning a
-    sentence boundary can still be matched, without doing a full quadratic
-    scan of the whole document.
+    sentence boundary can still be matched, and so the winning candidate is
+    usually a clean, human-readable sentence for `result.best_match` rather
+    than an arbitrary character offset.
 
-    Returns `(windowed_candidates, raw_sentences, truncated)`. `raw_sentences`
-    is the underlying (possibly capped) sentence list, exposed so callers
-    can layer additional matching strategies on it (see the unpunctuated-
-    block fallback in `_best_fuzzy_match`) without re-splitting the text.
-    `truncated` is True when the document had more sentences than
-    `max_sentences` and only the first `max_sentences` were considered --
-    `verify_citation` must never classify a truncated scan's non-match as
-    ABSENT (see module docstring / `_MAX_SENTENCES_CONSIDERED`).
-
-    `max_sentences` defaults via a `None` sentinel (rather than binding
-    `_MAX_SENTENCES_CONSIDERED` at function-definition time) so tests can
-    monkeypatch the module constant and have it take effect.
+    This is ADDITIONAL to, never a substitute for, the whole-text sliding
+    window in `_best_fuzzy_match`: gating candidate generation on sentence
+    *shape* alone silently defeats matching in two real shapes this project's
+    sources take -- an unpunctuated table/list/heading run that never hits a
+    `[.!?]` (one giant "sentence" whose SequenceMatcher ratio against a short
+    quote collapses toward zero regardless of content), and a block quote
+    spanning more than 3 sentences (beyond this function's window). Both were
+    confirmed to produce false ABSENT verdicts before the sliding window was
+    added as the primary defence and this function became a secondary,
+    readability-oriented source of candidates.
     """
-    if max_sentences is None:
-        max_sentences = _MAX_SENTENCES_CONSIDERED
-    all_sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
-    truncated = len(all_sentences) > max_sentences
-    sentences = all_sentences[:max_sentences]
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
     candidates: list[str] = []
     for window in (1, 2, 3):
         for i in range(max(len(sentences) - window + 1, 0)):
             candidates.append(" ".join(sentences[i : i + window]))
-    return candidates, sentences, truncated
+    return candidates
 
 
 def _sliding_char_windows(text: str, window_len: int, step: int) -> list[str]:
     """Quote-length substrings of `text`, stepped by `step` characters.
 
-    Fallback for unpunctuated regions (a table, a list, a heading block)
-    where the sentence splitter never finds a `[.!?]` and the whole region
-    collapses into one giant "sentence" candidate -- SequenceMatcher.ratio()
-    on a short quote against that giant blob collapses toward zero
-    regardless of whether the quote is actually in there, since the ratio
-    is bounded by combined length. Sliding a quote-sized window across the
-    block gives the matcher same-scale candidates to compare against.
+    Runs against the WHOLE text, not any particular segment -- earlier this
+    only fired on segments judged to "look like" an unpunctuated block by
+    length, which was non-monotone (a small table could score worse than a
+    huge one) and missed block quotes spanning many sentences entirely.
+    Matching against the raw text directly, regardless of its punctuation or
+    sentence shape, is what the shape-based gate was trying to approximate
+    and failed to.
     """
     if window_len <= 0 or not text:
         return []
@@ -630,33 +618,66 @@ def _sliding_char_windows(text: str, window_len: int, step: int) -> list[str]:
     return [text[i : i + window_len] for i in range(0, len(text) - window_len + 1, step)]
 
 
-def _best_fuzzy_match(
-    normalized_quote: str, normalized_text: str
-) -> tuple[str | None, float, bool]:
-    """Return the best-matching candidate, its similarity ratio, and whether
-    the underlying sentence scan was truncated (see `_split_sentence_windows`).
-    """
-    if not normalized_quote or not normalized_text:
-        return None, 0.0, False
-    quote_cf = normalized_quote.casefold()
-    quote_len = len(normalized_quote)
-
-    windowed_candidates, raw_sentences, truncated = _split_sentence_windows(normalized_text)
-    candidates = list(windowed_candidates)
-    unpunctuated_block_threshold = max(_UNPUNCTUATED_BLOCK_MIN_LENGTH, quote_len * 2)
-    for sentence in raw_sentences:
-        if len(sentence) > unpunctuated_block_threshold:
-            step = max(quote_len // 2, 1)
-            candidates.extend(_sliding_char_windows(sentence, quote_len, step))
-
-    best_sentence: str | None = None
+def _best_of(quote_cf: str, candidates: list[str]) -> tuple[str | None, float]:
+    """The candidate with the highest SequenceMatcher ratio against `quote_cf`."""
+    best_candidate: str | None = None
     best_score = 0.0
     for candidate in candidates:
         score = difflib.SequenceMatcher(None, quote_cf, candidate.casefold()).ratio()
         if score > best_score:
             best_score = score
-            best_sentence = candidate
-    return best_sentence, best_score, truncated
+            best_candidate = candidate
+    return best_candidate, best_score
+
+
+def _best_fuzzy_match(
+    normalized_quote: str, normalized_text: str, near_threshold: float
+) -> tuple[str | None, float, bool]:
+    """Return the best-matching candidate, its similarity ratio, and whether
+    the scan was truncated to `_MAX_CHARS_CONSIDERED` characters of the text.
+
+    Two independent candidate sources exist: sentence-window runs
+    (`_split_sentence_windows`, 1-3 sentences, giving a readable
+    `best_match` for ordinary prose) and a quote-length window slid across
+    the whole (possibly truncated) text at a quarter-quote-length step
+    (`_sliding_char_windows`) -- the latter is what actually defends against
+    false ABSENT on unpunctuated tables and multi-sentence block quotes,
+    since it does not depend on sentence segmentation succeeding at all.
+
+    The sentence-window candidates are tried FIRST and returned directly if
+    the best one already clears `near_threshold`: a short quote-length
+    substring frequently scores *higher* than a full matching sentence
+    purely because it is closer in length to the quote (SequenceMatcher's
+    ratio is sensitive to combined length), so pooling both sets and taking
+    the single best score would silently prefer an arbitrary character
+    offset over a coherent, human-readable sentence whenever they are
+    close. The whole-text sliding window is only computed -- and only wins
+    -- when sentence segmentation alone did not already prove a match, which
+    is exactly the unpunctuated-table / long-block-quote case it exists for.
+    This also means the more expensive whole-text scan is skipped entirely
+    for the common case of an ordinary prose match.
+    """
+    if not normalized_quote or not normalized_text:
+        return None, 0.0, False
+
+    truncated = len(normalized_text) > _MAX_CHARS_CONSIDERED
+    scan_text = normalized_text[:_MAX_CHARS_CONSIDERED] if truncated else normalized_text
+
+    quote_cf = normalized_quote.casefold()
+    quote_len = len(normalized_quote)
+
+    best_sentence, best_sentence_score = _best_of(quote_cf, _split_sentence_windows(scan_text))
+    if best_sentence_score >= near_threshold:
+        return best_sentence, best_sentence_score, truncated
+
+    step = max(quote_len // 4, 1)
+    best_sliding, best_sliding_score = _best_of(
+        quote_cf, _sliding_char_windows(scan_text, quote_len, step)
+    )
+
+    if best_sliding_score > best_sentence_score:
+        return best_sliding, best_sliding_score, truncated
+    return best_sentence, best_sentence_score, truncated
 
 
 def _extraction_is_unreliable(
@@ -665,7 +686,7 @@ def _extraction_is_unreliable(
     raw_markup: str | None,
     best_sentence: str | None,
     best_score: float,
-    partial_extraction_reason: str | None = None,
+    pdf_unreliable_reason: str | None = None,
 ) -> str | None:
     """Return a reason string if the extracted text is not plausibly the
     document's real substance, else None.
@@ -678,8 +699,8 @@ def _extraction_is_unreliable(
     that a false "unreliable" costs a human a look while a false "absent"
     impugns a real case.
     """
-    if partial_extraction_reason is not None:
-        return partial_extraction_reason
+    if pdf_unreliable_reason is not None:
+        return pdf_unreliable_reason
 
     text_length = len(normalized_text)
 
@@ -726,10 +747,11 @@ def verify_citation(
 
     Deterministic core, no LLM required: fetches `url` (or uses
     `fetched_text` directly, e.g. for a test or an already-scraped pass),
-    extracts text (HTML via BeautifulSoup; PDF via `pdftotext` if
-    installed), normalises whitespace/quote-style/dash-style on both sides,
-    and classifies the result as VERBATIM, NEAR, ABSENT, EXTRACTION_UNRELIABLE,
-    or UNFETCHABLE (see module docstring for the exact meaning of each).
+    extracts text (HTML via BeautifulSoup; PDF via
+    `uncorrupt.extraction.pdf.extract_pdf_bytes`), normalises whitespace/
+    quote-style/dash-style on both sides, and classifies the result as
+    VERBATIM, NEAR, ABSENT, EXTRACTION_UNRELIABLE, or UNFETCHABLE (see module
+    docstring for the exact meaning of each).
 
     EXTRACTION_UNRELIABLE is only ever considered in place of what would
     otherwise be ABSENT (see `_extraction_is_unreliable`) -- it can never
@@ -785,7 +807,9 @@ def verify_citation(
             fetched_content_length=len(fetched),
         )
 
-    best_sentence, best_score, scan_truncated = _best_fuzzy_match(normalized_quote, normalized_text)
+    best_sentence, best_score, scan_truncated = _best_fuzzy_match(
+        normalized_quote, normalized_text, near_threshold
+    )
 
     if best_score >= near_threshold:
         result = CitationVerification(
@@ -803,8 +827,8 @@ def verify_citation(
         return result
 
     if scan_truncated:
-        # The fuzzy scan only covered the first `_MAX_SENTENCES_CONSIDERED`
-        # sentences and found nothing there -- that is not proof the quote
+        # The fuzzy scan only covered the first `_MAX_CHARS_CONSIDERED`
+        # characters and found nothing there -- that is not proof the quote
         # is absent from the rest of the document, so this can never
         # classify as ABSENT.
         return CitationVerification(
@@ -813,7 +837,7 @@ def verify_citation(
             claimed_quote=claimed_quote,
             similarity=best_score,
             best_match=best_sentence,
-            detail=f"document_scan_truncated_after_{_MAX_SENTENCES_CONSIDERED}_sentences",
+            detail=f"document_scan_truncated_after_{_MAX_CHARS_CONSIDERED}_characters",
             fetched_content_length=len(fetched),
             truncated=True,
         )
@@ -823,7 +847,7 @@ def verify_citation(
         raw_markup=outcome.raw_markup,
         best_sentence=best_sentence,
         best_score=best_score,
-        partial_extraction_reason=outcome.partial_extraction_reason,
+        pdf_unreliable_reason=outcome.pdf_unreliable_reason,
     )
     if unreliable_reason is not None:
         return CitationVerification(

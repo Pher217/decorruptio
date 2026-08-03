@@ -2,12 +2,24 @@
 
 Compares the most recent successful IngestRun for each source against
 the ``freshness_sla_days`` defined in the source registry (``sources/*.yml``).
+Covers both connector families — ``connector_kind: procurement`` and
+``connector_kind: graph`` — because ``_load_source_sla`` reads every
+``sources/*.yml`` regardless of kind; there is nothing graph-specific to wire
+in here.
 
 Staleness labels:
 - **fresh**: last successful ingest within SLA.
 - **stale**: last successful ingest exceeds SLA but is less than 2× SLA.
-- **critical**: last successful ingest exceeds 2× SLA, or no successful
-  ingest has ever been recorded.
+- **critical**: an ingest has been attempted (an ``IngestRun`` row exists,
+  of any status) but the last success exceeds 2× SLA, or never succeeded.
+- **unknown**: no ``IngestRun`` row exists at all for this source — it has
+  never even been attempted. Distinct from ``critical`` on purpose: as of
+  this writing, none of the graph-layer connectors (``ec_donations``,
+  ``ch_officers``, ``ch_appointments``, ``lords_interests``,
+  ``parliament_interests``, ``gleif``) write to ``IngestRun`` yet, so every
+  one of them was previously indistinguishable from a source that ran and
+  kept failing — reported identically as ``critical`` instead of visibly as
+  "never run." ``unknown`` makes that gap visible instead of silent.
 
 The labels are designed for public display on a dashboard — they communicate
 data currency without exposing internal ingest details.
@@ -69,10 +81,26 @@ def _get_last_success(source_id: str) -> IngestRun | None:
     )
 
 
-def _compute_label(days_since: float | None, sla_days: int) -> str:
-    """Compute staleness label from days since last success and SLA."""
+def _has_any_run(source_id: str) -> bool:
+    """Has this source ever been the subject of an IngestRun, of any status?
+
+    Distinguishes "never run at all" (label ``unknown``) from "has run
+    before but the last success is missing or too old" (label ``critical``).
+    """
+    return IngestRun.objects.filter(source_id=source_id).exists()
+
+
+def _compute_label(days_since: float | None, sla_days: int, *, has_any_run: bool = True) -> str:
+    """Compute staleness label from days since last success and SLA.
+
+    ``has_any_run=False`` means no ``IngestRun`` row of any status exists for
+    this source — distinct from ``critical``, which means an attempt was
+    made (and failed, or succeeded too long ago). Defaults to ``True`` so
+    that a caller which doesn't pass run history keeps the pre-existing
+    "critical" behaviour for the no-success case.
+    """
     if days_since is None:
-        return "critical"  # No successful ingest ever
+        return "critical" if has_any_run else "unknown"
     if days_since <= sla_days:
         return "fresh"
     if days_since <= sla_days * 2:
@@ -115,7 +143,7 @@ def check_freshness(
             last_success = None
             days_since = None
 
-        label = _compute_label(days_since, sla_days)
+        label = _compute_label(days_since, sla_days, has_any_run=_has_any_run(source_id))
 
         results.append(
             FreshnessStatus(
@@ -154,7 +182,7 @@ def check_freshness_for_source(
         last_success = None
         days_since = None
 
-    label = _compute_label(days_since, sla_days)
+    label = _compute_label(days_since, sla_days, has_any_run=_has_any_run(source_id))
 
     return FreshnessStatus(
         source_id=source_id,

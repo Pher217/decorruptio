@@ -51,6 +51,7 @@ from scripts.phase_c_paths import (  # noqa: E402
     build_adjacency,
     find_paths,
     normalise_name,
+    prefer_companies_house,
     surname,
 )
 
@@ -123,7 +124,9 @@ def main() -> None:
         nearby = Entity.objects.filter(
             entity_type="company", name__icontains=company.name.strip()[:15]
         )[:200]
-        company_matches = [e for e in nearby if normalise_name(e.name) == target]
+        company_matches = prefer_companies_house(
+            [e for e in nearby if normalise_name(e.name) == target]
+        )
 
         row = {
             "person_register_name": person.name,

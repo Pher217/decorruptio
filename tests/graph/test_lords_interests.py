@@ -106,6 +106,31 @@ SAMPLE_HTML_WITH_CEASED = """\
 """
 
 
+SAMPLE_HTML_SHAREHOLDING = """\
+<html><body>
+<div class="results">
+  <div class="card-expandable">
+    <a class="card card-member" href="/member/4330/contact">
+      <div class="card-inner"><div class="content">
+        <div class="primary-info">Baroness Chisholm of Owlpen</div>
+        <div class="secondary-info">Non-affiliated</div>
+        <div class="secondary-info">Life peer</div>
+      </div></div>
+    </a>
+    <div class="expand-area"><div class="expand-area-content">
+      <div class="card card-child">
+        <div class="card-inner"><div class="content">
+          <div class="primary-info">Category 2: Shareholdings etc. (b)</div>
+          <ul><li>Halma (safety equipment)</li></ul>
+        </div></div>
+      </div>
+    </div></div>
+  </div>
+</div>
+</body></html>
+"""
+
+
 def _write_page(html_dir: Path, page_num: int, content: str) -> Path:
     path = html_dir / f"page_{page_num:02d}.html"
     path.write_text(content, encoding="utf-8")
@@ -184,6 +209,167 @@ class TestLordsInterestsParsing:
         name, _, _ = _extract_counterparty("Occasional speaker for events")
         assert name is None
 
+    def test_extract_counterparty_strips_all_trailing_parens(self):
+        """Two trailing parentheticals are both stripped, not just the last.
+
+        Real snapshot text: stripping only the last "(...)" (the pre-2026-08
+        behaviour) left "(trading as Afiniti)" glued onto the name.
+        """
+        name, _, is_private = _extract_counterparty(
+            "SATMAP Inc (trading as Afiniti) (communications technology)",
+            "Category 2: Shareholdings etc. (b)",
+        )
+        assert name == "SATMAP Inc"
+        assert is_private is False
+
+    def test_extract_counterparty_comma_inside_parenthetical_not_a_role_split(self):
+        """A comma inside the trailing parenthetical is not treated as a role separator.
+
+        Real snapshot text: "Unilever plc (nutrition, hygiene and personal
+        care products)" — splitting on the first comma in the raw
+        description (the pre-2026-08 behaviour) cut into the parenthetical
+        and lost "Unilever plc" entirely, even though it carries an
+        explicit "plc" marker.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Unilever plc (nutrition, hygiene and personal care products)"
+        )
+        assert name == "Unilever plc"
+        assert is_private is False
+
+    def test_extract_counterparty_comma_before_bare_suffix_is_not_a_role_split(self):
+        """A comma immediately followed by only a legal suffix belongs to the org's own name.
+
+        Real snapshot text: "Automatic Data Processing, Inc. (...)" — the
+        pre-2026-08 behaviour split on that comma and returned "Inc." alone
+        as the counterparty name.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Automatic Data Processing, Inc. (human resources data management)",
+            "Category 2: Shareholdings etc. (b)",
+        )
+        assert name == "Automatic Data Processing, Inc."
+        assert is_private is False
+
+    def test_extract_counterparty_distinct_companies_do_not_collapse(self):
+        """Two distinct companies sharing a description tail extract to distinct names.
+
+        Real snapshot text: five different "Dawn ... Holdings Ltd" entries
+        all ended "(co-investment with venture capital firm, printing)".
+        The pre-2026-08 code split on the comma INSIDE that parenthetical
+        and returned the shared tail ("printing)") as the name for all
+        five — silently merging five distinct companies onto one
+        fabricated placeholder.
+        """
+        name_1, _, _ = _extract_counterparty(
+            "Dawn OP Holdings Ltd (co-investment with venture capital firm, printing)",
+            "Category 2: Shareholdings etc. (b)",
+        )
+        name_2, _, _ = _extract_counterparty(
+            "Dawn OP Holdings II Ltd (co-investment with venture capital firm, printing)",
+            "Category 2: Shareholdings etc. (b)",
+        )
+        assert name_1 == "Dawn OP Holdings Ltd"
+        assert name_2 == "Dawn OP Holdings II Ltd"
+        assert name_1 != name_2
+
+    def test_extract_counterparty_shareholding_category_widens_bare_name_fallback(self):
+        """A Category 2 (Shareholdings) entry with no legal-form marker still extracts.
+
+        Real snapshot text: "Halma (safety equipment)" — a Shareholdings
+        entry, by the register's own category definition, names a body
+        corporate (you cannot hold "shares" in a person), so the bare
+        trading name is accepted when category context is supplied.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Halma (safety equipment)", "Category 2: Shareholdings etc. (b)"
+        )
+        assert name == "Halma"
+        assert is_private is False
+
+    def test_extract_counterparty_without_category_context_stays_conservative(self):
+        """The same bare-name text with NO category context still returns None.
+
+        The Category 2 fallback only widens extraction when the caller
+        supplies category — it never applies blindly, so a caller with no
+        register-structure context gets the same conservative behaviour as
+        before.
+        """
+        name, _, _ = _extract_counterparty("Halma (safety equipment)")
+        assert name is None
+
+    def test_extract_counterparty_shareholding_prose_still_skipped(self):
+        """An ambiguous, prose Category 2 entry is skipped even with category context.
+
+        Real snapshot text — a redaction notice, not an organisation name:
+        "The member is a shareholder with a controlling interest in a
+        property management company; full details are held by the
+        Registrar of Lords' Interests". Widening the Shareholdings fallback
+        must never promote a sentence fragment into a fabricated
+        counterparty.
+        """
+        name, _, is_private = _extract_counterparty(
+            "The member is a shareholder with a controlling interest in a property "
+            "management company; full details are held by the Registrar of "
+            "Lords’ Interests",
+            "Category 2: Shareholdings etc. (a)",
+        )
+        assert name is None
+        assert is_private is False
+
+    def test_extract_counterparty_date_after_comma_is_not_the_counterparty(self):
+        """A trailing date after a comma is never mistaken for the organisation name.
+
+        Real snapshot text: "Fee received from Philip Morris International
+        (tobacco company) for contributing to report on better regulation
+        to be submitted to the European Commission, June 2026" — the
+        pre-2026-08 code split on that final comma and returned the literal
+        string "June 2026" as the counterparty name.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Fee received from Philip Morris International (tobacco company) for "
+            "contributing to report on better regulation to be submitted to the "
+            "European Commission, June 2026",
+            "Category 1: Remunerated employment etc.",
+        )
+        assert name is None
+        assert is_private is False
+
+    def test_extract_counterparty_marker_inside_stripped_parenthetical_not_promoted(self):
+        """An org marker inside the trailing parenthetical does not promote the property text.
+
+        Real snapshot text: "Farmland including residential properties in
+        South Yorkshire (managed by LGK Farms LLP)" — the pre-2026-08 code
+        searched the FULL description (including the parenthetical about to
+        be stripped) for a marker, found "LLP" inside "(managed by LGK
+        Farms LLP)", and then returned the PROPERTY DESCRIPTION as the
+        counterparty name — the real organisation the marker came from was
+        discarded. This is Category 3 (Land and property): the interest is
+        the property itself, not an organisation, so the honest result is
+        no counterparty at all.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Farmland including residential properties in South Yorkshire "
+            "(managed by LGK Farms LLP)",
+            "Category 3: Land and property",
+        )
+        assert name is None
+        assert is_private is False
+
+    def test_extract_counterparty_family_role_marker_is_private_individual(self):
+        """A role naming a family member is scoped out as a private individual, never an entity.
+
+        ADR-004 D1: no private-individual profiling. This applies
+        regardless of category context — the Shareholdings fallback must
+        never override the family-marker exclusion.
+        """
+        name, _, is_private = _extract_counterparty(
+            "Gift from a family member, Acme Family Trust Ltd",
+            "Category 6: Gifts, benefits and hospitality",
+        )
+        assert name is None
+        assert is_private is True
+
 
 @pytest.mark.django_db
 class TestLordsInterestsIngest:
@@ -258,6 +444,28 @@ class TestLordsInterestsIngest:
         att = edge.attestations.first()
         assert att.match_confidence == 0.5
         assert att.match_method == "name_only"
+
+    def test_ingest_passes_category_to_extraction_for_bare_shareholding_name(self, tmp_path):
+        """A Category 2 entry with no legal-form marker still creates an Edge end-to-end.
+
+        Regression test: ``ingest_lords_register`` must pass the interest's
+        own category through to ``_extract_counterparty`` — without it,
+        "Halma (safety equipment)" (a real bare trading name from the
+        snapshot) has no legal-form marker and is silently dropped as
+        skipped_no_counterparty, even though a Category 2 entry always
+        names a body corporate.
+        """
+        _write_page(tmp_path, 1, SAMPLE_HTML_SHAREHOLDING)
+        _write_provenance(tmp_path)
+
+        summary = ingest_lords_register(tmp_path)
+
+        assert summary["matched"] == 1
+        assert summary["skipped_no_counterparty"] == 0
+        lord = Entity.objects.get(registry_id="4330")
+        halma = Entity.objects.get(name="Halma")
+        edge = Edge.objects.filter(source_entity=lord, target_entity=halma).first()
+        assert edge is not None
 
     def test_ingest_ambiguous_name_no_edge(self, tmp_path):
         """2+ companies with same normalised name → no edge, counted as unmatched."""

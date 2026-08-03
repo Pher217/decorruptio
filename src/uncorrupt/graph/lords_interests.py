@@ -73,6 +73,58 @@ CONNECTOR_VERSION = "0.1"
 # artefact from free-text register entries, not a real counterparty.
 _MAX_COUNTERPARTY_NAME = 200
 
+# A comma immediately followed by nothing but a bare legal suffix is part of
+# the organisation's own name (US-convention "X, Inc."), not a role
+# separator — splitting there produced counterparties named literally "Inc."
+# Whole-string match only: "X, Inc. of Delaware" still splits normally.
+_BARE_SUFFIX_RE = re.compile(
+    r"^(?:Inc|Ltd|Limited|LLC|LLP|Corp|Corporation|plc|PLC|SA|AG|NV|BV|KG|SE|"
+    r"ASA|SRL|SpA|GmbH|Co|L\.?P\.?|Pty)\.?$",
+    re.IGNORECASE,
+)
+
+# Legal-form suffixes (UK + common overseas jurisdictions) and institutional
+# nouns that mark free text as an organisation rather than a person or a
+# bare place/property description. Deliberately excludes generic words that
+# could plausibly appear in a person's own name.
+_ORG_MARKERS_RE = re.compile(
+    r"\b(Ltd|Limited|LLP|plc|PLC|CIC|Foundation|Trust|Society|Board|"
+    r"Authority|Group|Association|Charity|University|College|School|"
+    r"Partnership|Holdings|Capital|Fund|Enterprise|Enterprises|"
+    r"Council|Committee|Commission|Institute|Institution|Agency|Bureau|"
+    r"Church|Embassy|Ministry|Chambers|Programme|Federation|Alliance|"
+    r"Network|Forum|Confederation|Systems|Corporation|Corp|Inc|LLC|LP|"
+    r"GmbH|AG|SA|SE|NV|BV|ASA|SRL|SpA|Oy|AB|KG|Ltda|Limitada|"
+    r"Company|Companies)\b",
+    re.IGNORECASE,
+)
+
+# Signals that the candidate text is prose (a sentence fragment or a
+# redaction notice), not an organisation name — e.g. "The member is a
+# shareholder ... full details are held by the Registrar of Lords'
+# Interests". Category-2 entries carrying one of these are genuinely
+# unnamed, not a pattern miss.
+_PROSE_MARKERS = (
+    " is ",
+    " are ",
+    " was ",
+    " were ",
+    " has ",
+    " have ",
+    "full details",
+    "the member",
+    "The member",
+    "registrar",
+    "Registrar",
+    " no shares",
+    " which ",
+    " who ",
+    " whom ",
+    ";",
+    ":",
+)
+_NAME_CONNECTORS = {"the", "a", "an", "and", "of", "for", "in", "at", "&", "to", "on", "with"}
+
 # Categories that name an individual (relative) rather than the member's
 # own public-function interest — excluded per ADR-004 D1.
 _FAMILY_MARKERS = frozenset({"family"})
@@ -242,66 +294,157 @@ def _parse_interests(container: Tag) -> list[dict[str, Any]]:
     return interests
 
 
-def _extract_counterparty(description: str) -> tuple[str | None, str | None, bool]:
+def _strip_trailing_parens(text: str) -> str:
+    """Strip every consecutive trailing "(...)" annotation, not just the last one.
+
+    "SATMAP Inc (trading as Afiniti) (communications technology)" carries two
+    trailing parentheticals; stripping only the last one left "(trading as
+    Afiniti)" glued onto the name.
+
+    Depth-counted rather than a `\\([^)]*\\)` regex: register text nests
+    parens ("...see category 2(a))"), and a regex that stops at the first
+    ")" fails to match the true trailing group at all on nested text —
+    leaving it un-stripped and full of sentence punctuation.
+    """
+    text = text.rstrip()
+    while text.endswith(")"):
+        depth = 0
+        i = len(text) - 1
+        while i >= 0:
+            if text[i] == ")":
+                depth += 1
+            elif text[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            i -= 1
+        if i < 0 or depth != 0:
+            break
+        text = text[:i].rstrip()
+    return text
+
+
+def _looks_like_entity_name(text: str) -> bool:
+    """Plausibility gate for a candidate with no explicit legal-form marker.
+
+    Used only where the surrounding structure already establishes that a
+    named entity (not a person) is expected — a Category 2 shareholding, or
+    a description that independently mentions "company"/"corporation"/
+    "firm". Requires a short, capitalised, non-prose token sequence: real
+    organisation names in this register are short and Title Case even
+    without a legal suffix ("Halma", "The Terrapin Group", "Barclays");
+    prose fragments ("the member is a shareholder with...") and dates
+    ("18 December 2025") are rejected so this never promotes a sentence
+    fragment or a redaction notice into a fabricated counterparty.
+    """
+    text = text.strip()
+    if not text or len(text) > 100:
+        return False
+    if any(marker in text for marker in _PROSE_MARKERS):
+        return False
+    if not text[0].isalnum():
+        return False
+    words = text.split()
+    if not words or len(words) > 9:
+        return False
+    if words[0][0].islower():
+        return False
+    if any(w.strip(",.-()").lower() in _MONTH_NAMES for w in words):
+        return False
+    significant = [
+        w for w in words if w.lower().strip(",.-'()") not in _NAME_CONNECTORS and w[:1].isalpha()
+    ]
+    if not significant:
+        return False
+    upper_count = sum(1 for w in significant if w[0].isupper())
+    return (upper_count / len(significant)) >= 0.6
+
+
+def _extract_counterparty(
+    description: str, category: str | None = None
+) -> tuple[str | None, str | None, bool]:
     """Extract counterparty name and company number from an interest description.
 
     Lords register entries are free-text like:
         "Chairman, Microlink PC (UK) Ltd (computing and software)"
         "Director, Leadership in Mind Ltd (business activities)"
 
+    ``category`` (e.g. "Category 2: Shareholdings etc. (b)") is optional
+    context, not a requirement — it only widens the plausibility fallback
+    below for the one category where a named-but-unmarked entity is
+    virtually certain (see the Category 2 branch).
+
+    Two defects in the previous, marker-anywhere-in-description approach:
+    trailing parentheticals routinely contain their OWN commas ("Unilever
+    plc (nutrition, hygiene and personal care products)"), so splitting on
+    the first comma in the raw description split mid-parenthetical and
+    silently corrupted the role/organisation boundary — for a family of
+    entries this collapsed several distinct companies onto one fabricated
+    placeholder name built from the shared tail of their description (e.g.
+    five different "Dawn ... Holdings Ltd" companies all resolving to a
+    counterparty literally named "printing)"). Parentheses are now stripped
+    FIRST, and a comma is only treated as a role separator when the text
+    after it isn't itself just the organisation's own legal suffix ("X,
+    Inc.").
+
     Returns (name, company_number, is_private_individual).
     Company numbers are rarely present in Lords entries — most return None.
     """
     company_number = None
-
-    # Try to extract the organisation name — typically after a role and comma
-    # "Chairman, Microlink PC (UK) Ltd (computing and software)"
-    # → "Microlink PC (UK) Ltd"
-    parts = description.split(",", 1)
-    if len(parts) < 2:
-        # No comma — the whole description might be the organisation
-        # e.g. "Sharetego (travel company)"
-        if re.search(r"\b(Ltd|Limited|LLP|plc|CIC)\b", description, re.IGNORECASE):
-            # Extract name before last parenthetical description
-            name = re.split(r"\s*\([^)]*\)\s*$", description)[0].strip()
-            return name, company_number, False
-        # Check for org markers without comma
-        if re.search(
-            r"\b(Ltd|Limited|LLP|plc|CIC|Foundation|Trust|Society|Board|"
-            r"Authority|Group|Association|Charity|University|College)\b",
-            description,
-            re.IGNORECASE,
-        ):
-            name = re.split(r"\s*\([^)]*\)\s*$", description)[0].strip()
-            return name, company_number, False
+    core = _strip_trailing_parens(description)
+    if not core:
         return None, company_number, False
 
-    role = parts[0].strip().lower()
-    rest = parts[1].strip()
+    # A comma is a role/organisation separator UNLESS the text after it is
+    # nothing but a bare legal suffix ("Automatic Data Processing, Inc."),
+    # in which case the comma belongs to the organisation's own name.
+    comma_idx = core.find(",")
+    role: str | None = None
+    candidate = core
+    if comma_idx != -1:
+        after = core[comma_idx + 1 :].strip()
+        if not _BARE_SUFFIX_RE.match(after):
+            role = core[:comma_idx].strip().lower()
+            candidate = after
 
-    # Check if this is a family-related entry
-    if any(marker in role for marker in _FAMILY_MARKERS):
+    if role is not None and any(marker in role for marker in _FAMILY_MARKERS):
         return None, company_number, True
 
-    # Extract organisation name (before the LAST parenthetical description)
-    # "Microlink PC (UK) Ltd (computing and software)" → "Microlink PC (UK) Ltd"
-    name = re.split(r"\s*\([^)]*\)\s*$", rest)[0].strip()
-
-    # Check if it looks like an organisation vs a person
-    org_markers = re.search(
-        r"\b(Ltd|Limited|LLP|plc|CIC|Foundation|Trust|Society|Board|"
-        r"Authority|Group|Association|Charity|University|College|"
-        r"Partnership|Holdings|Capital|Fund|Enterprise)\b",
-        name,
-        re.IGNORECASE,
-    )
-    if not org_markers:
-        # Could be a person name or an institution without markers
-        if re.search(r"\b(company|corporation|firm)\b", description, re.IGNORECASE):
-            return name, company_number, False
+    if not candidate:
         return None, company_number, False
 
-    return name, company_number, False
+    # "Company"/"Companies" in _ORG_MARKERS_RE below is a real legal-form
+    # marker for names like "Walt Disney Company" — but it is also an
+    # ordinary English noun, so an unguarded marker search matches prose
+    # too: "...a property management company; full details are held by the
+    # Registrar..." is not a role/organisation split at all, just a
+    # sentence that happens to contain the word "company". Reject prose
+    # before any marker match, strong or fallback.
+    if any(marker in candidate for marker in _PROSE_MARKERS):
+        return None, company_number, False
+
+    if _ORG_MARKERS_RE.search(candidate):
+        return candidate, company_number, False
+
+    # No explicit legal-form marker on the candidate. Two contexts still
+    # make a named (non-person) entity plausible enough to extract:
+    #  - Category 2 (Shareholdings): the register's own category definition
+    #    means the entry NAMES a body corporate, never a person — you
+    #    cannot hold "shares" in an individual. "Halma", "Barclays",
+    #    "Sharetego" (trading names with no legal suffix) sit here.
+    #  - a "Role, X" entry (comma present) whose description independently
+    #    says "company"/"corporation"/"firm" (mirrors the previous
+    #    with-comma-only fallback, now gated on the candidate itself
+    #    looking like a name rather than blindly returning whatever
+    #    followed the comma).
+    is_shareholding = bool(category) and category.startswith("Category 2")
+    mentions_org_word = role is not None and bool(
+        re.search(r"\b(company|corporation|firm)\b", description, re.IGNORECASE)
+    )
+    if (is_shareholding or mentions_org_word) and _looks_like_entity_name(candidate):
+        return candidate, company_number, False
+
+    return None, company_number, False
 
 
 def _scoped_registry_id(scope: str, name: str) -> str:
@@ -647,7 +790,7 @@ def ingest_lords_register(
                 description = interest["description"]
                 category = interest["category"]
 
-                name, company_number, is_private = _extract_counterparty(description)
+                name, company_number, is_private = _extract_counterparty(description, category)
 
                 # A counterparty "name" longer than this is an extraction
                 # failure, not an organisation — the Lords register is free

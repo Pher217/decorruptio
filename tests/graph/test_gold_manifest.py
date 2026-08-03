@@ -1,7 +1,9 @@
 """Tests for the Phase C gold-manifest loader and pre-registered benchmark runner.
 
 Spec (LOCKED): vault
-`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`.
+`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
+including amendments v2.1 (unit of analysis) and v2.3 (manifest schema
+semantics + the narrowed case key).
 
 These tests exist because Phase C v1 conflated outcomes that are genuinely
 different -- treating "path found" as proof of truth, and "endpoint never
@@ -39,7 +41,8 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 MANIFEST_HEADER = (
     "case_id,person_name,person_registry_id,company_name,company_number,"
     "relationship_type,established_by,label_source_url,award_date,"
-    "relationship_start,excluded_from_retrieval\n"
+    "relationship_start,excluded_from_retrieval,intermediary_company_number,"
+    "awardee_confirmed\n"
 )
 
 
@@ -50,10 +53,10 @@ def _write_manifest(tmp_path: Path, rows: list[str]) -> Path:
 
 
 class TestLoadGoldManifest:
-    """Loader admissibility (spec SS2) and schema (spec SS4) checks."""
+    """Loader admissibility (spec SS2, A2.3.1) and schema (spec SS4) checks."""
 
     def test_admissible_row_is_loaded_and_company_number_normalised(self, tmp_path):
-        """GIVEN a row that satisfies every spec SS2 admissibility criterion
+        """GIVEN a row that satisfies every spec SS2/A2.3.1 admissibility criterion
         WHEN the manifest is loaded
         THEN it is admissible and its company number is zero-padded to 8
         characters by the project's canonical CH normaliser."""
@@ -61,7 +64,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-001,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -76,7 +79,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-002,Jane Testperson,,Example Holdings Ltd,,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -91,7 +94,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-003,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,,2018-01-15,"
+                "journalism,https://example.invalid/a,,2018-01-15,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -106,7 +109,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-004,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2019-01-01,2020-05-01,"
+                "journalism,https://example.invalid/a,2019-01-01,2020-05-01,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -121,7 +124,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-005,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,unknown,"
+                "journalism,https://example.invalid/a,2021-06-01,unknown,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -136,7 +139,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-006,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,,2021-06-01,2018-01-15,"
+                "journalism,,2021-06-01,2018-01-15,,,yes"
             ],
         )
         result = load_gold_manifest(path)
@@ -163,53 +166,170 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-007,A,,Example Ltd,1234567,directorship,journalism,"
-                "https://example.invalid/a,2021-06-01,2018-01-15,",
+                "https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
                 "SYNTH-007,B,,Other Ltd,7654321,directorship,journalism,"
-                "https://example.invalid/b,2021-06-01,2018-01-15,",
+                "https://example.invalid/b,2021-06-01,2018-01-15,,,yes",
             ],
         )
         result = load_gold_manifest(path)
         assert len(result.admissible) == 1
         assert any("duplicate case_id" in r for r in result.inadmissible[0].reasons)
 
-    def test_rows_sharing_company_and_award_collapse_into_one_case(self, tmp_path):
-        """GIVEN two admissible rows naming different people but the same
-        company_number and award_date (e.g. Greensill: five people, one
-        company, one award)
+    def test_awardee_not_confirmed_is_rejected(self, tmp_path):
+        """GIVEN a row where awardee_confirmed is explicitly 'no' (e.g. the
+        donations family's raw, unverified company_number)
         WHEN the manifest is loaded
-        THEN they collapse into exactly ONE case, not two -- spec A2.1.1's
-        unit of analysis is (company_number, award_date), not the row."""
+        THEN it is inadmissible -- company_number is never guessed at as the
+        awardee (spec A2.3.1)."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-008,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,no"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("not confirmed as the awardee" in r for r in result.inadmissible[0].reasons)
+
+    def test_blank_awardee_confirmed_is_rejected(self, tmp_path):
+        """GIVEN a row where awardee_confirmed is left blank
+        WHEN the manifest is loaded
+        THEN it is inadmissible -- a blank is never treated as an implicit
+        confirmation (spec A2.3.1)."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-009,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("not confirmed as the awardee" in r for r in result.inadmissible[0].reasons)
+
+    def test_intermediary_company_number_is_normalised_when_present(self, tmp_path):
+        """GIVEN a row recording a donor/linking entity's number in
+        intermediary_company_number (spec A2.3.1 -- the donations family's
+        original reading, now corrected)
+        WHEN the manifest is loaded
+        THEN the intermediary number is normalised to 8 characters like any
+        other company number, independently of the awardee company_number."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-014,Robin Donorlinked,,Confirmed Awardee Ltd,4445556,donation,"
+                "journalism,https://example.invalid/a,2021-09-01,2019-11-01,,999888,yes"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].company_number == "04445556"
+        assert result.admissible[0].intermediary_company_number == "00999888"
+
+    def test_psc_sourced_row_is_admissible_and_flagged(self, tmp_path):
+        """GIVEN a row whose established_by is 'PSC'
+        WHEN the manifest is loaded
+        THEN it is admissible (not rejected, not silently dropped) AND its
+        is_psc_sourced property is True (spec A2.3.3 -- flagged, never
+        silently kept unflagged either)."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-015,Kim Sample,,Placeholder Services Ltd,9999999,shareholding,"
+                "PSC,https://example.invalid/a,2021-01-10,2019-03-01,,,yes"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].is_psc_sourced is True
+
+    def test_rows_sharing_awardee_collapse_into_one_case_across_different_awards(self, tmp_path):
+        """GIVEN two admissible rows against the SAME awardee company_number
+        but DIFFERENT award_date (e.g. PPE Medpro's two separate DHSC
+        awards arising from one underlying relationship)
+        WHEN the manifest is loaded
+        THEN they collapse into exactly ONE case subsuming 2 distinct
+        awards -- spec A2.3.2 narrows the case key to the awardee company
+        alone, dropping award_date from the key entirely."""
         path = _write_manifest(
             tmp_path,
             [
                 "SYNTH-010,Person One,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,",
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
                 "SYNTH-011,Person Two,,Example Holdings Ltd,1234567,shareholding,"
-                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,",
+                "inquiry,https://example.invalid/b,2021-08-15,2019-02-20,,,yes",
             ],
         )
         result = load_gold_manifest(path)
         assert len(result.admissible) == 2
         assert len(result.cases) == 1
         assert result.cases[0].row_count == 2
-        assert result.cases[0].is_concentrated is True
+        assert result.cases[0].award_count == 2
+        assert result.cases[0].earliest_award_date == date(2021, 6, 1)
 
-    def test_distinct_company_or_award_date_are_separate_cases(self, tmp_path):
-        """GIVEN two admissible rows with different company numbers
+    def test_distinct_awardee_companies_are_separate_cases(self, tmp_path):
+        """GIVEN two admissible rows with different awardee company numbers
         WHEN the manifest is loaded
         THEN they form two distinct, non-concentrated cases."""
         path = _write_manifest(
             tmp_path,
             [
                 "SYNTH-012,Person One,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,",
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
                 "SYNTH-013,Person Two,,Other Traders Ltd,7654321,directorship,"
-                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,",
+                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,,,yes",
             ],
         )
         result = load_gold_manifest(path)
         assert len(result.cases) == 2
         assert all(not c.is_concentrated for c in result.cases)
+
+
+def _gold_row(**overrides) -> GoldRow:
+    defaults = dict(
+        case_id="SYNTH-100",
+        person_name="Jane Testperson",
+        person_registry_id=None,
+        company_name="Example Holdings Ltd",
+        company_number="01234567",
+        relationship_type="directorship",
+        established_by="journalism",
+        label_source_url="https://example.invalid/a",
+        award_date=date(2021, 6, 1),
+        relationship_start=date(2018, 1, 15),
+        excluded_from_retrieval=(),
+        intermediary_company_number=None,
+    )
+    defaults.update(overrides)
+    return GoldRow(**defaults)
+
+
+class TestGoldCase:
+    """spec A2.3.2: case-level award/row counts, computed from constituent rows."""
+
+    def test_award_count_and_earliest_date_computed_from_rows(self):
+        """GIVEN a GoldCase built from two rows with different award dates
+        WHEN its award_count, row_count and earliest_award_date are read
+        THEN they reflect 2 distinct awards, 2 rows, and the earlier date."""
+        row_a = _gold_row(case_id="A", award_date=date(2021, 6, 1))
+        row_b = _gold_row(case_id="B", award_date=date(2021, 8, 15))
+        case = GoldCase(company_number="01234567", rows=(row_a, row_b))
+
+        assert case.row_count == 2
+        assert case.award_count == 2
+        assert case.earliest_award_date == date(2021, 6, 1)
+
+    def test_award_count_is_one_when_all_rows_share_the_same_award(self):
+        """GIVEN a GoldCase built from two rows with the SAME award_date
+        WHEN its award_count is read
+        THEN it is 1 -- multiple people on one award do not inflate the
+        award count."""
+        row_a = _gold_row(case_id="A", award_date=date(2021, 6, 1))
+        row_b = _gold_row(case_id="B", award_date=date(2021, 6, 1))
+        case = GoldCase(company_number="01234567", rows=(row_a, row_b))
+
+        assert case.award_count == 1
 
 
 class TestClassifyOutcome:
@@ -369,27 +489,10 @@ class TestWilsonUpperBound:
         assert wilson_upper_bound(0, 0) == 0.0
 
 
-def _gold_row(**overrides) -> GoldRow:
-    defaults = dict(
-        case_id="SYNTH-100",
-        person_name="Jane Testperson",
-        person_registry_id=None,
-        company_name="Example Holdings Ltd",
-        company_number="01234567",
-        relationship_type="directorship",
-        established_by="journalism",
-        label_source_url="https://example.invalid/a",
-        award_date=date(2021, 6, 1),
-        relationship_start=date(2018, 1, 15),
-        excluded_from_retrieval=(),
-    )
-    defaults.update(overrides)
-    return GoldRow(**defaults)
-
-
 @pytest.mark.django_db
 class TestEvaluateRow:
-    """The three-way (recovered / undated_only / untestable) + not_recovered split."""
+    """The recovered / undated_only / untestable / not_recovered split, using
+    the row's OWN award_date as cutoff."""
 
     def test_unresolved_supplier_is_untestable_not_refuted(self):
         """GIVEN a gold row whose company_number matches no graph entity
@@ -467,10 +570,71 @@ class TestEvaluateRow:
 
 
 @pytest.mark.django_db
+class TestPscRelabeling:
+    """Spec A2.3.3: a PSC-sourced row that finds no path is an expected
+    no-trace, never a refutation -- but PSC never overrides a real result."""
+
+    def test_psc_row_with_no_path_is_relabelled_no_trace_by_design(self):
+        """GIVEN a PSC-sourced row whose person and company resolve but have
+        no connecting path at all
+        WHEN the row is evaluated
+        THEN its status is no_trace_by_design, not not_recovered."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        adj = build_adjacency()
+        people_by_surname = {surname(person.name): [person]}
+        row = _gold_row(established_by="PSC")
+
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "no_trace_by_design"
+
+    def test_psc_row_that_recovers_via_independent_evidence_stays_recovered(self):
+        """GIVEN a PSC-sourced row whose person and company ARE connected by
+        an independently-ingested register edge dated before the award
+        WHEN the row is evaluated
+        THEN its status is recovered -- the PSC non-recovery expectation
+        does not override a genuine recovery through other evidence."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=person,
+            target_entity=company,
+            valid_from=date(2018, 1, 15),
+        )
+        adj = build_adjacency()
+        people_by_surname = {surname(person.name): [person]}
+        row = _gold_row(established_by="PSC")
+
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "recovered"
+
+    def test_psc_row_that_is_untestable_stays_untestable(self):
+        """GIVEN a PSC-sourced row whose company never resolves
+        WHEN the row is evaluated
+        THEN its status is untestable, not no_trace_by_design -- a
+        resolution gap is a different, still-informative condition from the
+        PSC temporal caveat."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        adj = build_adjacency()
+        people_by_surname = {surname(person.name): [person]}
+        row = _gold_row(established_by="PSC")
+
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "untestable"
+
+
+@pytest.mark.django_db
 class TestEvaluateCase:
-    """Spec A2.1.1: a case rolls up ALL its rows into ONE status -- multiple
-    people on one company+award raise confidence within the case, they never
-    multiply the case count."""
+    """Spec A2.1.1/A2.3.2: a case rolls up ALL its rows into ONE status, using
+    the case's EARLIEST qualifying award date as the cutoff for every row."""
 
     def test_case_recovers_if_any_row_recovers_even_if_others_are_untestable(self):
         """GIVEN a case with two rows -- one whose person/company resolve and
@@ -496,11 +660,7 @@ class TestEvaluateCase:
         unresolvable_row = _gold_row(
             case_id="SYNTH-201", person_name="Nobody Resolvable", person_registry_id=None
         )
-        case = GoldCase(
-            company_number="01234567",
-            award_date=date(2021, 6, 1),
-            rows=(recovering_row, unresolvable_row),
-        )
+        case = GoldCase(company_number="01234567", rows=(recovering_row, unresolvable_row))
 
         result = evaluate_case(case, adj, people_by_surname, {}, max_hops=2)
 
@@ -531,9 +691,7 @@ class TestEvaluateCase:
 
         undated_row = _gold_row(case_id="SYNTH-202", person_name="Jane Testperson")
         no_path_row = _gold_row(case_id="SYNTH-203", person_name="Sam Otherperson")
-        case = GoldCase(
-            company_number="01234567", award_date=date(2021, 6, 1), rows=(undated_row, no_path_row)
-        )
+        case = GoldCase(company_number="01234567", rows=(undated_row, no_path_row))
 
         result = evaluate_case(case, adj, people_by_surname, {}, max_hops=2)
 
@@ -544,11 +702,54 @@ class TestEvaluateCase:
         WHEN the case is evaluated
         THEN the case status is untestable."""
         adj = build_adjacency()
-        case = GoldCase(company_number="01234567", award_date=date(2021, 6, 1), rows=(_gold_row(),))
+        case = GoldCase(company_number="01234567", rows=(_gold_row(),))
 
         result = evaluate_case(case, adj, {}, {}, max_hops=2)
 
         assert result.status == "untestable"
+
+    def test_case_uses_earliest_award_date_not_each_rows_own(self):
+        """GIVEN a case with two rows against the same awardee: one with an
+        EARLIER award_date and no graph representation, one with a LATER
+        award_date whose person has a path dated between the two award dates
+        WHEN the case is evaluated
+        THEN the later row's path is NOT counted as recovered -- spec A2.3.2
+        requires testing against the case's earliest award date, not each
+        row's own, even though the row would recover standalone against its
+        own (later) award_date."""
+        person_late = Entity.objects.create(entity_type="person", name="Sam Otherperson")
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=person_late,
+            target_entity=company,
+            valid_from=date(2021, 7, 1),
+        )
+        adj = build_adjacency()
+        people_by_surname = {surname(person_late.name): [person_late]}
+
+        early_row = _gold_row(
+            case_id="SYNTH-210",
+            person_name="Nobody Resolvable",
+            award_date=date(2021, 6, 1),
+        )
+        late_row = _gold_row(
+            case_id="SYNTH-211",
+            person_name="Sam Otherperson",
+            award_date=date(2021, 8, 15),
+        )
+        case = GoldCase(company_number="01234567", rows=(early_row, late_row))
+        assert case.earliest_award_date == date(2021, 6, 1)
+
+        # Standalone, against its OWN (later) award_date, this row recovers.
+        standalone = evaluate_row(late_row, adj, people_by_surname, {}, max_hops=2)
+        assert standalone.status == "recovered"
+
+        result = evaluate_case(case, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "undated_only"
 
 
 class TestLoadTemporalGate:

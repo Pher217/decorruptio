@@ -2,8 +2,9 @@
 
 Spec (LOCKED, do not deviate): vault
 `02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
-including AMENDMENT v2 (temporal evidence ladder) and AMENDMENT v2.1 (unit of
-analysis + revised verdict set). Sections 5-7 and both amendments are binding.
+including AMENDMENT v2 (temporal evidence ladder), v2.1 (unit of analysis +
+revised verdict set) and v2.3 (manifest schema semantics + the narrowed case
+key). Sections 5-7 and all three amendments are binding.
 
 This script does NOT implement a second path-search or resolution stack. It
 calls the same code the rest of Phase C already uses and already trusts:
@@ -23,36 +24,51 @@ gate's *result* as an explicit input -- see `TemporalGate` / `load_temporal_gate
 -- so this runner can never emit REFUTED (or CONFIRMED) without one having
 actually been measured.
 
-UNIT OF ANALYSIS (amendment v2.1, A2.1.1): every threshold below is scored at
-CASE level, not row level. A case is a distinct `(company_number, award_date)`
-pair (`scripts.load_gold_manifest.GoldCase`); one heavily-populated case (e.g.
-five people tied to one company and one award) must never look like five
-recovered cases. `evaluate_case` rolls up all of a case's constituent rows
-into one status: recovered beats undated_only beats not_recovered beats
-untestable, i.e. a case counts as testable/recovered if ANY of its rows
-achieves that status. Row-level counts are still computed and reported, but
-never as the headline figure (A2.1.1: "Row-level alone is forbidden as a
-headline").
+UNIT OF ANALYSIS (amendment v2.1 A2.1.1, NARROWED by v2.3 A2.3.2): every
+threshold below is scored at CASE level, not row level, and a case is the
+distinct AWARDEE `company_number` alone -- not `(company_number, award_date)`
+as v2.1 first set it. PPE Medpro's two separate DHSC awards (2020-06-12,
+2020-06-25) arising from one underlying relationship must never score as two
+recovered cases: what determines recovery is officer coverage of the
+awardee company, so rows sharing an awardee are correlated, not independent.
+`evaluate_case` rolls a case's constituent rows up into one status
+(recovered beats undated_only beats not_recovered beats untestable beats
+no_trace_by_design) using the case's EARLIEST qualifying award date as the
+cutoff for every row -- the strictest cutoff available, since a relationship
+pre-dating the earliest award necessarily pre-dates every later one too.
+Row-level counts, and each case's row/award counts, are still computed and
+reported, but never as the headline figure (A2.1.1: "Row-level alone is
+forbidden as a headline").
 
-Three per-row / per-case outcomes that MUST NOT be conflated -- Phase C v1
+`company_number` always means the AWARDEE (spec A2.3.1) -- the loader
+(`scripts/load_gold_manifest.py`) rejects any row that does not explicitly
+confirm this, so this script can assume it throughout.
+
+Four per-row / per-case outcomes that MUST NOT be conflated -- Phase C v1
 collapsed (c) into a refutation and had to retract "0 of 52" because of it:
 
-  (a) recovered      -- a path was found and every edge on it dates before
-                        the row's own award_date (H1's actual claim).
-  (b) undated_only    -- a path was found but at least one edge on it has no
-                        valid_from, so pre-award is UNDECIDABLE, not false.
-                        Superseded in spirit by the A2.2 evidence ladder
-                        (levels 1/2 vs 3), whose actual level classification
-                        lives in the separate temporal-lift script; this
-                        script's own dated/undated split is the coarse
-                        version it can determine locally without that
-                        classifier.
-  (c) untestable      -- the supplier or the referrer never resolved to a
-                        graph entity. Excluded from every denominator;
-                        reported separately with the specific reason.
+  (a) recovered           -- a path was found and every edge on it dates
+                             before the case's earliest award_date (H1's
+                             actual claim).
+  (b) undated_only        -- a path was found but at least one edge on it
+                             has no valid_from, so pre-award is UNDECIDABLE,
+                             not false.
+  (c) untestable          -- the supplier or the referrer never resolved to
+                             a graph entity. Excluded from every denominator;
+                             reported separately with the specific reason.
+  (d) no_trace_by_design  -- spec A2.3.3: the row's only evidence is
+                             Persons-with-Significant-Control data
+                             (`established_by: PSC`, `GoldRow.is_psc_sourced`).
+                             PSC is a label source only, never ingested for
+                             retrieval, so a `not_recovered` result on such a
+                             row is an EXPECTED, honest "no trace" -- never a
+                             refutation. Only a `not_recovered` PSC row is
+                             relabelled this way; a PSC row that IS recovered
+                             through independent register evidence is a
+                             genuine recovery and is left alone.
 
-Only a resolved pair with no path at all, dated or undated, is a genuine
-`not_recovered` miss.
+Only a resolved, non-PSC-only pair with no path at all, dated or undated, is
+a genuine `not_recovered` miss.
 
 Source separation (spec SS3): a row's `excluded_from_retrieval` sources must
 never be what makes its path recoverable. `check_source_separation` is a
@@ -104,6 +120,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import django
@@ -130,7 +147,16 @@ CONFIRM_MIN_CASES = 4  # >=4/20 cases (not rows -- A2.1.1)
 CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
 
 # Priority order for rolling per-row statuses up to a case (higher wins).
-_STATUS_PRIORITY = {"recovered": 3, "undated_only": 2, "not_recovered": 1, "untestable": 0}
+# no_trace_by_design (spec A2.3.3) ranks lowest: it is an EXPECTED non-result
+# on a PSC-only row, so any other row in the case -- even a mere untestable
+# resolution gap -- is more informative and wins the roll-up.
+_STATUS_PRIORITY = {
+    "recovered": 4,
+    "undated_only": 3,
+    "not_recovered": 2,
+    "untestable": 1,
+    "no_trace_by_design": 0,
+}
 
 _Z_95 = 1.959963984540054  # two-sided 95% normal quantile
 
@@ -138,7 +164,7 @@ _Z_95 = 1.959963984540054  # two-sided 95% normal quantile
 @dataclass
 class RowEvaluation:
     case_id: str
-    status: str  # "recovered" | "undated_only" | "not_recovered" | "untestable"
+    status: str  # recovered | undated_only | not_recovered | untestable | no_trace_by_design
     reason: str | None = None
     source_separation: str = "not_applicable"
     example_path: list[str] = field(default_factory=list)
@@ -146,19 +172,21 @@ class RowEvaluation:
 
 @dataclass
 class CaseEvaluation:
-    """The case-level roll-up of one `GoldCase`'s constituent rows (A2.1.1)."""
+    """The case-level roll-up of one `GoldCase`'s constituent rows (A2.1.1, A2.3.2)."""
 
     case_key: str
     company_number: str
-    award_date: str
+    row_count: int
+    award_count: int
+    earliest_award_date: str
     row_case_ids: list[str]
-    status: str  # "recovered" | "undated_only" | "not_recovered" | "untestable"
+    status: str  # recovered | undated_only | not_recovered | untestable | no_trace_by_design
     source_separation: str
     row_evaluations: list[RowEvaluation]
 
     @property
     def is_concentrated(self) -> bool:
-        return len(self.row_case_ids) > 1
+        return self.row_count > 1
 
 
 @dataclass(frozen=True)
@@ -283,20 +311,20 @@ def check_source_separation(paths: list[list[Edge]], excluded_sources: tuple[str
     return "violation"
 
 
-def evaluate_row(
+def _resolve_pair(
     row: GoldRow,
     adj: dict[int, list[Edge]],
     people_by_surname: dict[str, list[Entity]],
     ch_cache: dict,
     max_hops: int,
+    cutoff: date,
 ) -> RowEvaluation:
-    """Classify one gold row into recovered / undated_only / not_recovered / untestable.
+    """Core recovered/undated_only/not_recovered/untestable decision for one
+    row, at an explicit `cutoff`.
 
-    Reuses `resolve_supplier` and `find_paths` exactly as Phase C's other
-    scripts do. Critically, `find_paths` is called with `cutoff=row.award_date`
-    -- each row's OWN award date, not the VIP-lane cohort's single fixed
-    cutoff `find_paths` defaults to. That per-row cutoff is the entire reason
-    the gold manifest schema carries an `award_date` column (spec SS2.3).
+    Shared by `evaluate_row` (the row's own `award_date`) and `evaluate_case`
+    (the case's `earliest_award_date`, spec A2.3.2) so the resolve + path
+    search + source-separation logic exists in exactly one place.
     """
     supplier = resolve_supplier(row.company_name, ch_cache, row.company_number)
     referrers = _resolve_referrer_entities(row, people_by_surname)
@@ -314,7 +342,7 @@ def evaluate_row(
         )
 
     pre_award, undated = find_paths(
-        {r.id for r in referrers}, supplier.id, adj, max_hops, cutoff=row.award_date
+        {r.id for r in referrers}, supplier.id, adj, max_hops, cutoff=cutoff
     )
 
     if pre_award:
@@ -337,6 +365,51 @@ def evaluate_row(
     return RowEvaluation(case_id=row.case_id, status="not_recovered")
 
 
+def _apply_psc_relabel(row: GoldRow, evaluation: RowEvaluation) -> RowEvaluation:
+    """Spec A2.3.3: a PSC-sourced row that finds no path is an EXPECTED
+    "no trace" -- PSC is a label source only, never ingested for retrieval --
+    never a refutation.
+
+    Relabels a `not_recovered` PSC row to `no_trace_by_design`. Every other
+    status is left untouched: a PSC row that IS recovered through
+    independent register evidence is a genuine recovery, not overridden, and
+    an `untestable` PSC row is still a real resolution gap worth its own
+    label, not conflated with the PSC caveat.
+    """
+    if row.is_psc_sourced and evaluation.status == "not_recovered":
+        return RowEvaluation(
+            case_id=evaluation.case_id,
+            status="no_trace_by_design",
+            reason=(
+                "PSC is a label source only, not ingested for retrieval -- expected "
+                "no-trace, not a refutation (spec A2.3.3)"
+            ),
+            source_separation=evaluation.source_separation,
+            example_path=evaluation.example_path,
+        )
+    return evaluation
+
+
+def evaluate_row(
+    row: GoldRow,
+    adj: dict[int, list[Edge]],
+    people_by_surname: dict[str, list[Entity]],
+    ch_cache: dict,
+    max_hops: int,
+) -> RowEvaluation:
+    """Classify one gold row on its OWN `award_date` as the cutoff.
+
+    Reuses `resolve_supplier` and `find_paths` exactly as Phase C's other
+    scripts do, via the shared `_resolve_pair` helper. Note that the BINDING
+    case-level test (`evaluate_case`) uses the case's earliest qualifying
+    award date, not each row's own -- this function is the standalone,
+    per-row view (spec SS2.3's per-row admissibility question), not the
+    scored recovery test.
+    """
+    result = _resolve_pair(row, adj, people_by_surname, ch_cache, max_hops, cutoff=row.award_date)
+    return _apply_psc_relabel(row, result)
+
+
 def evaluate_case(
     case: GoldCase,
     adj: dict[int, list[Edge]],
@@ -344,17 +417,30 @@ def evaluate_case(
     ch_cache: dict,
     max_hops: int,
 ) -> CaseEvaluation:
-    """Roll up every row in a case into ONE case-level status (spec A2.1.1).
+    """Roll up every row in a case into ONE case-level status (spec A2.1.1, A2.3.2).
+
+    Every row is tested against the CASE's earliest qualifying award date
+    (`case.earliest_award_date`), not its own -- the strictest cutoff
+    available, since a relationship pre-dating the earliest award
+    necessarily pre-dates every later award from the same awardee too.
 
     A case's status is the STRONGEST status achieved by any of its rows
-    (recovered > undated_only > not_recovered > untestable): a case counts as
-    recovered if any one of the people tied to it produces a pre-award path,
-    even if others don't resolve at all. This is exactly "additional people
-    on the same case may raise confidence within that case; they never
-    multiply it" -- five recovered rows on one case still contribute exactly
-    ONE recovered case, never five.
+    (recovered > undated_only > not_recovered > untestable >
+    no_trace_by_design): a case counts as recovered if any one of the people
+    tied to it produces a pre-award path, even if others don't resolve at
+    all. This is exactly "additional people on the same case may raise
+    confidence within that case; they never multiply it" -- five recovered
+    rows on one case still contribute exactly ONE recovered case, never
+    five; likewise multiple awards to the same company are one case, not one
+    per award.
     """
-    row_evals = [evaluate_row(row, adj, people_by_surname, ch_cache, max_hops) for row in case.rows]
+    cutoff = case.earliest_award_date
+    row_evals = [
+        _apply_psc_relabel(
+            row, _resolve_pair(row, adj, people_by_surname, ch_cache, max_hops, cutoff)
+        )
+        for row in case.rows
+    ]
     status = max(row_evals, key=lambda r: _STATUS_PRIORITY[r.status]).status
 
     if status in ("recovered", "undated_only"):
@@ -374,7 +460,9 @@ def evaluate_case(
     return CaseEvaluation(
         case_key=case.case_key,
         company_number=case.company_number,
-        award_date=case.award_date.isoformat(),
+        row_count=case.row_count,
+        award_count=case.award_count,
+        earliest_award_date=case.earliest_award_date.isoformat(),
         row_case_ids=[r.case_id for r in case.rows],
         status=status,
         source_separation=sep,
@@ -404,8 +492,8 @@ def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
 
 def compute_precision(cases_recovered: int, negatives_recovered: int) -> float:
     """BENCHMARK precision over the constructed case-control sample (spec
-    SS5/A2.5): `cases_recovered` (case-level, per A2.1.1) against a spurious
-    hit count from the 200 matched negatives.
+    SS5/A2.5): `cases_recovered` (case-level, per A2.1.1/A2.3.2) against a
+    spurious hit count from the 200 matched negatives.
 
     Spec A2.5 is explicit that this is benchmark precision on a constructed
     ~20:200 sample, NOT expected field precision at real-world prevalence --
@@ -513,17 +601,31 @@ def main() -> None:
 
     manifest_result = load_gold_manifest(args.manifest)
     concentrated_cases = [c for c in manifest_result.cases if c.is_concentrated]
+    psc_rows = [r for r in manifest_result.admissible if r.is_psc_sourced]
 
     print(f"=== GOLD MANIFEST: {args.manifest} ===")
     print(f"admissible rows : {len(manifest_result.admissible)}")
-    print(f"distinct cases  : {len(manifest_result.cases)}  (unit of analysis -- spec A2.1.1)")
+    print(
+        f"distinct cases  : {len(manifest_result.cases)}"
+        "  (unit of analysis -- awardee company, spec A2.3.2)"
+    )
     print(f"inadmissible    : {len(manifest_result.inadmissible)}")
     for row in manifest_result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
     if concentrated_cases:
-        print("\nconcentrated cases (>1 row -- spec A2.1.1 requires these listed explicitly):")
+        print(
+            "\nconcentrated cases (>1 row -- spec A2.1.1/A2.3.2 requires these listed explicitly):"
+        )
         for case in concentrated_cases:
-            print(f"  {case.case_key}: {case.row_count} rows -- {[r.case_id for r in case.rows]}")
+            print(
+                f"  {case.case_key}: {case.row_count} rows, {case.award_count} distinct award(s) "
+                f"-- {[r.case_id for r in case.rows]}"
+            )
+    if psc_rows:
+        print(
+            f"\nPSC-sourced rows (spec A2.3.3, expected unrecoverable by design): "
+            f"{len(psc_rows)} -- {[r.case_id for r in psc_rows]}"
+        )
 
     if args.skip_controls:
         positive_controls = json.loads(
@@ -584,11 +686,13 @@ def main() -> None:
     cases_undated_only = _count(case_evaluations, "undated_only")
     cases_not_recovered = _count(case_evaluations, "not_recovered")
     cases_untestable = _count(case_evaluations, "untestable")
+    cases_no_trace_by_design = _count(case_evaluations, "no_trace_by_design")
 
     rows_recovered = _count(row_evaluations, "recovered")
     rows_undated_only = _count(row_evaluations, "undated_only")
     rows_not_recovered = _count(row_evaluations, "not_recovered")
     rows_untestable = _count(row_evaluations, "untestable")
+    rows_no_trace_by_design = _count(row_evaluations, "no_trace_by_design")
 
     benchmark_precision = compute_precision(cases_recovered, negatives_recovered)
     sensitivity = cases_recovered / len(manifest_result.cases) if manifest_result.cases else 0.0
@@ -608,7 +712,7 @@ def main() -> None:
     unverifiable = [c for c in case_evaluations if c.source_separation == "cannot_verify"]
 
     print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops, case-level) ===")
-    print(f"cases total (distinct)            : {len(manifest_result.cases)}")
+    print(f"cases total (distinct awardees)    : {len(manifest_result.cases)}")
     print(f"  recovered (pre-award)            : {cases_recovered}")
     print(
         f"  undated_only (temporal unknown)  : {cases_undated_only}"
@@ -617,9 +721,13 @@ def main() -> None:
     print(f"  not_recovered (real miss)        : {cases_not_recovered}")
     print(f"  untestable (unresolved)          : {cases_untestable}  -- excluded from denominators")
     print(
+        f"  no_trace_by_design (PSC, A2.3.3) : {cases_no_trace_by_design}"
+        "  -- expected, never a refutation"
+    )
+    print(
         f"rows (secondary, non-headline)    : recovered={rows_recovered} "
         f"undated_only={rows_undated_only} not_recovered={rows_not_recovered} "
-        f"untestable={rows_untestable}"
+        f"untestable={rows_untestable} no_trace_by_design={rows_no_trace_by_design}"
     )
     print(
         f"retrieval controls                : {retrieval_controls_recovered}/"
@@ -667,8 +775,14 @@ def main() -> None:
             "undated_only": cases_undated_only,
             "not_recovered": cases_not_recovered,
             "untestable": cases_untestable,
+            "no_trace_by_design": cases_no_trace_by_design,
             "concentrated": [
-                {"case_key": c.case_key, "row_count": c.row_count, "row_case_ids": c.row_case_ids}
+                {
+                    "case_key": c.case_key,
+                    "row_count": c.row_count,
+                    "award_count": c.award_count,
+                    "row_case_ids": c.row_case_ids,
+                }
                 for c in concentrated_cases
             ],
         },
@@ -678,6 +792,8 @@ def main() -> None:
             "undated_only": rows_undated_only,
             "not_recovered": rows_not_recovered,
             "untestable": rows_untestable,
+            "no_trace_by_design": rows_no_trace_by_design,
+            "psc_sourced": [r.case_id for r in psc_rows],
             "note": "secondary figure only -- spec A2.1.1 forbids row-level as a headline",
         },
         "retrieval_controls": {
@@ -713,7 +829,9 @@ def main() -> None:
             {
                 "case_key": c.case_key,
                 "company_number": c.company_number,
-                "award_date": c.award_date,
+                "row_count": c.row_count,
+                "award_count": c.award_count,
+                "earliest_award_date": c.earliest_award_date,
                 "row_case_ids": c.row_case_ids,
                 "status": c.status,
                 "source_separation": c.source_separation,

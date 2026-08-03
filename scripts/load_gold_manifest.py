@@ -1,13 +1,16 @@
 """Load and validate the Phase C gold manifest against the pre-registration spec.
 
 Spec (LOCKED, do not deviate): vault
-`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`.
-Sections 2 (admissibility) and 4 (schema) are binding here.
+`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
+including amendments v2.1 (unit of analysis) and v2.3 (manifest schema
+semantics + the case key). Sections 2 and 4, and both amendments, are binding.
 
 A manifest row is admissible only if it satisfies every spec SS2 criterion this
 loader can decide mechanically from the manifest's own columns:
 
-  1. `company_number` is present (SS2.2 -- the company-side registry identifier).
+  1. `company_number` is present (SS2.2 -- the company-side registry identifier)
+     AND is explicitly confirmed to be the AWARDEE, not inferred (spec A2.3.1 --
+     see `awardee_confirmed` below).
   2. `label_source_url` is present (SS2.1 -- how the relationship was
      independently established must trace to a primary document).
   3. `award_date` parses as an ISO date (SS2.3 -- pre-award must be decidable
@@ -30,16 +33,35 @@ Company numbers are normalised with the project's canonical Companies House
 normaliser (`uncorrupt.staging.companies_house.normalise_company_number`)
 rather than re-implementing the zero-padding rule a second time.
 
-UNIT OF ANALYSIS (spec amendment v2.1, A2.1.1): a CASE is the distinct pair
-`(company_number, award_date)`, not a row. Candidate sourcing produced rows
-that are not independent -- one company+award event can be named by several
-people, and the same case can be surfaced twice by different sourcing
-families. Recovering one heavily-populated case must never look like
-recovering several. Every admissible row is therefore grouped into a
-`GoldCase` at load time (`ManifestLoadResult.cases`); multiple rows on one
-case collapse into that ONE case, and the benchmark runner scores cases, not
-rows (row-level counts are still reported, but only as a secondary figure --
-see spec A2.1.1: "Row-level alone is forbidden as a headline.").
+AWARDEE VS INTERMEDIARY (spec amendment v2.3, A2.3.1): parallel sourcing
+produced two incompatible readings of `company_number` -- most families
+recorded the awardee (the supplier receiving public money), but the
+donations family recorded the donor. `company_number` means the AWARDEE,
+always; a donor/linking entity goes in the separate `intermediary_company_number`
+column and is part of the *path*, not the endpoint. This loader does not try
+to infer which reading a row used from free text -- it REJECTS any row where
+`awardee_confirmed` is not explicitly asserted true, rather than guess.
+
+UNIT OF ANALYSIS (spec amendments v2.1 A2.1.1, narrowed by v2.3 A2.3.2): a
+CASE is the distinct AWARDEE `company_number` -- not `(company_number,
+award_date)` as v2.1 first set it. PPE Medpro-style companies holding
+multiple separate awards from one underlying relationship would otherwise
+count as multiple cases and score a single relationship twice. What actually
+determines recovery is officer coverage of the awardee company, so rows
+sharing an awardee are correlated, not independent. Every admissible row is
+grouped into a `GoldCase` at load time (`ManifestLoadResult.cases`); the
+benchmark runner scores cases, not rows, using each case's EARLIEST
+qualifying award date for the temporal test (row-level counts and per-case
+award counts are still reported, but only as a secondary figure -- spec
+A2.1.1: "Row-level alone is forbidden as a headline.").
+
+PSC DATA (spec amendment v2.3, A2.3.3 -- an OPEN governance question, not
+settled by this loader): a row whose relationship rests only on
+Persons-with-Significant-Control data records `established_by: PSC`. Such a
+row is NOT rejected and NOT silently kept unflagged -- `GoldRow.is_psc_sourced`
+marks it, because PSC is a label source only (never ingested for retrieval),
+so it is expected to be unrecoverable by design. The benchmark runner treats
+that expected non-recovery as an honest "no trace", never a refutation.
 
 Usage:
     PYTHONPATH=.:src python scripts/load_gold_manifest.py data/gold_manifest.csv
@@ -67,6 +89,8 @@ from uncorrupt.staging.companies_house import normalise_company_number  # noqa: 
 # Spec SS4 schema -- exact column names. Two of Phase C v1's four defects were
 # wrong column names; failing loudly on a header mismatch is the "head -1"
 # check SS7.3 requires, done in code instead of by hand.
+# `intermediary_company_number` and `awardee_confirmed` added by spec
+# amendment v2.3 (A2.3.1).
 REQUIRED_COLUMNS = (
     "case_id",
     "person_name",
@@ -79,7 +103,16 @@ REQUIRED_COLUMNS = (
     "award_date",
     "relationship_start",
     "excluded_from_retrieval",
+    "intermediary_company_number",
+    "awardee_confirmed",
 )
+
+# spec A2.3.3: the established_by value flagging a row whose relationship
+# rests only on Persons-with-Significant-Control data.
+PSC_LABEL_SOURCE = "PSC"
+
+_AWARDEE_CONFIRMED_TRUTHY = {"yes", "true", "y", "1"}
+_AWARDEE_CONFIRMED_FALSY = {"no", "false", "n", "0"}
 
 
 @dataclass(frozen=True)
@@ -97,6 +130,17 @@ class GoldRow:
     award_date: date
     relationship_start: date
     excluded_from_retrieval: tuple[str, ...]
+    intermediary_company_number: str | None
+
+    @property
+    def is_psc_sourced(self) -> bool:
+        """Spec A2.3.3: this row's relationship rests only on PSC data.
+
+        Not rejected, not silently kept unflagged -- the benchmark runner
+        treats an expected non-recovery on a PSC-sourced row as an honest
+        "no trace" by design, never a refutation.
+        """
+        return self.established_by.strip().upper() == PSC_LABEL_SOURCE
 
 
 @dataclass(frozen=True)
@@ -110,27 +154,53 @@ class InadmissibleRow:
 
 @dataclass(frozen=True)
 class GoldCase:
-    """One distinct case (spec A2.1.1): the pair `(company_number, award_date)`.
+    """One distinct case (spec A2.3.2): the AWARDEE `company_number` alone --
+    narrowed from v2.1's `(company_number, award_date)` pair.
 
-    Multiple admissible rows sharing this key -- multiple people tied to the
-    same company and award event, or the same case surfaced twice by
-    different sourcing families -- collapse into ONE case. They may raise
-    within-case confidence (more independent people named for the same
-    company+award is stronger evidence); they never multiply the case count
-    a threshold is measured against.
+    Multiple admissible rows sharing this awardee -- multiple people tied to
+    the company, and/or multiple separate awards to it -- collapse into ONE
+    case. What determines recovery is officer coverage of the awardee
+    company: if that company's officers are in the graph, most linked
+    officials are findable; if not, none are. Rows sharing an awardee are
+    therefore correlated, not independent (A2.3.2) -- PPE Medpro's two
+    separate DHSC awards from one underlying relationship must never score
+    as two recovered cases.
     """
 
     company_number: str
-    award_date: date
     rows: tuple[GoldRow, ...]
 
     @property
     def case_key(self) -> str:
-        return f"{self.company_number}@{self.award_date.isoformat()}"
+        return self.company_number
 
     @property
     def row_count(self) -> int:
         return len(self.rows)
+
+    @property
+    def distinct_award_dates(self) -> tuple[date, ...]:
+        return tuple(sorted({row.award_date for row in self.rows}))
+
+    @property
+    def award_count(self) -> int:
+        """How many distinct awards this case subsumes -- spec A2.3.2
+        requires this reported per case alongside row_count, so
+        concentration from either source (extra people, or extra awards to
+        the same company) is visible."""
+        return len(self.distinct_award_dates)
+
+    @property
+    def earliest_award_date(self) -> date:
+        """The earliest qualifying award date across the case's rows.
+
+        Spec A2.3.2: the temporal recovery test for a multi-award case uses
+        this date, not any individual row's own `award_date` -- the
+        strictest (hardest-to-satisfy) cutoff available, since a
+        relationship pre-dating the earliest award necessarily pre-dates
+        every later one from the same company too.
+        """
+        return min(row.award_date for row in self.rows)
 
     @property
     def is_concentrated(self) -> bool:
@@ -141,19 +211,17 @@ class GoldCase:
 
 
 def _group_into_cases(rows: list[GoldRow]) -> list[GoldCase]:
-    """Group admissible rows into cases by `(company_number, award_date)`.
+    """Group admissible rows into cases by the AWARDEE `company_number` alone
+    (spec A2.3.2).
 
     Grouping order follows first appearance in the (already row-order-
     preserving) admissible list, so the result is deterministic for a given
     manifest.
     """
-    grouped: dict[tuple[str, date], list[GoldRow]] = defaultdict(list)
+    grouped: dict[str, list[GoldRow]] = defaultdict(list)
     for row in rows:
-        grouped[(row.company_number, row.award_date)].append(row)
-    return [
-        GoldCase(company_number=key[0], award_date=key[1], rows=tuple(members))
-        for key, members in grouped.items()
-    ]
+        grouped[row.company_number].append(row)
+    return [GoldCase(company_number=key, rows=tuple(members)) for key, members in grouped.items()]
 
 
 @dataclass
@@ -213,6 +281,24 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
         if not company_number:
             reasons.append("missing company_number (spec SS2.2)")
 
+        awardee_confirmed_raw = (raw.get("awardee_confirmed") or "").strip().lower()
+        if awardee_confirmed_raw in _AWARDEE_CONFIRMED_TRUTHY:
+            awardee_confirmed = True
+        elif awardee_confirmed_raw in _AWARDEE_CONFIRMED_FALSY:
+            awardee_confirmed = False
+        else:
+            awardee_confirmed = None
+        if awardee_confirmed is not True:
+            reasons.append(
+                "company_number not confirmed as the awardee (spec A2.3.1) -- "
+                "awardee_confirmed must be explicitly 'yes', never inferred from "
+                "award_description or other free text"
+            )
+
+        intermediary_company_number = normalise_company_number(
+            raw.get("intermediary_company_number")
+        )
+
         label_source_url = (raw.get("label_source_url") or "").strip()
         if not label_source_url:
             reasons.append("missing label_source_url (spec SS2.1)")
@@ -262,6 +348,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                 award_date=award_date,
                 relationship_start=relationship_start,
                 excluded_from_retrieval=_split_sources(raw.get("excluded_from_retrieval")),
+                intermediary_company_number=intermediary_company_number,
             )
         )
 
@@ -279,27 +366,40 @@ def main() -> None:
 
     result = load_gold_manifest(args.manifest)
     concentrated = [c for c in result.cases if c.is_concentrated]
+    psc_rows = [r for r in result.admissible if r.is_psc_sourced]
 
     print(f"=== GOLD MANIFEST: {args.manifest} ===")
     print(f"admissible rows : {len(result.admissible)}")
-    print(f"distinct cases  : {len(result.cases)}  (unit of analysis -- spec A2.1.1)")
+    print(
+        f"distinct cases  : {len(result.cases)}  (unit of analysis -- awardee company, spec A2.3.2)"
+    )
     print(f"inadmissible    : {len(result.inadmissible)}")
     for row in result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
     if concentrated:
-        print("\nconcentrated cases (>1 row, spec A2.1.1 requires these listed explicitly):")
+        print("\nconcentrated cases (>1 row, spec A2.1.1/A2.3.2 requires these listed explicitly):")
         for case in concentrated:
-            print(f"  {case.case_key}: {case.row_count} rows -- {[r.case_id for r in case.rows]}")
+            print(
+                f"  {case.case_key}: {case.row_count} rows, {case.award_count} distinct award(s) "
+                f"-- {[r.case_id for r in case.rows]}"
+            )
+    if psc_rows:
+        print(
+            f"\nPSC-sourced rows (flagged, spec A2.3.3 -- expected unrecoverable by design, "
+            f"never a refutation): {len(psc_rows)} -- {[r.case_id for r in psc_rows]}"
+        )
 
     if args.out:
         payload = {
             "admissible_rows": [r.case_id for r in result.admissible],
+            "psc_sourced_rows": [r.case_id for r in psc_rows],
             "cases": [
                 {
                     "case_key": c.case_key,
                     "company_number": c.company_number,
-                    "award_date": c.award_date.isoformat(),
                     "row_count": c.row_count,
+                    "award_count": c.award_count,
+                    "earliest_award_date": c.earliest_award_date.isoformat(),
                     "row_case_ids": [r.case_id for r in c.rows],
                 }
                 for c in result.cases

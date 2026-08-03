@@ -193,6 +193,7 @@ def ingest_officer_appointments(
     input_dir: str | Path,
     batch_size: int = 500,
     progress_every: int = 2000,
+    selection_rule: str | None = None,
 ) -> dict[str, int]:
     """Turn cached appointment lists into `officer_of` edges.
 
@@ -202,6 +203,11 @@ def ingest_officer_appointments(
     client dies at minute 20 -- which is exactly what happened twice. Because
     every write is a `get_or_create`, a partially-completed run is safe to
     re-run: it resumes rather than duplicating.
+
+    `selection_rule`, when given, is stamped onto `Edge.properties
+    ["selection_rule"]` for every officer_of edge newly created by this call
+    -- see `ch_officers.ingest_company_officers` for why this is
+    first-write-only (a re-run under a different rule never overwrites it).
 
     Returns {edges_created, officers_processed, appointments_seen,
     company_unmatched, officer_missing, inconsistent_dates}.
@@ -277,6 +283,9 @@ def ingest_officer_appointments(
                         properties["resignation_status"] = "ended_date_unknown"
 
                     valid_from = _parse_ch_date(item.get("appointed_on"))
+
+                    if selection_rule:
+                        properties["selection_rule"] = selection_rule
 
                     # Companies House contains appointments that resigned BEFORE
                     # they were appointed (real example: appointed 1993-02-22,

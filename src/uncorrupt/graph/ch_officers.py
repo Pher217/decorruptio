@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -110,6 +111,8 @@ from uncorrupt.staging.models import Company, SupplierResolution
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 SOURCE_NAME = "Companies House"
 API_KEY_ENV_VAR = "COMPANIES_HOUSE_API_KEY"
+
+logger = logging.getLogger(__name__)
 
 # Allowlist of officer fields we actually need — everything else the API
 # returns (former_names, occupation, country_of_residence, contact_details,
@@ -198,6 +201,15 @@ def fetch_company_officers(
     `output_dir`. Callers are expected to point `output_dir` at a
     gitignored path (e.g. `experiments/`) — this function does not commit
     anything.
+
+    A single company's fetch failing (exhausted retries, a non-retryable
+    HTTP error) does not abort the whole run: the failure is logged and
+    that company is skipped -- it is simply absent from the returned list
+    (no cache files are written for it either, so it is picked up again as
+    pending on the next invocation). Mirrors the same per-item resilience
+    already used in `ch_appointments.fetch_officer_appointments` -- an
+    unattended multi-hour sweep across tens of thousands of companies must
+    survive one bad company, not die on it.
     """
     api_key = api_key or _require_api_key()
     output_dir = Path(output_dir)
@@ -230,7 +242,11 @@ def fetch_company_officers(
                     continue
 
             source_url = f"{CH_API_BASE}/company/{company_number}/officers"
-            items = _fetch_all_officer_pages(client, source_url, items_per_page, max_retries)
+            try:
+                items = _fetch_all_officer_pages(client, source_url, items_per_page, max_retries)
+            except (httpx.HTTPError, RuntimeError) as exc:
+                logger.warning("officers fetch failed for %s: %s", company_number, exc)
+                continue
             items = [_strip_personal_fields(item) for item in items]
 
             json_path.write_text(json.dumps(items, indent=2))
@@ -349,13 +365,27 @@ def procurement_supplier_universe() -> list[str]:
     coverage only where the benchmark already looks would manufacture the
     very result the expansion is meant to test.
 
+    The true invariant is `company__isnull=False` -- a verified FK to an
+    actual `staging.Company` row -- NOT `company_number__isnull=False`.
+    `resolve_suppliers` (`staging/companies_house.py`) sets `company_number`
+    to the raw, unverified external identifier even when the match against
+    the CH bulk snapshot **failed** (`company=None`, `match_confidence=0.0`,
+    see the "GB-COH identifier ... not found" branch there) -- so filtering
+    on `company_number` alone silently admits unmatched identifiers into the
+    universe. `company__isnull=False` and `match_confidence__gt=0` are
+    equivalent given how `resolve_suppliers` writes rows (every branch that
+    sets `company` also sets a positive confidence, and vice versa); the FK
+    is used here because it is the structural fact, not a derived number
+    that could drift if a future match tier assigns partial confidence
+    without a resolved company.
+
     Ordering is stable (company_number ascending) only so the *set* this
     function returns is reproducible before `salted_hash_order` is applied
     to it for traversal -- it is not meant to be used as the traversal
     order itself.
     """
     numbers = (
-        SupplierResolution.objects.filter(company_number__isnull=False)
+        SupplierResolution.objects.filter(company__isnull=False)
         .values_list("company_number", flat=True)
         .distinct()
         .order_by("company_number")
@@ -462,7 +492,7 @@ def officer_ids_for_companies(company_numbers: Sequence[str]) -> list[str]:
     return [r for r in registry_ids if r is not None]
 
 
-def coverage_report() -> dict[str, int]:
+def coverage_report() -> dict[str, Any]:
     """Report GB-COH officer coverage without mutating any data.
 
     Splits all `GB-COH` company Entities into three tiers so "no officer
@@ -483,13 +513,41 @@ def coverage_report() -> dict[str, int]:
 
     `direct_roster_fetch + appointment_hop_only + zero_officers ==
     total_gb_coh_companies` always (strict partition).
+
+    `direct_roster_fetch_by_universe_membership` further splits
+    `direct_roster_fetch` by whether the company is inside TODAY'S
+    benchmark-independent `procurement_supplier_universe()` -- blending the
+    pre-feature seed (which may have been assembled by hand, potentially
+    from benchmark rows -- there is no recorded provenance for edges
+    created before `selection_rule` tagging existed) with the clean
+    universe would hide exactly the contamination this expansion exists to
+    fix. This is a live re-check against the current universe, not a read
+    of any persisted tag -- most existing edges predate `selection_rule`
+    tagging entirely and would otherwise show as unlabelled either way.
     """
     company_ids = set(
         Entity.objects.filter(entity_type="company", registry_scheme="GB-COH").values_list(
             "id", flat=True
         )
     )
-    return {"total_gb_coh_companies": len(company_ids), **_officer_coverage_tiers(company_ids)}
+    tiers = _officer_coverage_tiers(company_ids)
+    direct_fetch_ids = _direct_roster_fetch_entity_ids(company_ids)
+    universe = set(procurement_supplier_universe())
+    in_universe = len(
+        set(
+            Entity.objects.filter(id__in=direct_fetch_ids, company_number__in=universe).values_list(
+                "id", flat=True
+            )
+        )
+    )
+    return {
+        "total_gb_coh_companies": len(company_ids),
+        **tiers,
+        "direct_roster_fetch_by_universe_membership": {
+            "in_procurement_universe": in_universe,
+            "outside_procurement_universe": tiers["direct_roster_fetch"] - in_universe,
+        },
+    }
 
 
 def procurement_universe_coverage_report() -> dict[str, int]:
@@ -518,13 +576,9 @@ def procurement_universe_coverage_report() -> dict[str, int]:
     }
 
 
-def _officer_coverage_tiers(company_ids: set[int]) -> dict[str, int]:
-    """Partition `company_ids` (GB-COH company Entity ids) into three officer-coverage tiers.
-
-    See `coverage_report` for what `direct_roster_fetch` /
-    `appointment_hop_only` / `zero_officers` mean.
-    """
-    direct_fetch_ids = set(
+def _direct_roster_fetch_entity_ids(company_ids: set[int]) -> set[int]:
+    """Entity ids among `company_ids` with at least one direct `/officers` roster fetch."""
+    return set(
         Attestation.objects.filter(
             source_name=SOURCE_NAME,
             source_url__endswith="/officers",
@@ -532,11 +586,25 @@ def _officer_coverage_tiers(company_ids: set[int]) -> dict[str, int]:
             edge__target_entity_id__in=company_ids,
         ).values_list("edge__target_entity_id", flat=True)
     )
-    any_officer_ids = set(
+
+
+def _any_officer_entity_ids(company_ids: set[int]) -> set[int]:
+    """Entity ids among `company_ids` with at least one officer_of edge of any provenance."""
+    return set(
         Edge.objects.filter(edge_type="officer_of", target_entity_id__in=company_ids).values_list(
             "target_entity_id", flat=True
         )
     )
+
+
+def _officer_coverage_tiers(company_ids: set[int]) -> dict[str, int]:
+    """Partition `company_ids` (GB-COH company Entity ids) into three officer-coverage tiers.
+
+    See `coverage_report` for what `direct_roster_fetch` /
+    `appointment_hop_only` / `zero_officers` mean.
+    """
+    direct_fetch_ids = _direct_roster_fetch_entity_ids(company_ids)
+    any_officer_ids = _any_officer_entity_ids(company_ids)
     return {
         "direct_roster_fetch": len(direct_fetch_ids),
         "appointment_hop_only": len(any_officer_ids - direct_fetch_ids),
@@ -563,7 +631,9 @@ def append_run_manifest(output_dir: str | Path, **fields: Any) -> Path:
 
 
 def ingest_company_officers(
-    company_numbers: Sequence[str], input_dir: str | Path
+    company_numbers: Sequence[str],
+    input_dir: str | Path,
+    selection_rule: str | None = None,
 ) -> dict[str, Any]:
     """Ingest previously-fetched officer JSON files into Entity/Edge rows.
 
@@ -571,6 +641,18 @@ def ingest_company_officers(
     out of `input_dir`. Returns summary stats: {edges_created,
     companies_processed, companies_unmatched, officers_no_id,
     missing_appointed_on, unparseable_resigned_on, total_officers}.
+
+    `selection_rule`, when given, is stamped onto `Edge.properties
+    ["selection_rule"]` for every officer_of edge **newly created** by this
+    call -- provenance of *why* this edge was fetched (e.g.
+    "universe=procurement-suppliers"), independent of `coverage_report`'s
+    live universe-membership check, which can only answer that question
+    for whatever the universe looks like today. Because the edge is
+    `get_or_create`d, only the first ingest to create a given edge sets
+    this: a later re-fetch of the same company under a different rule does
+    not overwrite it. That is intentional -- the tag answers "was this edge
+    ever selected via an unlabelled/legacy path", and a fetch that finds an
+    edge already exists changes nothing about how it first came to exist.
     """
     input_dir = Path(input_dir)
     edges_created = 0
@@ -663,6 +745,9 @@ def ingest_company_officers(
                 role = (item.get("officer_role") or "").strip()
                 if role:
                     edge_properties["officer_role"] = role
+
+                if selection_rule:
+                    edge_properties["selection_rule"] = selection_rule
 
                 appointment_ref = _parse_appointment_self_link(item)
                 if appointment_ref:

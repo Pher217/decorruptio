@@ -33,11 +33,21 @@ manufactured result:
   requests / 5 minutes, so a full sweep runs as many resumable partial
   invocations, not one). Re-running with the same candidate set picks up
   where the previous invocation left off.
-- Every run appends a record to the manifest (selection rule, salt,
-  timestamp, counts) so a partial run's history is auditable.
+- Every run appends a manifest record (selection rule, salt, timestamp,
+  the exact selected batch) BEFORE any network I/O, and a second,
+  correlated record with outcome counts afterward -- so a fetch that dies
+  partway through (exhausted retries, the process killed) still leaves a
+  record of what it was attempting, not just of what it finished.
+- A single company's fetch failing does not abort the run: it is logged
+  and skipped (no cache written for it), so it is simply picked up as
+  pending again on the next invocation.
 - `--expand-appointments` walks exactly one additional appointment
   frontier for the officers discovered in this run's batch, then stops --
   no recursive re-expansion.
+- Every newly-created officer_of edge is tagged with the selection rule
+  that produced it (`Edge.properties["selection_rule"]`) for future
+  provenance -- see `ch_officers.coverage_report` for how this is
+  cross-checked against the live procurement-supplier universe.
 
 Usage:
     uv run python scripts/ingest_ch_officers.py --universe procurement-suppliers --limit 500
@@ -52,6 +62,7 @@ import argparse
 import json
 import os
 import secrets
+import uuid
 
 import django
 
@@ -108,13 +119,21 @@ def _load_or_create_salt(output_dir: Path, explicit_salt: str | None) -> str:
     return secrets.token_hex(16)
 
 
+def _print_report(report: dict[str, object]) -> None:
+    for key, value in report.items():
+        if isinstance(value, dict):
+            print(f"  {key}:")
+            for sub_key, sub_value in value.items():
+                print(f"    {sub_key}: {sub_value:,}")
+        else:
+            print(f"  {key}: {value:,}")
+
+
 def _print_coverage_reports() -> None:
     print("=== GB-COH officer coverage (all graph entities) ===")
-    for key, value in coverage_report().items():
-        print(f"  {key}: {value:,}")
+    _print_report(coverage_report())
     print("\n=== GB-COH officer coverage (procurement-supplier universe) ===")
-    for key, value in procurement_universe_coverage_report().items():
-        print(f"  {key}: {value:,}")
+    _print_report(procurement_universe_coverage_report())
 
 
 def main() -> None:
@@ -212,18 +231,40 @@ def main() -> None:
         f"(limit={args.limit if args.limit is not None else 'none'}, salt={salt})"
     )
 
+    # Record the selection BEFORE any network I/O: salt, universe definition
+    # (selection_rule), universe size, and the exact selected batch. A
+    # fetch that later dies partway through (exhausted retries, the process
+    # being killed) must not lose the only record of what this run was
+    # even attempting -- that record is what makes a partial sweep
+    # reproducible, not just its eventual success.
+    run_id = uuid.uuid4().hex
+    append_run_manifest(
+        output_dir,
+        run_id=run_id,
+        phase="selected",
+        selection_rule=selection_rule,
+        salt=salt,
+        limit=args.limit,
+        candidate_count=len(company_numbers),
+        selected_companies=batch,
+    )
+
     if not batch:
         print("nothing to do -- every candidate already has a valid cache entry")
         return
 
-    fetched = cached = 0
+    fetched = cached = failed = 0
     if not args.skip_fetch:
         results = fetch_company_officers(batch, output_dir, max_cache_age_days=args.max_age_days)
         fetched = sum(1 for r in results if not r.cached)
         cached = sum(1 for r in results if r.cached)
-        print(f"Fetched {fetched} companies ({cached} already cached) -> {output_dir}")
+        failed = len(batch) - len(results)
+        print(
+            f"Fetched {fetched} companies ({cached} already cached, {failed} failed) "
+            f"-> {output_dir}"
+        )
 
-    summary = ingest_company_officers(batch, output_dir)
+    summary = ingest_company_officers(batch, output_dir, selection_rule=selection_rule)
     print(
         f"Ingested: {summary['edges_created']} officer edges "
         f"({summary['officers_no_id']} without a stable officer ID), "
@@ -233,15 +274,19 @@ def main() -> None:
         f"{summary['missing_appointed_on']} missing appointed_on)"
     )
 
+    # Update with results afterward -- a second, correlated JSONL line
+    # rather than rewriting the "selected" line in place: append-only is
+    # safe against a concurrent/interrupted writer, an in-place rewrite of
+    # a shared audit file is not.
     append_run_manifest(
         output_dir,
+        run_id=run_id,
+        phase="completed",
         selection_rule=selection_rule,
         salt=salt,
-        limit=args.limit,
-        candidate_count=len(company_numbers),
-        attempted_companies=batch,
         fetched=fetched,
         cached=cached,
+        failed=failed,
         ingest_summary=summary,
     )
 
@@ -253,12 +298,29 @@ def main() -> None:
         )
         if officer_ids:
             appointments_output_dir = Path(args.appointments_output_dir)
+            appointments_selection_rule = (
+                "single appointment frontier for officers discovered in companies "
+                f"batch of {len(batch)} (see {output_dir}/run_manifest.jsonl, run_id={run_id})"
+            )
+            appointments_run_id = uuid.uuid4().hex
+            append_run_manifest(
+                appointments_output_dir,
+                run_id=appointments_run_id,
+                phase="selected",
+                selection_rule=appointments_selection_rule,
+                salt=salt,
+                requested_officers=len(officer_ids),
+                selected_officers=officer_ids,
+            )
+
             counts = fetch_officer_appointments(officer_ids, appointments_output_dir)
             print(
                 f"appointments fetched {counts['fetched']}, cached {counts['cached']}, "
                 f"failed {counts['failed']}"
             )
-            appointment_stats = ingest_officer_appointments(officer_ids, appointments_output_dir)
+            appointment_stats = ingest_officer_appointments(
+                officer_ids, appointments_output_dir, selection_rule=appointments_selection_rule
+            )
             print(
                 f"Appointments ingested: {appointment_stats['edges_created']} officer_of edges "
                 f"from {appointment_stats['officers_processed']} officers "
@@ -267,12 +329,10 @@ def main() -> None:
             )
             append_run_manifest(
                 appointments_output_dir,
-                selection_rule=(
-                    "single appointment frontier for officers discovered in companies "
-                    f"batch of {len(batch)} (see {output_dir}/run_manifest.jsonl)"
-                ),
+                run_id=appointments_run_id,
+                phase="completed",
+                selection_rule=appointments_selection_rule,
                 salt=salt,
-                requested_officers=len(officer_ids),
                 fetch_counts=counts,
                 ingest_summary=appointment_stats,
             )

@@ -307,6 +307,49 @@ class TestChOfficersIngest:
         assert "Jonny" not in serialized
 
 
+@pytest.mark.django_db
+class TestIngestCompanyOfficersSelectionRule:
+    def test_selection_rule_is_stamped_on_newly_created_edge(self, tmp_path):
+        """GIVEN a selection_rule WHEN a new officer_of edge is created THEN the edge's
+        properties record that selection_rule -- provenance of why this edge was ever
+        fetched, independent of any live universe-membership re-check."""
+        Company.objects.create(company_number="12410514", company_name="PPE Medpro Ltd")
+        _write_cache(tmp_path, "12410514", [RAW_OFFICER_ITEM])
+
+        ingest_company_officers(
+            ["12410514"], tmp_path, selection_rule="universe=procurement-suppliers"
+        )
+
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
+        assert edge.properties["selection_rule"] == "universe=procurement-suppliers"
+
+    def test_selection_rule_is_not_overwritten_on_re_ingest_under_a_different_rule(self, tmp_path):
+        """GIVEN an edge already created under one selection_rule WHEN re-ingested
+        (get_or_create matches the existing edge) under a DIFFERENT selection_rule THEN
+        the original rule is preserved -- get_or_create only applies `defaults` at
+        creation, so a later fetch under a new rule cannot rewrite provenance for an
+        edge that already existed."""
+        Company.objects.create(company_number="12410514", company_name="PPE Medpro Ltd")
+        _write_cache(tmp_path, "12410514", [RAW_OFFICER_ITEM])
+        ingest_company_officers(["12410514"], tmp_path, selection_rule="first-rule")
+
+        ingest_company_officers(["12410514"], tmp_path, selection_rule="second-rule")
+
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
+        assert edge.properties["selection_rule"] == "first-rule"
+
+    def test_no_selection_rule_leaves_properties_without_the_key(self, tmp_path):
+        """GIVEN no selection_rule argument (existing call sites, unchanged) WHEN
+        ingesting THEN the edge's properties contain no selection_rule key at all."""
+        Company.objects.create(company_number="12410514", company_name="PPE Medpro Ltd")
+        _write_cache(tmp_path, "12410514", [RAW_OFFICER_ITEM])
+
+        ingest_company_officers(["12410514"], tmp_path)
+
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
+        assert "selection_rule" not in edge.properties
+
+
 class TestChOfficersFetchStripsPersonalFields:
     def test_fetch_strips_personal_fields_before_caching_to_disk(self, tmp_path, monkeypatch):
         """DOB/address/nationality are stripped before the raw response ever touches disk."""
@@ -416,6 +459,43 @@ class TestChOfficersFetchStripsPersonalFields:
         results = fetch_company_officers(["12410514"], tmp_path, client=client)
         assert call_count == 1
         assert results[0].cached is True
+
+
+class TestFetchCompanyOfficersPerCompanyFailure:
+    def test_one_company_failing_does_not_abort_the_batch(self, tmp_path, monkeypatch):
+        """GIVEN one company whose fetch raises a non-retryable HTTP error WHEN fetching
+        a batch of two THEN the OTHER company is still fetched successfully -- a single
+        bad company must not kill a multi-hour sweep."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "00000001" in str(request.url):
+                return httpx.Response(403)
+            return httpx.Response(200, json={"items": [RAW_OFFICER_ITEM], "total_results": 1})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        results = fetch_company_officers(
+            ["00000001", "00000002"], tmp_path, client=client, polite_delay_seconds=0
+        )
+
+        assert [r.company_number for r in results] == ["00000002"]
+
+    def test_failed_company_writes_no_cache_file(self, tmp_path, monkeypatch):
+        """GIVEN a company whose fetch fails WHEN fetching THEN no cache file is written
+        for it, so `select_next_pending` still treats it as pending on the next
+        invocation rather than silently marking it done."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        fetch_company_officers(["00000001"], tmp_path, client=client, polite_delay_seconds=0)
+
+        assert not (tmp_path / "00000001.json").exists()
+        assert not (tmp_path / "00000001.provenance.json").exists()
 
 
 def _write_valid_cache(
@@ -529,11 +609,13 @@ class TestSaltedHashOrder:
 @pytest.mark.django_db
 class TestProcurementSupplierUniverse:
     def test_returns_distinct_resolved_company_numbers(self):
-        """GIVEN two supplier resolutions pointing at the same company WHEN building the
-        universe THEN the company number appears exactly once."""
+        """GIVEN two verified supplier resolutions pointing at the same company WHEN
+        building the universe THEN the company number appears exactly once."""
+        company = Company.objects.create(company_number="00000001", company_name="Acme Ltd")
         SupplierResolution.objects.create(
             source_id="uk_contracts_finder",
             supplier_name="Acme Ltd",
+            company=company,
             company_number="00000001",
             match_confidence=1.0,
             match_method="identifier",
@@ -541,6 +623,7 @@ class TestProcurementSupplierUniverse:
         SupplierResolution.objects.create(
             source_id="uk_contracts_finder",
             supplier_name="Acme Limited",
+            company=company,
             company_number="00000001",
             match_confidence=0.9,
             match_method="exact_name",
@@ -556,9 +639,33 @@ class TestProcurementSupplierUniverse:
         SupplierResolution.objects.create(
             source_id="uk_contracts_finder",
             supplier_name="Unknown Supplier Ltd",
+            company=None,
             company_number=None,
             match_confidence=0.0,
             match_method=None,
+        )
+
+        universe = procurement_supplier_universe()
+
+        assert universe == []
+
+    def test_excludes_unverified_identifier_that_carries_a_company_number(self):
+        """GIVEN a GB-COH identifier match that FAILED against the CH bulk snapshot --
+        `resolve_suppliers` still sets `company_number=sid` (the raw, unverified
+        external identifier) even though `company=None` and `match_confidence=0.0`
+        (see `staging/companies_house.py`'s "not found in CH bulk snapshot" branch) --
+        WHEN building the universe THEN that row is excluded. Filtering on
+        `company_number__isnull=False` alone would wrongly admit it."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Ghost Supplier Ltd",
+            supplier_id_scheme="GB-COH",
+            supplier_id="09999999",
+            company=None,
+            company_number="09999999",
+            match_confidence=0.0,
+            match_method=None,
+            normalisation_note="GB-COH identifier '09999999' not found in CH bulk snapshot.",
         )
 
         universe = procurement_supplier_universe()
@@ -687,26 +794,40 @@ class TestCoverageReport:
             == report["total_gb_coh_companies"]
         )
 
+    def test_direct_roster_fetch_split_by_universe_membership(self):
+        """GIVEN one direct-roster-fetch company inside the procurement-supplier
+        universe and one outside it WHEN reporting coverage THEN
+        direct_roster_fetch_by_universe_membership attributes each to the right side --
+        this is the split that tells apart the old (potentially benchmark-tainted)
+        seed from today's clean universe, rather than blending them."""
+        in_universe = _make_company_entity("00000007")
+        _make_verified_supplier_resolution("00000007", "In Universe Ltd")
+        outside_universe = _make_company_entity("00000008")
+        _make_officer_of_edge(
+            _make_officer_entity("officer-7"),
+            in_universe,
+            source_url="https://x/company/00000007/officers",
+        )
+        _make_officer_of_edge(
+            _make_officer_entity("officer-8"),
+            outside_universe,
+            source_url="https://x/company/00000008/officers",
+        )
+
+        report = coverage_report()
+        breakdown = report["direct_roster_fetch_by_universe_membership"]
+
+        assert breakdown["in_procurement_universe"] == 1
+        assert breakdown["outside_procurement_universe"] == 1
+
 
 @pytest.mark.django_db
 class TestProcurementUniverseCoverageReport:
     def test_universe_size_matches_distinct_resolved_suppliers(self):
-        """GIVEN two SupplierResolution rows resolving to two distinct companies WHEN
-        reporting universe coverage THEN universe_size is exactly 2."""
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Acme Ltd",
-            company_number="00000001",
-            match_confidence=1.0,
-            match_method="identifier",
-        )
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Beta Ltd",
-            company_number="00000002",
-            match_confidence=1.0,
-            match_method="identifier",
-        )
+        """GIVEN two verified SupplierResolution rows resolving to two distinct
+        companies WHEN reporting universe coverage THEN universe_size is exactly 2."""
+        _make_verified_supplier_resolution("00000001", "Acme Ltd")
+        _make_verified_supplier_resolution("00000002", "Beta Ltd")
 
         report = procurement_universe_coverage_report()
 
@@ -714,15 +835,9 @@ class TestProcurementUniverseCoverageReport:
 
     def test_company_outside_universe_is_excluded_from_report(self):
         """GIVEN a GB-COH company entity with officers but NOT referenced by any
-        SupplierResolution WHEN reporting universe coverage THEN it is not counted
-        anywhere in the universe report."""
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Acme Ltd",
-            company_number="00000001",
-            match_confidence=1.0,
-            match_method="identifier",
-        )
+        verified SupplierResolution WHEN reporting universe coverage THEN it is not
+        counted anywhere in the universe report."""
+        _make_verified_supplier_resolution("00000001", "Acme Ltd")
         outside_universe = _make_company_entity("00000099")
         _make_officer_of_edge(
             _make_officer_entity("officer-99"),
@@ -736,16 +851,11 @@ class TestProcurementUniverseCoverageReport:
         assert report["universe_with_graph_entity"] == 0
 
     def test_universe_company_with_no_graph_entity_counts_as_zero_officers(self):
-        """GIVEN a resolved supplier company that has never been touched by the graph
-        pipeline (no Entity created at all) WHEN reporting universe coverage THEN it
-        still counts towards zero_officers, and not towards universe_with_graph_entity."""
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Never Touched Ltd",
-            company_number="00000042",
-            match_confidence=1.0,
-            match_method="identifier",
-        )
+        """GIVEN a verified resolved supplier company that has never been touched by
+        the graph pipeline (no Entity created at all) WHEN reporting universe coverage
+        THEN it still counts towards zero_officers, and not towards
+        universe_with_graph_entity."""
+        _make_verified_supplier_resolution("00000042", "Never Touched Ltd")
 
         report = procurement_universe_coverage_report()
 
@@ -757,13 +867,7 @@ class TestProcurementUniverseCoverageReport:
         but no officers, and with no entity at all) WHEN reporting universe coverage
         THEN the tiers sum exactly to universe_size."""
         for i, number in enumerate(["00000001", "00000002", "00000003"]):
-            SupplierResolution.objects.create(
-                source_id="uk_contracts_finder",
-                supplier_name=f"Supplier {i}",
-                company_number=number,
-                match_confidence=1.0,
-                match_method="identifier",
-            )
+            _make_verified_supplier_resolution(number, f"Supplier {i}")
         with_officer = _make_company_entity("00000001")
         _make_company_entity("00000002")  # entity exists, no officers
         # 00000003: no Entity at all
@@ -836,6 +940,30 @@ def _make_officer_of_edge(
         match_method="identifier",
     )
     return edge
+
+
+def _make_verified_supplier_resolution(
+    company_number: str, supplier_name: str = "Test Supplier Ltd"
+) -> SupplierResolution:
+    """Create a SupplierResolution that is actually verified (`company` FK set).
+
+    Mirrors the real success path in `resolve_suppliers` -- NOT the "GB-COH
+    identifier present but never matched against the CH bulk snapshot"
+    failure path, which sets `company_number=sid` while leaving `company`
+    None and `match_confidence=0.0` (see
+    `test_excludes_unverified_identifier_that_carries_a_company_number`).
+    """
+    company, _ = Company.objects.get_or_create(
+        company_number=company_number, defaults={"company_name": supplier_name}
+    )
+    return SupplierResolution.objects.create(
+        source_id="uk_contracts_finder",
+        supplier_name=supplier_name,
+        company=company,
+        company_number=company_number,
+        match_confidence=1.0,
+        match_method="identifier",
+    )
 
 
 class TestLoadOrCreateSalt:

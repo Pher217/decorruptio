@@ -28,12 +28,11 @@ weeks. Falls back to `AcceptedDate` only if `ReceivedDate` is blank.
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
+import io
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -45,6 +44,7 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
+from uncorrupt.staging.raw import write_cached_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ EC_API_BASE = "https://search.electoralcommission.org.uk/api/csv/Donations"
 SOURCE_NAME = "Electoral Commission"
 # sources/uk_ec_donations.yml — connector refuses to run without it (ADR-001 D5)
 SOURCE_ID = "uk_ec_donations"
+CONNECTOR_VERSION = "0.1"
 
 # Donor statuses that identify an organisation we can resolve to a company.
 # "Individual" and similar person-level statuses are excluded by design
@@ -108,7 +109,7 @@ def fetch_ec_donations_csv(
     expected to point `output_dir` at a gitignored path (e.g. `experiments/`)
     — this function does not commit anything.
     """
-    load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
+    source = load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "ec_donations.csv"
@@ -156,31 +157,37 @@ def fetch_ec_donations_csv(
             client.close()
 
     header = header or []
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(header)
+    writer.writerows(rows)
+    csv_bytes = buffer.getvalue().encode("utf-8")
 
-    content_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-    retrieved_at = datetime.now(UTC)
     et_list = list(entity_types)
     source_url_template = f"{EC_API_BASE}?from={from_date}&to={to_date}&et={et_list}"
-    provenance = {
-        "source_url_template": source_url_template,
-        "retrieved_at": retrieved_at.isoformat(),
-        "content_hash": f"sha256:{content_hash}",
-        "row_count": len(rows),
-        "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-    }
-    provenance_path.write_text(json.dumps(provenance, indent=2))
+    # observed_at: left unset -- this is a live export of the CURRENT donation
+    # register, not a historical snapshot with a capture date of its own.
+    cached = write_cached_fetch(
+        csv_bytes,
+        csv_path,
+        provenance_path,
+        source=source,
+        source_url=source_url_template,
+        connector_version=CONNECTOR_VERSION,
+        extra={
+            "source_url_template": source_url_template,
+            "row_count": len(rows),
+            "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+        },
+    )
 
     return FetchResult(
         csv_path=csv_path,
         provenance_path=provenance_path,
         row_count=len(rows),
         source_url_template=source_url_template,
-        retrieved_at=retrieved_at,
-        content_hash=f"sha256:{content_hash}",
+        retrieved_at=cached.provenance.retrieved_at,
+        content_hash=cached.provenance.content_hash,
     )
 
 

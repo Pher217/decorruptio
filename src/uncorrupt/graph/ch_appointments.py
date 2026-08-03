@@ -29,23 +29,27 @@ placeholder entity.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 from django.db import transaction
 
+from uncorrupt.core.circuit_breaker import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    CircuitBreaker,
+    CircuitOpenError,
+)
 from uncorrupt.graph.ch_officers import (
     CH_API_BASE,
+    CONNECTOR_VERSION,
     DEFAULT_MAX_CACHE_AGE_DAYS,
     SOURCE_ID,
     SOURCE_NAME,
-    _cache_is_valid,
     _fetch_page_with_backoff,
     _parse_appointment_self_link,
     _parse_ch_date,
@@ -55,6 +59,7 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import normalise_company_number
 from uncorrupt.staging.models import Company
+from uncorrupt.staging.raw import read_cached_fetch, write_cached_fetch
 
 # Appointment items carry a different shape to officer items: the company is
 # in `appointed_to`, and the person's name sits on the response envelope
@@ -90,17 +95,24 @@ def fetch_officer_appointments(
     max_cache_age_days: int = DEFAULT_MAX_CACHE_AGE_DAYS,
     max_retries: int = 5,
     items_per_page: int = 50,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> dict[str, int]:
     """Fetch and cache each officer's full appointment list.
 
     Caches `{officer_id}.json` plus a `{officer_id}.provenance.json` beside
     it, so an interrupted run resumes without refetching. Returns counts:
     {fetched, cached, failed}.
+
+    A session-level circuit breaker aborts the whole sweep after
+    `max_consecutive_failures` officers in a row fail (mirrors
+    `ch_officers.fetch_company_officers`) -- distinct from the per-request
+    retry inside `_fetch_page_with_backoff`.
     """
-    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
+    source = load_source(SOURCE_ID)  # refuses without uk_companies_house_officers.yml
     api_key = _require_api_key()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    breaker = CircuitBreaker(threshold=max_consecutive_failures)
 
     counts = {"fetched": 0, "cached": 0, "failed": 0}
 
@@ -109,14 +121,17 @@ def fetch_officer_appointments(
             json_path = output_dir / f"{officer_id}.json"
             provenance_path = output_dir / f"{officer_id}.provenance.json"
 
-            if json_path.exists() and provenance_path.exists():
-                try:
-                    provenance = json.loads(provenance_path.read_text())
-                    if _cache_is_valid(json_path, provenance, max_cache_age_days):
-                        counts["cached"] += 1
-                        continue
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    pass  # unreadable provenance ⇒ refetch rather than trust
+            cached = read_cached_fetch(
+                json_path,
+                provenance_path,
+                source=source,
+                connector_version=CONNECTOR_VERSION,
+                max_age_days=max_cache_age_days,
+            )
+            if cached is not None:
+                breaker.record_success()
+                counts["cached"] += 1
+                continue
 
             source_url = f"{CH_API_BASE}/officers/{officer_id}/appointments"
             try:
@@ -136,22 +151,30 @@ def fetch_officer_appointments(
                         break
             except (httpx.HTTPError, RuntimeError):
                 counts["failed"] += 1
+                try:
+                    breaker.record_failure()
+                except CircuitOpenError:
+                    logger.error(
+                        "appointments fetch: %d consecutive failures, aborting sweep "
+                        "after %d officers",
+                        breaker.consecutive_failures,
+                        counts["fetched"] + counts["cached"],
+                    )
+                    break
                 continue
+            breaker.record_success()
 
             stripped = [_strip_appointment(i) for i in items]
-            payload = json.dumps(stripped, indent=2).encode()
-            json_path.write_bytes(payload)
-            provenance_path.write_text(
-                json.dumps(
-                    {
-                        "officer_id": officer_id,
-                        "source_url": source_url,
-                        "retrieved_at": datetime.now(UTC).isoformat(),
-                        "appointment_count": len(stripped),
-                        "content_hash": f"sha256:{hashlib.sha256(payload).hexdigest()}",
-                    },
-                    indent=2,
-                )
+            # observed_at left unset -- a live current-register snapshot, no
+            # separate capture date of its own (mirrors ch_officers.py).
+            write_cached_fetch(
+                json.dumps(stripped, indent=2).encode(),
+                json_path,
+                provenance_path,
+                source=source,
+                source_url=source_url,
+                connector_version=CONNECTOR_VERSION,
+                extra={"officer_id": officer_id, "appointment_count": len(stripped)},
             )
             counts["fetched"] += 1
             time.sleep(_THROTTLE_SECONDS)

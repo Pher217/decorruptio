@@ -104,16 +104,24 @@ from typing import Any
 import httpx
 from django.db import transaction
 
+from uncorrupt.core.circuit_breaker import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    CircuitBreaker,
+    CircuitOpenError,
+)
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
+from uncorrupt.register.models import SourceEntry
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company, SupplierResolution
+from uncorrupt.staging.raw import read_cached_fetch, write_cached_fetch
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 SOURCE_NAME = "Companies House"
 API_KEY_ENV_VAR = "COMPANIES_HOUSE_API_KEY"
 # sources/uk_companies_house_officers.yml — connector refuses to run without it (ADR-001 D5)
 SOURCE_ID = "uk_companies_house_officers"
+CONNECTOR_VERSION = "0.1"
 
 logger = logging.getLogger(__name__)
 
@@ -170,16 +178,6 @@ def _strip_personal_fields(item: dict[str, Any]) -> dict[str, Any]:
     return {k: item[k] for k in _ALLOWED_OFFICER_FIELDS if k in item}
 
 
-def _cache_is_valid(json_path: Path, provenance: dict[str, Any], max_age_days: int) -> bool:
-    """A cache entry is trusted only if it is fresh and its content hash matches."""
-    retrieved_at = datetime.fromisoformat(provenance["retrieved_at"])
-    age_days = (datetime.now(UTC) - retrieved_at).days
-    if age_days > max_age_days:
-        return False
-    actual_hash = f"sha256:{hashlib.sha256(json_path.read_bytes()).hexdigest()}"
-    return actual_hash == provenance["content_hash"]
-
-
 def fetch_company_officers(
     company_numbers: Sequence[str],
     output_dir: str | Path,
@@ -189,6 +187,7 @@ def fetch_company_officers(
     polite_delay_seconds: float = 1.0,
     items_per_page: int = 35,
     max_cache_age_days: int = DEFAULT_MAX_CACHE_AGE_DAYS,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> list[OfficersFetchResult]:
     """Fetch officers for a bounded list of company numbers.
 
@@ -213,11 +212,21 @@ def fetch_company_officers(
     already used in `ch_appointments.fetch_officer_appointments` -- an
     unattended multi-hour sweep across tens of thousands of companies must
     survive one bad company, not die on it.
+
+    A session-level circuit breaker (`uncorrupt.core.circuit_breaker`) aborts
+    the whole sweep -- returning whatever was already fetched -- after
+    `max_consecutive_failures` companies IN A ROW fail. This is distinct from
+    the per-request retry inside `_fetch_all_officer_pages`: it is for the
+    case where those retries themselves keep failing across many companies
+    (a revoked API key, an outage), so a run over thousands of companies
+    gives up instead of grinding through the rest at the same failure rate.
+    A cache hit or a successful fetch resets the counter.
     """
-    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
+    source = load_source(SOURCE_ID)  # refuses without uk_companies_house_officers.yml
     api_key = api_key or _require_api_key()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    breaker = CircuitBreaker(threshold=max_consecutive_failures)
 
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0, auth=httpx.BasicAuth(api_key, ""))
@@ -227,43 +236,60 @@ def fetch_company_officers(
         for company_number in company_numbers:
             json_path = output_dir / f"{company_number}.json"
             provenance_path = output_dir / f"{company_number}.provenance.json"
-
-            if json_path.exists() and provenance_path.exists():
-                provenance = json.loads(provenance_path.read_text())
-                if _cache_is_valid(json_path, provenance, max_cache_age_days):
-                    results.append(
-                        OfficersFetchResult(
-                            company_number=company_number,
-                            json_path=json_path,
-                            provenance_path=provenance_path,
-                            officer_count=provenance["officer_count"],
-                            source_url=provenance["source_url"],
-                            retrieved_at=datetime.fromisoformat(provenance["retrieved_at"]),
-                            content_hash=provenance["content_hash"],
-                            cached=True,
-                        )
-                    )
-                    continue
-
             source_url = f"{CH_API_BASE}/company/{company_number}/officers"
+
+            cached = read_cached_fetch(
+                json_path,
+                provenance_path,
+                source=source,
+                connector_version=CONNECTOR_VERSION,
+                max_age_days=max_cache_age_days,
+            )
+            if cached is not None:
+                breaker.record_success()
+                results.append(
+                    OfficersFetchResult(
+                        company_number=company_number,
+                        json_path=json_path,
+                        provenance_path=provenance_path,
+                        officer_count=cached.extra["officer_count"],
+                        source_url=cached.provenance.source_url,
+                        retrieved_at=cached.provenance.retrieved_at,
+                        content_hash=cached.provenance.content_hash,
+                        cached=True,
+                    )
+                )
+                continue
+
             try:
                 items = _fetch_all_officer_pages(client, source_url, items_per_page, max_retries)
             except (httpx.HTTPError, RuntimeError) as exc:
                 logger.warning("officers fetch failed for %s: %s", company_number, exc)
+                try:
+                    breaker.record_failure()
+                except CircuitOpenError:
+                    logger.error(
+                        "officers fetch: %d consecutive failures, aborting sweep after "
+                        "%d companies",
+                        breaker.consecutive_failures,
+                        len(results),
+                    )
+                    break
                 continue
+            breaker.record_success()
             items = [_strip_personal_fields(item) for item in items]
 
-            json_path.write_text(json.dumps(items, indent=2))
-            content_hash = hashlib.sha256(json_path.read_bytes()).hexdigest()
-            retrieved_at = datetime.now(UTC)
-            provenance = {
-                "company_number": company_number,
-                "source_url": source_url,
-                "retrieved_at": retrieved_at.isoformat(),
-                "content_hash": f"sha256:{content_hash}",
-                "officer_count": len(items),
-            }
-            provenance_path.write_text(json.dumps(provenance, indent=2))
+            # observed_at left unset -- a live current-register snapshot, no
+            # separate capture date of its own (mirrors gleif.py/ec_donations.py).
+            written = write_cached_fetch(
+                json.dumps(items, indent=2).encode(),
+                json_path,
+                provenance_path,
+                source=source,
+                source_url=source_url,
+                connector_version=CONNECTOR_VERSION,
+                extra={"company_number": company_number, "officer_count": len(items)},
+            )
 
             results.append(
                 OfficersFetchResult(
@@ -272,8 +298,8 @@ def fetch_company_officers(
                     provenance_path=provenance_path,
                     officer_count=len(items),
                     source_url=source_url,
-                    retrieved_at=retrieved_at,
-                    content_hash=f"sha256:{content_hash}",
+                    retrieved_at=written.provenance.retrieved_at,
+                    content_hash=written.provenance.content_hash,
                     cached=False,
                 )
             )
@@ -437,40 +463,46 @@ def select_next_pending(
     incorporation cohort and would bias a partial sweep towards older
     companies.
 
-    `limit=None` returns every company unchanged (existing behaviour).
+    `limit=None` returns every company unchanged (existing behaviour), with
+    no register lookup at all.
     """
     if limit is None:
         return list(company_numbers)
 
+    source = load_source(SOURCE_ID)  # refuses without uk_companies_house_officers.yml
     output_dir = Path(output_dir)
     pending: list[str] = []
     for company_number in company_numbers:
         if len(pending) >= limit:
             break
-        if _is_freshly_cached(company_number, output_dir, max_cache_age_days):
+        if _is_freshly_cached(company_number, output_dir, max_cache_age_days, source):
             continue
         pending.append(company_number)
     return pending
 
 
-def _is_freshly_cached(company_number: str, output_dir: Path, max_cache_age_days: int) -> bool:
+def _is_freshly_cached(
+    company_number: str, output_dir: Path, max_cache_age_days: int, source: SourceEntry
+) -> bool:
     """True if company_number already has a fresh, hash-verified cache entry.
 
-    Mirrors the resumability check inside `fetch_company_officers`, but
-    treats unreadable provenance as "not cached" (so it is refetched) rather
-    than raising -- an unattended multi-hour sweep across tens of thousands
-    of companies must survive one corrupted file, matching the pattern
-    already used for the same problem in `ch_appointments`.
+    Mirrors the resumability check inside `fetch_company_officers` (both go
+    through `read_cached_fetch`, which treats unreadable/tampered/stale
+    provenance as "not cached" rather than raising) -- an unattended
+    multi-hour sweep across tens of thousands of companies must survive one
+    corrupted file, matching the pattern already used for the same problem
+    in `ch_appointments`.
     """
     json_path = output_dir / f"{company_number}.json"
     provenance_path = output_dir / f"{company_number}.provenance.json"
-    if not (json_path.exists() and provenance_path.exists()):
-        return False
-    try:
-        provenance = json.loads(provenance_path.read_text())
-        return _cache_is_valid(json_path, provenance, max_cache_age_days)
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return False
+    cached = read_cached_fetch(
+        json_path,
+        provenance_path,
+        source=source,
+        connector_version=CONNECTOR_VERSION,
+        max_age_days=max_cache_age_days,
+    )
+    return cached is not None
 
 
 def officer_ids_for_companies(company_numbers: Sequence[str]) -> list[str]:

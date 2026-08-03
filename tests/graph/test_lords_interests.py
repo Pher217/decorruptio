@@ -503,6 +503,57 @@ class TestLordsInterestsIngest:
         assert summary["total_members"] == 2
 
 
+class TestLordsInterestsFetchProvenance:
+    def test_wayback_fetch_records_observed_at_as_the_capture_date(self, tmp_path):
+        """GIVEN a wayback_timestamp WHEN fetch_lords_register runs THEN the
+        provenance sidecar's observed_at is the parsed capture date -- distinct from
+        retrieved_at (today's download time). This is the fetch-side half of the
+        regression covered at ingest time by
+        test_wayback_attestation_observed_at_is_capture_date_not_today: the capture
+        date is now computed and recorded once, at write time, rather than only
+        ever re-derived at ingest time."""
+        import json
+
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return httpx.Response(200, text=SAMPLE_HTML)
+            return httpx.Response(404)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = fetch_lords_register(tmp_path, wayback_timestamp="20201130", client=client)
+
+        provenance = json.loads(result.provenance_path.read_text())
+        assert provenance["observed_at"] == "2020-11-30T00:00:00+00:00"
+        assert provenance["observed_at"] != provenance["retrieved_at"]
+
+    def test_live_fetch_with_no_wayback_timestamp_leaves_observed_at_null(self, tmp_path):
+        """GIVEN no wayback_timestamp (a live, non-archival fetch) WHEN
+        fetch_lords_register runs THEN observed_at is null -- never silently
+        backfilled from retrieved_at at write time."""
+        import json
+
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return httpx.Response(200, text=SAMPLE_HTML)
+            return httpx.Response(404)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = fetch_lords_register(tmp_path, client=client)
+
+        provenance = json.loads(result.provenance_path.read_text())
+        assert provenance["observed_at"] is None
+
+
 class TestLordsInterestsRegisterContract:
     def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
         """GIVEN sources/uk_lords_interests.yml cannot be resolved (its source_id is

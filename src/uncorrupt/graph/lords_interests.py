@@ -52,6 +52,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from django.db import transaction
 
+from uncorrupt.core.provenance import ProvenanceRecord
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
@@ -66,6 +67,7 @@ WAYBACK_PREFIX = "https://web.archive.org/web/"
 SOURCE_NAME = "UK House of Lords Register of Interests"
 # sources/uk_lords_interests.yml — connector refuses to run without it (ADR-001 D5)
 SOURCE_ID = "uk_lords_interests"
+CONNECTOR_VERSION = "0.1"
 
 # Longest plausible organisation name. Anything beyond this is a parse
 # artefact from free-text register entries, not a real counterparty.
@@ -418,7 +420,7 @@ def fetch_lords_register(
 
     Stores each page as ``page_NN.html`` and a provenance JSON sidecar.
     """
-    load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
+    source = load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -476,12 +478,40 @@ def fetch_lords_register(
         content_hash = hasher.hexdigest()
 
         retrieved_at = datetime.now(UTC)
+        # observed_at is when the SOURCE published/captured this page set --
+        # the Wayback snapshot timestamp -- never today's download time. This
+        # is the multi-page analogue of `uncorrupt.staging.raw`'s shared
+        # cache-with-provenance helper (that helper assumes one payload file;
+        # a Lords register fetch is N page files sharing one provenance
+        # record, so the `ProvenanceRecord` shape is adopted directly here
+        # rather than forcing a single-payload API onto a multi-file
+        # artifact). A live (non-Wayback) fetch has no capture date of its
+        # own and leaves this None; `ingest_lords_register` still falls back
+        # to retrieved_at for that case (unchanged).
+        observed_at = _parse_wayback_timestamp(wayback_timestamp) if wayback_timestamp else None
+        provenance_record = ProvenanceRecord(
+            source_id=source.source_id,
+            source_url=base_url,
+            retrieved_at=retrieved_at,
+            content_hash=content_hash,
+            license=source.license,
+            redistribution=source.redistribution,
+            jurisdiction=source.jurisdictions[0] if source.jurisdictions else "",
+            data_class=source.data_class,
+            tier=source.tier,
+            connector=source.source_id,
+            connector_version=CONNECTOR_VERSION,
+            observed_at=observed_at,
+        )
         provenance = {
             "source": SOURCE_NAME,
-            "source_url": base_url,
+            "source_url": provenance_record.source_url,
             "wayback_timestamp": wayback_timestamp,
-            "retrieved_at": retrieved_at.isoformat(),
-            "content_hash": content_hash,
+            "retrieved_at": provenance_record.retrieved_at.isoformat(),
+            "content_hash": provenance_record.content_hash,
+            "observed_at": (
+                provenance_record.observed_at.isoformat() if provenance_record.observed_at else None
+            ),
             "page_count": len(pages),
             "total_entries": total_entries,
             "pages": pages,
@@ -494,9 +524,9 @@ def fetch_lords_register(
             provenance_path=provenance_path,
             page_count=len(pages),
             total_entries=total_entries,
-            source_url=base_url,
-            retrieved_at=retrieved_at,
-            content_hash=content_hash,
+            source_url=provenance_record.source_url,
+            retrieved_at=provenance_record.retrieved_at,
+            content_hash=provenance_record.content_hash,
             wayback_timestamp=wayback_timestamp,
         )
     finally:

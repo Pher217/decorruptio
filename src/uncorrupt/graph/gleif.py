@@ -33,12 +33,11 @@ authority code and raw number are preserved in `properties` either way.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +48,7 @@ from uncorrupt.graph.models import Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import normalise_company_number
 from uncorrupt.staging.models import Company
+from uncorrupt.staging.raw import write_cached_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ GLEIF_API_BASE = "https://api.gleif.org/api/v1/lei-records"
 SOURCE_NAME = "GLEIF"
 REGISTRY_SCHEME = "GLEIF-LEI"
 SOURCE_ID = "gleif"  # sources/gleif.yml — connector refuses to run without it (ADR-001 D5)
+CONNECTOR_VERSION = "0.1"
 
 # GLEIF's API caps page[size] at 200; larger values return HTTP 400.
 MAX_PAGE_SIZE = 200
@@ -113,7 +114,7 @@ def fetch_gleif(
     (e.g. `experiments/`) — this function never commits anything, and never
     writes person-level data because GLEIF records contain none.
     """
-    load_source(SOURCE_ID)  # refuses to run without sources/gleif.yml (ADR-001 D5)
+    source = load_source(SOURCE_ID)  # refuses to run without sources/gleif.yml (ADR-001 D5)
     if page_size > MAX_PAGE_SIZE:
         raise ValueError(f"GLEIF API rejects page[size] > {MAX_PAGE_SIZE}")
 
@@ -157,31 +158,34 @@ def fetch_gleif(
 
     records = records[:limit]
 
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record))
-            f.write("\n")
-
-    content_hash = hashlib.sha256(jsonl_path.read_bytes()).hexdigest()
-    retrieved_at = datetime.now(UTC)
+    jsonl_bytes = "".join(json.dumps(record) + "\n" for record in records).encode("utf-8")
     source_url_template = f"{GLEIF_API_BASE}?filter[entity.legalAddress.country]={country or '*'}"
-    provenance = {
-        "source_url_template": source_url_template,
-        "retrieved_at": retrieved_at.isoformat(),
-        "content_hash": f"sha256:{content_hash}",
-        "record_count": len(records),
-        "country": country,
-        "limit": limit,
-    }
-    provenance_path.write_text(json.dumps(provenance, indent=2))
+    # observed_at: left unset (never retrieved_at) -- GLEIF's Golden Copy
+    # publishDate is a per-record field (see module docstring), not a single
+    # capture instant for the whole fetched slice, and this is a live API
+    # pull with no separate historical-snapshot concept.
+    cached = write_cached_fetch(
+        jsonl_bytes,
+        jsonl_path,
+        provenance_path,
+        source=source,
+        source_url=source_url_template,
+        connector_version=CONNECTOR_VERSION,
+        extra={
+            "source_url_template": source_url_template,
+            "record_count": len(records),
+            "country": country,
+            "limit": limit,
+        },
+    )
 
     return FetchResult(
         jsonl_path=jsonl_path,
         provenance_path=provenance_path,
         record_count=len(records),
         source_url_template=source_url_template,
-        retrieved_at=retrieved_at,
-        content_hash=f"sha256:{content_hash}",
+        retrieved_at=cached.provenance.retrieved_at,
+        content_hash=cached.provenance.content_hash,
     )
 
 

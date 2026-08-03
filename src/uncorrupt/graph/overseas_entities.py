@@ -107,7 +107,6 @@ personal-data-filtered) raw JSON, mirroring `ch_officers.py`'s
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -124,12 +123,15 @@ from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
+from uncorrupt.register.models import SourceEntry
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
+from uncorrupt.staging.raw import read_cached_fetch, write_cached_fetch
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 SOURCE_NAME = "Companies House"
 SOURCE_ID = "uk_roe"
 API_KEY_ENV_VAR = "COMPANIES_HOUSE_API_KEY"
+CONNECTOR_VERSION = "0.1"
 
 # The overseas entity itself.
 REGISTRY_SCHEME = "GB-ROE"
@@ -211,9 +213,9 @@ def _require_api_key() -> str:
     return api_key
 
 
-def _require_source_registered() -> None:
+def _require_source_registered() -> SourceEntry:
     """Refuse to run without `sources/uk_roe.yml` (mirrors the Connector protocol contract)."""
-    load_source(SOURCE_ID)
+    return load_source(SOURCE_ID)
 
 
 @dataclass(frozen=True)
@@ -300,7 +302,7 @@ def fetch_overseas_entities(
     provenance record into `output_dir`. Never writes personal data — this
     endpoint returns none.
     """
-    _require_source_registered()
+    source = _require_source_registered()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"{incorporated_from or 'all'}_{incorporated_to or 'all'}"
@@ -353,28 +355,29 @@ def fetch_overseas_entities(
 
     truncated = hits > start_index and start_index >= ADVANCED_SEARCH_OFFSET_CAP
 
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for company in companies:
-            f.write(json.dumps(company))
-            f.write("\n")
-
-    content_hash = hashlib.sha256(jsonl_path.read_bytes()).hexdigest()
-    retrieved_at = datetime.now(UTC)
+    jsonl_bytes = "".join(json.dumps(company) + "\n" for company in companies).encode("utf-8")
     source_url_template = (
         f"{CH_API_BASE}/advanced-search/companies?company_type=registered-overseas-entity"
         f"&incorporated_from={incorporated_from or ''}&incorporated_to={incorporated_to or ''}"
     )
-    provenance = {
-        "source_url_template": source_url_template,
-        "retrieved_at": retrieved_at.isoformat(),
-        "content_hash": f"sha256:{content_hash}",
-        "company_count": len(companies),
-        "hits": hits,
-        "truncated": truncated,
-        "incorporated_from": incorporated_from.isoformat() if incorporated_from else None,
-        "incorporated_to": incorporated_to.isoformat() if incorporated_to else None,
-    }
-    provenance_path.write_text(json.dumps(provenance, indent=2))
+    # observed_at left unset -- a live enumeration of the CURRENT register,
+    # no separate capture date of its own.
+    cached = write_cached_fetch(
+        jsonl_bytes,
+        jsonl_path,
+        provenance_path,
+        source=source,
+        source_url=source_url_template,
+        connector_version=CONNECTOR_VERSION,
+        extra={
+            "source_url_template": source_url_template,
+            "company_count": len(companies),
+            "hits": hits,
+            "truncated": truncated,
+            "incorporated_from": incorporated_from.isoformat() if incorporated_from else None,
+            "incorporated_to": incorporated_to.isoformat() if incorporated_to else None,
+        },
+    )
 
     return EnumerationFetchResult(
         jsonl_path=jsonl_path,
@@ -383,8 +386,8 @@ def fetch_overseas_entities(
         hits=hits,
         truncated=truncated,
         source_url_template=source_url_template,
-        retrieved_at=retrieved_at,
-        content_hash=f"sha256:{content_hash}",
+        retrieved_at=cached.provenance.retrieved_at,
+        content_hash=cached.provenance.content_hash,
     )
 
 
@@ -407,7 +410,7 @@ def fetch_overseas_entity_details(
     `_filter_officer_item`) before anything is written — the cache on disk
     is exactly what gets ingested, nothing more.
     """
-    _require_source_registered()
+    source = _require_source_registered()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -422,21 +425,26 @@ def fetch_overseas_entity_details(
             json_path = output_dir / f"{company_number}.json"
             provenance_path = output_dir / f"{company_number}.provenance.json"
 
-            if json_path.exists() and provenance_path.exists():
-                provenance = json.loads(provenance_path.read_text())
-                if _cache_is_valid(json_path, provenance, max_cache_age_days):
-                    results.append(
-                        EntityFetchResult(
-                            company_number=company_number,
-                            json_path=json_path,
-                            provenance_path=provenance_path,
-                            source_url=provenance["source_url"],
-                            retrieved_at=datetime.fromisoformat(provenance["retrieved_at"]),
-                            content_hash=provenance["content_hash"],
-                            cached=True,
-                        )
+            cached = read_cached_fetch(
+                json_path,
+                provenance_path,
+                source=source,
+                connector_version=CONNECTOR_VERSION,
+                max_age_days=max_cache_age_days,
+            )
+            if cached is not None:
+                results.append(
+                    EntityFetchResult(
+                        company_number=company_number,
+                        json_path=json_path,
+                        provenance_path=provenance_path,
+                        source_url=cached.provenance.source_url,
+                        retrieved_at=cached.provenance.retrieved_at,
+                        content_hash=cached.provenance.content_hash,
+                        cached=True,
                     )
-                    continue
+                )
+                continue
 
             source_url = f"{CH_API_BASE}/company/{company_number}"
             profile = _fetch_json_with_backoff(client, source_url, max_retries)
@@ -459,16 +467,18 @@ def fetch_overseas_entity_details(
                 "officers": [_filter_officer_item(item) for item in officer_items],
             }
 
-            json_path.write_text(json.dumps(bundle, indent=2))
-            content_hash = hashlib.sha256(json_path.read_bytes()).hexdigest()
-            retrieved_at = datetime.now(UTC)
-            provenance = {
-                "company_number": company_number,
-                "source_url": source_url,
-                "retrieved_at": retrieved_at.isoformat(),
-                "content_hash": f"sha256:{content_hash}",
-            }
-            provenance_path.write_text(json.dumps(provenance, indent=2))
+            # observed_at left unset -- a live current-register snapshot; the
+            # ingest side sets Attestation.observed_at from each item's own
+            # notified_on/appointed_on date, never from this cache's fetch time.
+            written = write_cached_fetch(
+                json.dumps(bundle, indent=2).encode(),
+                json_path,
+                provenance_path,
+                source=source,
+                source_url=source_url,
+                connector_version=CONNECTOR_VERSION,
+                extra={"company_number": company_number},
+            )
 
             results.append(
                 EntityFetchResult(
@@ -476,8 +486,8 @@ def fetch_overseas_entity_details(
                     json_path=json_path,
                     provenance_path=provenance_path,
                     source_url=source_url,
-                    retrieved_at=retrieved_at,
-                    content_hash=f"sha256:{content_hash}",
+                    retrieved_at=written.provenance.retrieved_at,
+                    content_hash=written.provenance.content_hash,
                     cached=False,
                 )
             )
@@ -487,15 +497,6 @@ def fetch_overseas_entity_details(
             client.close()
 
     return results
-
-
-def _cache_is_valid(json_path: Path, provenance: dict[str, Any], max_age_days: int) -> bool:
-    retrieved_at = datetime.fromisoformat(provenance["retrieved_at"])
-    age_days = (datetime.now(UTC) - retrieved_at).days
-    if age_days > max_age_days:
-        return False
-    actual_hash = f"sha256:{hashlib.sha256(json_path.read_bytes()).hexdigest()}"
-    return actual_hash == provenance["content_hash"]
 
 
 def _fetch_page_with_backoff(

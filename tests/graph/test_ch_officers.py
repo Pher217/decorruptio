@@ -503,6 +503,59 @@ class TestFetchCompanyOfficersPerCompanyFailure:
         assert not (tmp_path / "00000001.provenance.json").exists()
 
 
+class TestFetchCompanyOfficersCircuitBreaker:
+    def test_aborts_sweep_after_max_consecutive_failures(self, tmp_path, monkeypatch):
+        """GIVEN every company fails WHEN max_consecutive_failures=3 over a batch of 10
+        THEN the sweep aborts after exactly 3 consecutive failures -- the remaining 7
+        companies are never attempted (no HTTP request made for them)."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key")
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(403)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        company_numbers = [f"0000000{i}" for i in range(10)]
+
+        results = fetch_company_officers(
+            company_numbers,
+            tmp_path,
+            client=client,
+            polite_delay_seconds=0,
+            max_consecutive_failures=3,
+        )
+
+        assert results == []
+        assert call_count == 3
+
+    def test_a_success_resets_the_circuit_so_the_sweep_completes(self, tmp_path, monkeypatch):
+        """GIVEN failures that alternate with successes (never 2 in a row) WHEN
+        max_consecutive_failures=2 THEN the circuit never trips and every company is
+        attempted -- a success resets the streak rather than the threshold being a
+        cumulative failure count."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key")
+        successful = {"00000002", "00000004"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if any(n in str(request.url) for n in successful):
+                return httpx.Response(200, json={"items": [RAW_OFFICER_ITEM], "total_results": 1})
+            return httpx.Response(403)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        results = fetch_company_officers(
+            ["00000001", "00000002", "00000003", "00000004", "00000005"],
+            tmp_path,
+            client=client,
+            polite_delay_seconds=0,
+            max_consecutive_failures=2,
+        )
+
+        assert [r.company_number for r in results] == ["00000002", "00000004"]
+
+
 class TestChOfficersRegisterContract:
     def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
         """GIVEN sources/uk_companies_house_officers.yml cannot be resolved (its

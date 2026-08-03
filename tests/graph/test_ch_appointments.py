@@ -16,11 +16,13 @@ ch_officers.py uses -- one CH API, one licence, one register row).
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 import uncorrupt.graph.ch_appointments as ch_appointments_module
 from uncorrupt.core.errors import RegisterError
 from uncorrupt.graph.ch_appointments import fetch_officer_appointments, ingest_officer_appointments
+from uncorrupt.graph.ch_officers import API_KEY_ENV_VAR
 from uncorrupt.graph.models import Edge, Entity
 from uncorrupt.staging.models import Company
 
@@ -91,6 +93,29 @@ class TestIngestOfficerAppointmentsSelectionRule:
 
         edge = Edge.objects.get(edge_type="officer_of", target_entity__company_number="00000001")
         assert "selection_rule" not in edge.properties
+
+
+class TestFetchOfficerAppointmentsCircuitBreaker:
+    def test_aborts_sweep_after_max_consecutive_failures(self, tmp_path, monkeypatch):
+        """GIVEN every officer fails WHEN max_consecutive_failures=3 over a batch of 10
+        THEN the sweep aborts after exactly 3 consecutive failures -- the remaining 7
+        officers are never attempted."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key")
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(403)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(ch_appointments_module.httpx, "Client", lambda *a, **k: client)
+        officer_ids = [f"officer-{i}" for i in range(10)]
+
+        counts = fetch_officer_appointments(officer_ids, tmp_path, max_consecutive_failures=3)
+
+        assert counts == {"fetched": 0, "cached": 0, "failed": 3}
+        assert call_count == 3
 
 
 class TestChAppointmentsRegisterContract:

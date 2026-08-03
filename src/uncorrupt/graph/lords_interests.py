@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -55,11 +56,17 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
+logger = logging.getLogger(__name__)
+
 LORDS_REGISTER_URL = (
     "https://members.parliament.uk/members/lords/interests/register-of-lords-interests"
 )
 WAYBACK_PREFIX = "https://web.archive.org/web/"
 SOURCE_NAME = "UK House of Lords Register of Interests"
+
+# Longest plausible organisation name. Anything beyond this is a parse
+# artefact from free-text register entries, not a real counterparty.
+_MAX_COUNTERPARTY_NAME = 200
 
 # Categories that name an individual (relative) rather than the member's
 # own public-function interest — excluded per ADR-004 D1.
@@ -262,6 +269,19 @@ def _extract_counterparty(description: str) -> tuple[str | None, str | None, boo
     return name, company_number, False
 
 
+def _scoped_registry_id(scope: str, name: str) -> str:
+    """Bounded, deterministic registry_id for an unresolved placeholder.
+
+    The name component is hashed rather than embedded: Lords interest text is
+    free-form and unbounded, which overflowed registry_id (DataError: value too
+    long). Hashing keeps the key a fixed length while remaining deterministic
+    (idempotent re-ingest) and scoped to the individual claim, so unresolved
+    counterparties never merge across interests.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+    return f"{scope[:64]}:{digest}"
+
+
 def _resolve_counterparty(
     name: str, company_number: str | None, interest_key: str
 ) -> tuple[Entity, float, str, dict[str, Any]] | None:
@@ -287,7 +307,7 @@ def _resolve_counterparty(
         entity, _ = Entity.objects.get_or_create(
             entity_type="regulated_entity",
             registry_scheme="UK-LORDS-UNRESOLVED",
-            registry_id=f"{interest_key}:{_normalise_name(name)}",
+            registry_id=_scoped_registry_id(interest_key, _normalise_name(name)),
             defaults={"name": name},
         )
         return entity, 0.5, "name_only", {"declared_company_number": company_number}
@@ -313,7 +333,7 @@ def _resolve_counterparty(
     entity, _ = Entity.objects.get_or_create(
         entity_type="regulated_entity",
         registry_scheme="UK-LORDS-UNRESOLVED",
-        registry_id=f"{interest_key}:{normalised}",
+        registry_id=_scoped_registry_id(interest_key, normalised),
         defaults={"name": name},
     )
     return entity, 0.5, "name_only", {}
@@ -373,6 +393,17 @@ def fetch_lords_register(
         for page_num in range(1, max_pages + 1):
             url = f"{base_url}?page={page_num}" if page_num > 1 else base_url
             r = client.get(url)
+            # A 404 past page 1 means we have run off the end of the register, or
+            # (with Wayback) that this page was never archived. Either way it is
+            # the end of what is available — stop and keep the pages already
+            # fetched rather than discarding a successful partial crawl.
+            if r.status_code == 404 and page_num > 1:
+                logger.warning(
+                    "lords register: page %d returned 404, stopping after %d pages",
+                    page_num,
+                    len(pages),
+                )
+                break
             r.raise_for_status()
             html_content = r.text
 
@@ -488,6 +519,7 @@ def ingest_lords_register(
     unmatched_counterparty = 0
     skipped_private_individual = 0
     skipped_no_counterparty = 0
+    skipped_implausible_name = 0
     nil_returns = 0
     total_interests = 0
     total_members = 0
@@ -521,6 +553,17 @@ def ingest_lords_register(
                     category = interest["category"]
 
                     name, company_number, is_private = _extract_counterparty(description)
+
+                    # A counterparty "name" longer than this is an extraction
+                    # failure, not an organisation — the Lords register is free
+                    # text and the extractor sometimes captures a whole sentence.
+                    # Creating an Entity from it would both overflow Entity.name
+                    # (varchar 500) and pollute the graph with junk nodes, so
+                    # skip and count instead. Conservative extraction: prefer
+                    # missing a counterparty over inventing one.
+                    if name and len(name) > _MAX_COUNTERPARTY_NAME:
+                        skipped_implausible_name += 1
+                        continue
                     if is_private:
                         skipped_private_individual += 1
                         continue
@@ -528,7 +571,15 @@ def ingest_lords_register(
                         skipped_no_counterparty += 1
                         continue
 
-                    interest_key = f"{member['member_id']}:{category}:{_normalise_name(name)}"
+                    # Bounded at construction: category and counterparty name are free-form
+                    # Lords register text. interest_key feeds BOTH registry_id and
+                    # Attestation.source_reference (varchar 200), so hash the
+                    # variable part rather than embedding it — deterministic, so
+                    # re-ingest stays idempotent, and still unique per interest.
+                    _key_body = hashlib.sha256(
+                        f"{category}:{_normalise_name(name)}".encode()
+                    ).hexdigest()[:32]
+                    interest_key = f"{member['member_id']}:{_key_body}"
                     resolved = _resolve_counterparty(name, company_number, interest_key)
                     if resolved is None:
                         unmatched_counterparty += 1
@@ -583,6 +634,7 @@ def ingest_lords_register(
         "unmatched_counterparty": unmatched_counterparty,
         "skipped_private_individual": skipped_private_individual,
         "skipped_no_counterparty": skipped_no_counterparty,
+        "skipped_implausible_name": skipped_implausible_name,
         "nil_returns": nil_returns,
         "total_interests": total_interests,
         "total_members": total_members,

@@ -5,7 +5,9 @@ services:
       POSTGRES_USER: decorruptio
       POSTGRES_PASSWORD: decorruptio
       POSTGRES_DB: decorruptio
-    ports: ["5432:5432"]
+    # Host port 5435 — 5432/5433 are used by other local projects.
+    # Must match DATABASE_URL in .env / .env.example.
+    ports: ["5435:5432"]
     volumes: ["pg:/var/lib/postgresql/data"]
 
 volumes:

@@ -12,7 +12,7 @@ import os
 import django
 import httpx
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
 from uncorrupt.connectors.base import RawArtifact

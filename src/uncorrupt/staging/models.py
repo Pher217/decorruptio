@@ -190,12 +190,21 @@ class Company(models.Model):
 
     company_number = models.CharField(max_length=20, primary_key=True)
     company_name = models.CharField(max_length=500, db_index=True)
-    company_status = models.CharField(max_length=50, null=True, blank=True)
-    incorporation_date = models.DateField(null=True, blank=True)
+    company_status = models.CharField(max_length=100, null=True, blank=True)
+    incorporation_date = models.DateField(null=True, blank=True, db_index=True)
+    company_category = models.CharField(max_length=100, null=True, blank=True)
     accounts_category = models.CharField(max_length=100, null=True, blank=True)
+    accounts_next_due = models.DateField(null=True, blank=True)
     accounts_last_made_up_date = models.DateField(null=True, blank=True)
+    # Raw text as loaded from the CH bulk file, e.g.
+    # "77320 - Renting and leasing of construction machinery". Left as TEXT
+    # deliberately: all 5.7M rows are populated with non-JSON strings, so
+    # retyping this column to jsonb fails at ALTER time (USING sic_codes::jsonb
+    # cannot cast "77320 - Renting ..."). The parsed form lives beside it.
     sic_codes = models.TextField(null=True, blank=True)
+    sic_codes_list = models.JSONField(default=list, blank=True)
     registered_address = models.TextField(null=True, blank=True)
+    dissolution_date = models.DateField(null=True, blank=True)
     # Normalised name for tier-2 matching (uppercase, stripped whitespace)
     normalised_name = models.CharField(max_length=500, db_index=True, null=True, blank=True)
     # Which CH bulk snapshot this came from

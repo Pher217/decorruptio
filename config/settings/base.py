@@ -1,5 +1,6 @@
 """Base Django settings — shared across all environments."""
 
+import sys
 from pathlib import Path
 
 import environ
@@ -61,6 +62,25 @@ DATABASES = {
         default="postgresql://decorruptio:decorruptio@localhost:5432/decorruptio",
     ),
 }
+
+
+def log_db_target(databases: dict, label: str = "DB target") -> None:
+    """Print the resolved database connection so a wrong-database run is loud, not silent.
+
+    A previous incident: every ingest script hardcoded config.settings.dev
+    (SQLite), silently writing to an empty local file instead of the
+    PostgreSQL staging DB with 5.7M rows. Never again unknowingly.
+    """
+    db = databases["default"]
+    print(
+        f"[settings] {label}: engine={db.get('ENGINE')} "
+        f"host={db.get('HOST') or '(embedded)'} port={db.get('PORT') or '-'} "
+        f"name={db.get('NAME')}",
+        file=sys.stderr,
+    )
+
+
+log_db_target(DATABASES)
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"

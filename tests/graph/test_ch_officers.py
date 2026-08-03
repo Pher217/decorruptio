@@ -14,6 +14,9 @@ Also covers the officer-coverage-expansion primitives (`select_next_pending`,
 `salted_hash_order`, `procurement_supplier_universe`, `officer_ids_for_companies`,
 `coverage_report`, `procurement_universe_coverage_report`, `append_run_manifest`)
 and the CLI's salt-persistence helper.
+
+- fetch_company_officers/ingest_company_officers refuse to run without a
+  sources/uk_companies_house_officers.yml register entry
 """
 
 import hashlib
@@ -25,6 +28,8 @@ import httpx
 import pytest
 from scripts.ingest_ch_officers import _load_or_create_salt
 
+import uncorrupt.graph.ch_officers as ch_officers_module
+from uncorrupt.core.errors import RegisterError
 from uncorrupt.graph.ch_officers import (
     API_KEY_ENV_VAR,
     append_run_manifest,
@@ -496,6 +501,32 @@ class TestFetchCompanyOfficersPerCompanyFailure:
 
         assert not (tmp_path / "00000001.json").exists()
         assert not (tmp_path / "00000001.provenance.json").exists()
+
+
+class TestChOfficersRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_companies_house_officers.yml cannot be resolved (its
+        source_id is absent from the register) WHEN ingest_company_officers is called
+        THEN it raises RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(ch_officers_module, "SOURCE_ID", "does_not_exist_xyz")
+        _write_cache(tmp_path, "12410514", [RAW_OFFICER_ITEM])
+
+        with pytest.raises(RegisterError):
+            ingest_company_officers(["12410514"], tmp_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_companies_house_officers.yml cannot be resolved WHEN
+        fetch_company_officers is called THEN it raises RegisterError before making
+        any HTTP request."""
+        monkeypatch.setattr(ch_officers_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_company_officers must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(RegisterError):
+            fetch_company_officers(["12410514"], tmp_path, client=client)
 
 
 def _write_valid_cache(

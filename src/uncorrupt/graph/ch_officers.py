@@ -105,12 +105,15 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company, SupplierResolution
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 SOURCE_NAME = "Companies House"
 API_KEY_ENV_VAR = "COMPANIES_HOUSE_API_KEY"
+# sources/uk_companies_house_officers.yml — connector refuses to run without it (ADR-001 D5)
+SOURCE_ID = "uk_companies_house_officers"
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +214,7 @@ def fetch_company_officers(
     unattended multi-hour sweep across tens of thousands of companies must
     survive one bad company, not die on it.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
     api_key = api_key or _require_api_key()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -654,6 +658,7 @@ def ingest_company_officers(
     ever selected via an unlabelled/legacy path", and a fetch that finds an
     edge already exists changes nothing about how it first came to exist.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
     input_dir = Path(input_dir)
     edges_created = 0
     companies_processed = 0

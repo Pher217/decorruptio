@@ -6,6 +6,11 @@ records why an appointment-hop edge was created, mirroring
 `ch_officers.ingest_company_officers` -- set only on first creation, never
 overwritten by a later re-ingest under a different rule (get_or_create only
 applies `defaults` at creation time).
+
+Also covers the register contract: fetch_officer_appointments/
+ingest_officer_appointments refuse to run without a
+sources/uk_companies_house_officers.yml register entry (the same entry
+ch_officers.py uses -- one CH API, one licence, one register row).
 """
 
 import json
@@ -13,7 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from uncorrupt.graph.ch_appointments import ingest_officer_appointments
+import uncorrupt.graph.ch_appointments as ch_appointments_module
+from uncorrupt.core.errors import RegisterError
+from uncorrupt.graph.ch_appointments import fetch_officer_appointments, ingest_officer_appointments
 from uncorrupt.graph.models import Edge, Entity
 from uncorrupt.staging.models import Company
 
@@ -84,3 +91,32 @@ class TestIngestOfficerAppointmentsSelectionRule:
 
         edge = Edge.objects.get(edge_type="officer_of", target_entity__company_number="00000001")
         assert "selection_rule" not in edge.properties
+
+
+class TestChAppointmentsRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_companies_house_officers.yml cannot be resolved (its
+        source_id is absent from the register) WHEN ingest_officer_appointments is
+        called THEN it raises RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(ch_appointments_module, "SOURCE_ID", "does_not_exist_xyz")
+        _write_cache(tmp_path, "officer-1", [APPOINTMENT_ITEM])
+
+        with pytest.raises(RegisterError):
+            ingest_officer_appointments(["officer-1"], tmp_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_companies_house_officers.yml cannot be resolved WHEN
+        fetch_officer_appointments is called THEN it raises RegisterError before
+        creating an HTTP client. fetch_officer_appointments (unlike
+        fetch_company_officers) takes no injectable client, so httpx.Client itself
+        is patched to raise if instantiated -- proving no request could have been
+        attempted."""
+        monkeypatch.setattr(ch_appointments_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def _unexpected_client(*args, **kwargs):
+            raise AssertionError("fetch_officer_appointments must not create an HTTP client")
+
+        monkeypatch.setattr(ch_appointments_module.httpx, "Client", _unexpected_client)
+
+        with pytest.raises(RegisterError):
+            fetch_officer_appointments(["officer-1"], tmp_path)

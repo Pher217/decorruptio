@@ -43,6 +43,7 @@ from django.db import transaction
 from uncorrupt.graph.ch_officers import (
     CH_API_BASE,
     DEFAULT_MAX_CACHE_AGE_DAYS,
+    SOURCE_ID,
     SOURCE_NAME,
     _cache_is_valid,
     _fetch_page_with_backoff,
@@ -51,6 +52,7 @@ from uncorrupt.graph.ch_officers import (
     _require_api_key,
 )
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import normalise_company_number
 from uncorrupt.staging.models import Company
 
@@ -95,6 +97,7 @@ def fetch_officer_appointments(
     it, so an interrupted run resumes without refetching. Returns counts:
     {fetched, cached, failed}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
     api_key = _require_api_key()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -212,6 +215,7 @@ def ingest_officer_appointments(
     Returns {edges_created, officers_processed, appointments_seen,
     company_unmatched, officer_missing, inconsistent_dates}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_companies_house_officers.yml
     input_dir = Path(input_dir)
     stats = {
         "edges_created": 0,

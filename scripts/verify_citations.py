@@ -126,11 +126,15 @@ def verify_manifest(
 def _print_report(reports: list[dict[str, Any]]) -> Counter:
     counts: Counter = Counter(r["status"] for r in reports)
     for r in reports:
-        line = f"[{r['status']:11s}] {r['case_id']}"
-        if r["status"] in (CitationStatus.NEAR.value, CitationStatus.ABSENT.value):
+        line = f"[{r['status']:21s}] {r['case_id']}"
+        if r["status"] in (
+            CitationStatus.NEAR.value,
+            CitationStatus.ABSENT.value,
+            CitationStatus.EXTRACTION_UNRELIABLE.value,
+        ):
             similarity = r.get("similarity")
             line += f" (similarity={similarity:.2f})" if similarity is not None else ""
-        if r["status"] in ("UNFETCHABLE", "SKIPPED"):
+        if r["status"] in ("UNFETCHABLE", "EXTRACTION_UNRELIABLE", "SKIPPED"):
             line += f" -- {r.get('detail')}"
         print(line)
     print()

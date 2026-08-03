@@ -41,6 +41,50 @@ Edge identity: `source_reference` prefers the per-appointment
 company stay distinct edges), falling back to the officer ID — a weaker
 claim, noted via `properties["source_reference_scope"]` — only when
 `links.self` is absent.
+
+Coverage expansion (2026-08): the target set was originally ~1,000
+companies, leaving most `GB-COH` company Entities with no direct roster
+fetch at all — a benchmark row that cannot reach the officer layer through
+any of them is untestable, not a negative result. Two things must both
+hold for an expansion to be scientifically defensible, not a manufactured
+result:
+
+1. **The universe must be defined without reference to the benchmark at
+   all.** Expanding "symmetrically" to positive AND matched-negative
+   companies still gives every benchmark-referenced company preferential
+   ascertainment over the rest of the register — that is the same
+   ascertainment bias wearing a fairness label. `procurement_supplier_universe`
+   instead pulls the company_numbers Companies House suppliers were already
+   resolved to (`staging.SupplierResolution`, built from the frozen
+   procurement corpus) — a set that exists independently of which rows
+   ended up in any golden/benchmark set.
+2. **The traversal order over that universe must not correlate with a
+   real-world company attribute.** Company-number ascending is a bad
+   stopping rule: CH numbers correlate with incorporation cohort, so a
+   partial sweep in that order systematically over-samples older
+   companies. `salted_hash_order` sorts by `sha256(salt + company_number)`
+   instead — deterministic and reproducible given the same salt, but
+   uncorrelated with age, sector, or size. The salt must be pinned once
+   per sweep (recorded via `append_run_manifest`) and reused by every
+   partial run of that sweep, not regenerated each time.
+
+`select_next_pending` turns `--limit` into a resumable partial run over
+that (already hash-ordered) list: already fresh-cached companies are
+skipped rather than reprocessed or counted against the limit, so
+re-invoking with the same list and salt picks up exactly where a previous
+partial run left off. `coverage_report` / `procurement_universe_coverage_report`
+tell apart a company with zero officer edges from one whose only
+officer_of edge is incidental (landed there via someone else's appointment
+walk, never itself roster-fetched). `append_run_manifest` records the
+selection rule, salt, timestamp, and counts for every run so a later
+reader can tell whether a given company was ever attempted, and why.
+
+The second-hop appointment expansion (`ch_appointments`) is deliberately a
+single frontier: officers discovered while seeding this batch of companies
+get their *other* appointments expanded once, and that is where it stops —
+no recursive re-expansion of companies discovered via that hop. Anything
+beyond that pre-registered stopping point is a separate, clearly-labelled
+sensitivity analysis, never folded into the same run.
 """
 
 from __future__ import annotations
@@ -61,7 +105,7 @@ from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
-from uncorrupt.staging.models import Company
+from uncorrupt.staging.models import Company, SupplierResolution
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 SOURCE_NAME = "Companies House"
@@ -289,6 +333,233 @@ def _parse_ch_date(value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def procurement_supplier_universe() -> list[str]:
+    """Company numbers of every CH supplier resolved from the frozen procurement corpus.
+
+    This is the pre-registered universe for officer-coverage expansion. It
+    is built from `staging.SupplierResolution` -- suppliers already
+    resolved to a Companies House company from the procurement award data
+    -- and defined **without any reference to benchmark/gold-row
+    membership**. Deriving the universe from which companies happen to
+    appear in a positive or negative benchmark row -- even applied
+    identically to both -- still gives every benchmark-referenced company
+    preferential ascertainment over the rest of the register: expanding
+    coverage only where the benchmark already looks would manufacture the
+    very result the expansion is meant to test.
+
+    Ordering is stable (company_number ascending) only so the *set* this
+    function returns is reproducible before `salted_hash_order` is applied
+    to it for traversal -- it is not meant to be used as the traversal
+    order itself.
+    """
+    numbers = (
+        SupplierResolution.objects.filter(company_number__isnull=False)
+        .values_list("company_number", flat=True)
+        .distinct()
+        .order_by("company_number")
+    )
+    return [n for n in numbers if n is not None]
+
+
+def salted_hash_order(company_numbers: Sequence[str], salt: str) -> list[str]:
+    """Order company_numbers by sha256(salt + company_number), ascending.
+
+    Company-number ascending is a bad stopping order for a partial sweep:
+    CH numbers correlate with incorporation cohort, so stopping partway
+    through an ascending sweep systematically over-samples older
+    companies. A precommitted salted-hash order is deterministic and fully
+    reproducible given the same salt, but uncorrelated with any real-world
+    attribute of the company (age, sector, size, ...), so a partial sweep
+    is an unbiased subsample of the universe at whatever point it stops --
+    not just once it eventually completes.
+
+    The salt must be pinned once per sweep and reused by every partial run
+    of that sweep (see `append_run_manifest` / `scripts/ingest_ch_officers.py`);
+    regenerating it on each invocation would silently reshuffle which
+    companies count as "already sampled".
+    """
+    return sorted(company_numbers, key=lambda n: hashlib.sha256(f"{salt}{n}".encode()).hexdigest())
+
+
+def select_next_pending(
+    company_numbers: Sequence[str],
+    output_dir: str | Path,
+    limit: int | None,
+    max_cache_age_days: int = DEFAULT_MAX_CACHE_AGE_DAYS,
+) -> list[str]:
+    """Select the next `limit` companies, in the given order, not already validly cached.
+
+    This is what makes `--limit` resumable rather than a fixed head-slice:
+    re-invoking with the same ordered company list picks up wherever the
+    previous partial run left off, because already-attempted companies (a
+    fresh, hash-verified cache entry present) are skipped rather than
+    reprocessed or counted against the limit. The input order is never
+    reshuffled, so a partial run over a deterministically-ordered company
+    list stays reproducible and cannot be cherry-picked. Callers should
+    pass a list already ordered by `salted_hash_order` rather than a raw
+    attribute like company number ascending, which correlates with
+    incorporation cohort and would bias a partial sweep towards older
+    companies.
+
+    `limit=None` returns every company unchanged (existing behaviour).
+    """
+    if limit is None:
+        return list(company_numbers)
+
+    output_dir = Path(output_dir)
+    pending: list[str] = []
+    for company_number in company_numbers:
+        if len(pending) >= limit:
+            break
+        if _is_freshly_cached(company_number, output_dir, max_cache_age_days):
+            continue
+        pending.append(company_number)
+    return pending
+
+
+def _is_freshly_cached(company_number: str, output_dir: Path, max_cache_age_days: int) -> bool:
+    """True if company_number already has a fresh, hash-verified cache entry.
+
+    Mirrors the resumability check inside `fetch_company_officers`, but
+    treats unreadable provenance as "not cached" (so it is refetched) rather
+    than raising -- an unattended multi-hour sweep across tens of thousands
+    of companies must survive one corrupted file, matching the pattern
+    already used for the same problem in `ch_appointments`.
+    """
+    json_path = output_dir / f"{company_number}.json"
+    provenance_path = output_dir / f"{company_number}.provenance.json"
+    if not (json_path.exists() and provenance_path.exists()):
+        return False
+    try:
+        provenance = json.loads(provenance_path.read_text())
+        return _cache_is_valid(json_path, provenance, max_cache_age_days)
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return False
+
+
+def officer_ids_for_companies(company_numbers: Sequence[str]) -> list[str]:
+    """Distinct GB-COH-OFFICER registry IDs currently linked to any of the given companies.
+
+    Used to scope the second-hop appointment expansion (`ch_appointments`) to
+    officers just discovered while seeding this batch of companies, rather
+    than silently re-expanding the whole graph every time coverage is
+    widened for an arbitrary subset.
+    """
+    normalised = [normalise_company_number(n) for n in company_numbers]
+    registry_ids = (
+        Entity.objects.filter(
+            entity_type="person",
+            registry_scheme="GB-COH-OFFICER",
+            outgoing_edges__edge_type="officer_of",
+            outgoing_edges__target_entity__company_number__in=normalised,
+        )
+        .order_by("registry_id")
+        .values_list("registry_id", flat=True)
+        .distinct()
+    )
+    return [r for r in registry_ids if r is not None]
+
+
+def coverage_report() -> dict[str, int]:
+    """Report GB-COH officer coverage without mutating any data.
+
+    Splits all `GB-COH` company Entities into three tiers so "no officer
+    edge found" can be told apart from "never actually queried" -- the
+    distinction that matters when a benchmark row cannot reach the officer
+    layer at all (a "no path found" result is untestable, not a negative):
+
+    - `direct_roster_fetch`: at least one officer_of edge attested by a
+      direct `/company/{number}/officers` call -- a full roster fetch was
+      made for this company.
+    - `appointment_hop_only`: has an officer_of edge, but only because an
+      already-known officer's `/officers/{id}/appointments` walk happened to
+      land here -- an incidental, partial officer list, not a fetched
+      roster. A missing officer at this company cannot be distinguished
+      from "we never looked."
+    - `zero_officers`: no officer_of edge at all -- coverage is completely
+      absent.
+
+    `direct_roster_fetch + appointment_hop_only + zero_officers ==
+    total_gb_coh_companies` always (strict partition).
+    """
+    company_ids = set(
+        Entity.objects.filter(entity_type="company", registry_scheme="GB-COH").values_list(
+            "id", flat=True
+        )
+    )
+    return {"total_gb_coh_companies": len(company_ids), **_officer_coverage_tiers(company_ids)}
+
+
+def procurement_universe_coverage_report() -> dict[str, int]:
+    """Officer coverage restricted to the benchmark-independent procurement-supplier universe.
+
+    Same three-tier split as `coverage_report` (see there for what each
+    tier means), but scoped to `procurement_supplier_universe()` rather
+    than all ~210k GB-COH entities the graph happens to already contain --
+    the universe pre-registered for a defensible coverage-expansion run.
+    `universe_with_graph_entity` is how many of the universe even have a
+    graph Entity yet; the rest have never been touched by the graph
+    pipeline at all and fall into `zero_officers`.
+    """
+    universe = set(procurement_supplier_universe())
+    company_ids = set(
+        Entity.objects.filter(
+            entity_type="company", registry_scheme="GB-COH", company_number__in=universe
+        ).values_list("id", flat=True)
+    )
+    tiers = _officer_coverage_tiers(company_ids)
+    tiers["zero_officers"] += len(universe) - len(company_ids)
+    return {
+        "universe_size": len(universe),
+        "universe_with_graph_entity": len(company_ids),
+        **tiers,
+    }
+
+
+def _officer_coverage_tiers(company_ids: set[int]) -> dict[str, int]:
+    """Partition `company_ids` (GB-COH company Entity ids) into three officer-coverage tiers.
+
+    See `coverage_report` for what `direct_roster_fetch` /
+    `appointment_hop_only` / `zero_officers` mean.
+    """
+    direct_fetch_ids = set(
+        Attestation.objects.filter(
+            source_name=SOURCE_NAME,
+            source_url__endswith="/officers",
+            edge__edge_type="officer_of",
+            edge__target_entity_id__in=company_ids,
+        ).values_list("edge__target_entity_id", flat=True)
+    )
+    any_officer_ids = set(
+        Edge.objects.filter(edge_type="officer_of", target_entity_id__in=company_ids).values_list(
+            "target_entity_id", flat=True
+        )
+    )
+    return {
+        "direct_roster_fetch": len(direct_fetch_ids),
+        "appointment_hop_only": len(any_officer_ids - direct_fetch_ids),
+        "zero_officers": len(company_ids) - len(any_officer_ids),
+    }
+
+
+def append_run_manifest(output_dir: str | Path, **fields: Any) -> Path:
+    """Append one audit record to `{output_dir}/run_manifest.jsonl`.
+
+    Each CLI invocation appends a line recording the selection rule used,
+    the run timestamp, and outcome counts -- so a later reader can tell
+    whether (and why) a given company set was ever attempted, without having
+    to enumerate every per-company cache file (auditability requirement for
+    an arbitrary, partial, resumable expansion of officer coverage).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "run_manifest.jsonl"
+    record = {"recorded_at": datetime.now(UTC).isoformat(), **fields}
+    with manifest_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    return manifest_path
 
 
 def ingest_company_officers(

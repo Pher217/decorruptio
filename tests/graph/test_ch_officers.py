@@ -9,22 +9,36 @@ Verifies the core invariants:
   match_confidence, never guessed at full confidence
 - A missing COMPANIES_HOUSE_API_KEY raises a clear error before any
   network call is attempted
+
+Also covers the officer-coverage-expansion primitives (`select_next_pending`,
+`salted_hash_order`, `procurement_supplier_universe`, `officer_ids_for_companies`,
+`coverage_report`, `procurement_universe_coverage_report`, `append_run_manifest`)
+and the CLI's salt-persistence helper.
 """
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
+from scripts.ingest_ch_officers import _load_or_create_salt
 
 from uncorrupt.graph.ch_officers import (
     API_KEY_ENV_VAR,
+    append_run_manifest,
+    coverage_report,
     fetch_company_officers,
     ingest_company_officers,
+    officer_ids_for_companies,
+    procurement_supplier_universe,
+    procurement_universe_coverage_report,
+    salted_hash_order,
+    select_next_pending,
 )
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.models import Company
+from uncorrupt.staging.models import Company, SupplierResolution
 
 RAW_OFFICER_ITEM = {
     "name": "SMITH, John Michael",
@@ -402,3 +416,462 @@ class TestChOfficersFetchStripsPersonalFields:
         results = fetch_company_officers(["12410514"], tmp_path, client=client)
         assert call_count == 1
         assert results[0].cached is True
+
+
+def _write_valid_cache(
+    tmp_path: Path, company_number: str, items: list[dict], retrieved_at: str | None = None
+) -> None:
+    """Write a real, hash-verified cache entry.
+
+    Unlike `_write_cache` above (whose fixed 'sha256:deadbeef' content_hash
+    never matches -- fine for ingest-only tests that read the JSON directly),
+    this computes the real hash so cache-validity checks (`_is_freshly_cached`
+    / `select_next_pending`) actually see it as fresh.
+    """
+    payload = json.dumps(items)
+    (tmp_path / f"{company_number}.json").write_text(payload)
+    content_hash = f"sha256:{hashlib.sha256(payload.encode()).hexdigest()}"
+    (tmp_path / f"{company_number}.provenance.json").write_text(
+        json.dumps(
+            {
+                "company_number": company_number,
+                "source_url": f"https://api.company-information.service.gov.uk/company/{company_number}/officers",
+                "retrieved_at": retrieved_at or datetime.now(UTC).isoformat(),
+                "content_hash": content_hash,
+                "officer_count": len(items),
+            }
+        )
+    )
+
+
+class TestSelectNextPending:
+    def test_limit_none_returns_all_companies_unchanged(self, tmp_path):
+        """GIVEN limit=None WHEN selecting THEN every company is returned, in the given order."""
+        result = select_next_pending(["3", "1", "2"], tmp_path, limit=None)
+        assert result == ["3", "1", "2"]
+
+    def test_skips_companies_with_valid_cache(self, tmp_path):
+        """GIVEN one company already validly cached WHEN limit=2 THEN only the uncached
+        companies are selected, cached ones are skipped entirely."""
+        _write_valid_cache(tmp_path, "00000001", [RAW_OFFICER_ITEM])
+
+        result = select_next_pending(["00000001", "00000002", "00000003"], tmp_path, limit=2)
+
+        assert result == ["00000002", "00000003"]
+
+    def test_stops_at_limit_after_skipping_cached(self, tmp_path):
+        """GIVEN a cached company ahead of two pending ones WHEN limit=1 THEN exactly one
+        pending company is returned, not the cached one and not both pending ones."""
+        _write_valid_cache(tmp_path, "00000001", [RAW_OFFICER_ITEM])
+
+        result = select_next_pending(["00000001", "00000002", "00000003"], tmp_path, limit=1)
+
+        assert result == ["00000002"]
+
+    def test_treats_stale_cache_as_pending(self, tmp_path):
+        """GIVEN a cache entry older than max_cache_age_days WHEN selecting THEN it is
+        treated as pending (selected), not skipped as fresh."""
+        stale_retrieved_at = (datetime.now(UTC) - timedelta(days=31)).isoformat()
+        _write_valid_cache(
+            tmp_path, "00000001", [RAW_OFFICER_ITEM], retrieved_at=stale_retrieved_at
+        )
+
+        result = select_next_pending(["00000001"], tmp_path, limit=5, max_cache_age_days=30)
+
+        assert result == ["00000001"]
+
+    def test_treats_corrupted_provenance_as_pending(self, tmp_path):
+        """GIVEN a provenance file that is not valid JSON WHEN selecting THEN the company
+        is treated as pending rather than raising."""
+        (tmp_path / "00000001.json").write_text(json.dumps([RAW_OFFICER_ITEM]))
+        (tmp_path / "00000001.provenance.json").write_text("{not valid json")
+
+        result = select_next_pending(["00000001"], tmp_path, limit=5)
+
+        assert result == ["00000001"]
+
+    def test_limit_zero_selects_nothing(self, tmp_path):
+        """GIVEN limit=0 WHEN selecting THEN no companies are selected at all."""
+        result = select_next_pending(["00000001", "00000002"], tmp_path, limit=0)
+        assert result == []
+
+
+class TestSaltedHashOrder:
+    def test_order_matches_independent_sha256_computation(self):
+        """GIVEN a fixed company list and salt WHEN ordered THEN the result matches the
+        exact sha256(salt+company_number)-ascending order computed independently
+        (not company-number-ascending -- this salt/set combination reverses it)."""
+        numbers = ["00000001", "00000002", "00000003", "00000004"]
+
+        result = salted_hash_order(numbers, salt="fixed-salt-123")
+
+        assert result == ["00000004", "00000003", "00000002", "00000001"]
+
+    def test_same_salt_is_deterministic_across_calls(self):
+        """GIVEN the same salt WHEN called twice THEN the order is identical both times."""
+        numbers = ["00000005", "00000012", "00000099", "00000003"]
+
+        first = salted_hash_order(numbers, salt="repeat-salt")
+        second = salted_hash_order(numbers, salt="repeat-salt")
+
+        assert first == second
+
+    def test_preserves_the_same_set_of_companies(self):
+        """GIVEN a company list WHEN reordered THEN no company is added, dropped, or
+        duplicated -- only the order changes."""
+        numbers = ["00000007", "00000002", "00000009"]
+
+        result = salted_hash_order(numbers, salt="some-salt")
+
+        assert sorted(result) == sorted(numbers)
+
+
+@pytest.mark.django_db
+class TestProcurementSupplierUniverse:
+    def test_returns_distinct_resolved_company_numbers(self):
+        """GIVEN two supplier resolutions pointing at the same company WHEN building the
+        universe THEN the company number appears exactly once."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Acme Ltd",
+            company_number="00000001",
+            match_confidence=1.0,
+            match_method="identifier",
+        )
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Acme Limited",
+            company_number="00000001",
+            match_confidence=0.9,
+            match_method="exact_name",
+        )
+
+        universe = procurement_supplier_universe()
+
+        assert universe == ["00000001"]
+
+    def test_excludes_unresolved_suppliers_with_no_company_number(self):
+        """GIVEN a supplier resolution with no resolved company_number WHEN building the
+        universe THEN that row contributes nothing to it."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Unknown Supplier Ltd",
+            company_number=None,
+            match_confidence=0.0,
+            match_method=None,
+        )
+
+        universe = procurement_supplier_universe()
+
+        assert universe == []
+
+    def test_empty_when_no_supplier_resolutions_exist(self):
+        """GIVEN no SupplierResolution rows at all WHEN building the universe THEN it is
+        empty, never invented."""
+        assert procurement_supplier_universe() == []
+
+
+@pytest.mark.django_db
+class TestOfficerIdsForCompanies:
+    def test_returns_registry_id_of_officer_with_stable_id(self):
+        """GIVEN a company with one identifier-matched officer WHEN queried THEN that
+        officer's registry_id is returned."""
+        company = _make_company_entity("00000001")
+        officer = _make_officer_entity("officer-abc")
+        _make_officer_of_edge(officer, company, source_url="https://x/company/00000001/officers")
+
+        result = officer_ids_for_companies(["00000001"])
+
+        assert result == ["officer-abc"]
+
+    def test_excludes_officer_with_no_stable_id(self):
+        """GIVEN a company whose only officer has no stable CH officer ID
+        (GB-COH-OFFICER-UNRESOLVED) WHEN queried THEN nothing is returned -- expanding an
+        unresolved placeholder would risk fetching the wrong person's appointments."""
+        company = _make_company_entity("00000002")
+        unresolved = Entity.objects.create(
+            entity_type="person",
+            registry_scheme="GB-COH-OFFICER-UNRESOLVED",
+            registry_id="00000002:JONES, ALICE",
+            name="JONES, Alice",
+        )
+        _make_officer_of_edge(unresolved, company, source_url="https://x/company/00000002/officers")
+
+        result = officer_ids_for_companies(["00000002"])
+
+        assert result == []
+
+    def test_same_officer_across_two_companies_is_not_duplicated(self):
+        """GIVEN one officer serving on two companies in the batch WHEN queried THEN the
+        officer's registry_id appears exactly once."""
+        officer = _make_officer_entity("officer-shared")
+        company_a = _make_company_entity("00000003")
+        company_b = _make_company_entity("00000004")
+        _make_officer_of_edge(officer, company_a, source_url="https://x/company/00000003/officers")
+        _make_officer_of_edge(officer, company_b, source_url="https://x/company/00000004/officers")
+
+        result = officer_ids_for_companies(["00000003", "00000004"])
+
+        assert result == ["officer-shared"]
+
+    def test_unpadded_company_number_still_resolves(self):
+        """GIVEN a company stored zero-padded WHEN queried with an unpadded number THEN
+        it still resolves (mirrors the ingest-side padding normalisation)."""
+        company = _make_company_entity("00000005")
+        officer = _make_officer_entity("officer-padded")
+        _make_officer_of_edge(officer, company, source_url="https://x/company/00000005/officers")
+
+        result = officer_ids_for_companies(["5"])
+
+        assert result == ["officer-padded"]
+
+
+@pytest.mark.django_db
+class TestCoverageReport:
+    def test_direct_roster_fetch_company_is_counted_in_that_tier(self):
+        """GIVEN a company with an officer_of edge attested by a direct /officers fetch
+        WHEN reporting coverage THEN it counts as direct_roster_fetch, not zero_officers."""
+        company = _make_company_entity("00000001")
+        officer = _make_officer_entity("officer-1")
+        _make_officer_of_edge(officer, company, source_url="https://x/company/00000001/officers")
+
+        report = coverage_report()
+
+        assert report["direct_roster_fetch"] == 1
+
+    def test_appointment_hop_only_company_is_not_counted_as_direct_fetch(self):
+        """GIVEN a company whose only officer_of edge came from an /appointments walk
+        WHEN reporting coverage THEN it counts as appointment_hop_only, not
+        direct_roster_fetch -- it never had its own roster fetched."""
+        company = _make_company_entity("00000002")
+        officer = _make_officer_entity("officer-2")
+        _make_officer_of_edge(
+            officer, company, source_url="https://x/officers/officer-2/appointments"
+        )
+
+        report = coverage_report()
+
+        assert report["appointment_hop_only"] == 1
+        assert report["direct_roster_fetch"] == 0
+
+    def test_company_with_no_officer_edge_is_counted_as_zero_officers(self):
+        """GIVEN a company with no officer_of edge at all WHEN reporting coverage THEN it
+        counts as zero_officers."""
+        _make_company_entity("00000003")
+
+        report = coverage_report()
+
+        assert report["zero_officers"] == 1
+
+    def test_tier_counts_sum_to_total(self):
+        """GIVEN a mix of direct-fetch, appointment-hop-only, and zero-officer companies
+        WHEN reporting coverage THEN the three tiers sum exactly to the total."""
+        direct = _make_company_entity("00000004")
+        hop_only = _make_company_entity("00000005")
+        _make_company_entity("00000006")  # zero officers
+        _make_officer_of_edge(
+            _make_officer_entity("officer-4"),
+            direct,
+            source_url="https://x/company/00000004/officers",
+        )
+        _make_officer_of_edge(
+            _make_officer_entity("officer-5"),
+            hop_only,
+            source_url="https://x/officers/officer-5/appointments",
+        )
+
+        report = coverage_report()
+
+        assert (
+            report["direct_roster_fetch"] + report["appointment_hop_only"] + report["zero_officers"]
+            == report["total_gb_coh_companies"]
+        )
+
+
+@pytest.mark.django_db
+class TestProcurementUniverseCoverageReport:
+    def test_universe_size_matches_distinct_resolved_suppliers(self):
+        """GIVEN two SupplierResolution rows resolving to two distinct companies WHEN
+        reporting universe coverage THEN universe_size is exactly 2."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Acme Ltd",
+            company_number="00000001",
+            match_confidence=1.0,
+            match_method="identifier",
+        )
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Beta Ltd",
+            company_number="00000002",
+            match_confidence=1.0,
+            match_method="identifier",
+        )
+
+        report = procurement_universe_coverage_report()
+
+        assert report["universe_size"] == 2
+
+    def test_company_outside_universe_is_excluded_from_report(self):
+        """GIVEN a GB-COH company entity with officers but NOT referenced by any
+        SupplierResolution WHEN reporting universe coverage THEN it is not counted
+        anywhere in the universe report."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Acme Ltd",
+            company_number="00000001",
+            match_confidence=1.0,
+            match_method="identifier",
+        )
+        outside_universe = _make_company_entity("00000099")
+        _make_officer_of_edge(
+            _make_officer_entity("officer-99"),
+            outside_universe,
+            source_url="https://x/company/00000099/officers",
+        )
+
+        report = procurement_universe_coverage_report()
+
+        assert report["universe_size"] == 1
+        assert report["universe_with_graph_entity"] == 0
+
+    def test_universe_company_with_no_graph_entity_counts_as_zero_officers(self):
+        """GIVEN a resolved supplier company that has never been touched by the graph
+        pipeline (no Entity created at all) WHEN reporting universe coverage THEN it
+        still counts towards zero_officers, and not towards universe_with_graph_entity."""
+        SupplierResolution.objects.create(
+            source_id="uk_contracts_finder",
+            supplier_name="Never Touched Ltd",
+            company_number="00000042",
+            match_confidence=1.0,
+            match_method="identifier",
+        )
+
+        report = procurement_universe_coverage_report()
+
+        assert report["universe_with_graph_entity"] == 0
+        assert report["zero_officers"] == 1
+
+    def test_universe_tier_counts_sum_to_universe_size(self):
+        """GIVEN a mix of universe companies (with an entity + officers, with an entity
+        but no officers, and with no entity at all) WHEN reporting universe coverage
+        THEN the tiers sum exactly to universe_size."""
+        for i, number in enumerate(["00000001", "00000002", "00000003"]):
+            SupplierResolution.objects.create(
+                source_id="uk_contracts_finder",
+                supplier_name=f"Supplier {i}",
+                company_number=number,
+                match_confidence=1.0,
+                match_method="identifier",
+            )
+        with_officer = _make_company_entity("00000001")
+        _make_company_entity("00000002")  # entity exists, no officers
+        # 00000003: no Entity at all
+        _make_officer_of_edge(
+            _make_officer_entity("officer-1"),
+            with_officer,
+            source_url="https://x/company/00000001/officers",
+        )
+
+        report = procurement_universe_coverage_report()
+
+        assert (
+            report["direct_roster_fetch"] + report["appointment_hop_only"] + report["zero_officers"]
+            == report["universe_size"]
+        )
+
+
+class TestAppendRunManifest:
+    def test_appends_one_json_line_per_call(self, tmp_path):
+        """GIVEN two separate calls WHEN appending THEN the manifest has exactly two
+        lines, not one overwritten line."""
+        append_run_manifest(tmp_path, selection_rule="first run", fetched=1)
+        append_run_manifest(tmp_path, selection_rule="second run", fetched=2)
+
+        lines = (tmp_path / "run_manifest.jsonl").read_text().splitlines()
+
+        assert len(lines) == 2
+
+    def test_record_includes_given_fields_and_a_timestamp(self, tmp_path):
+        """GIVEN a call with arbitrary keyword fields WHEN appending THEN the resulting
+        JSON record contains those exact fields plus a recorded_at timestamp."""
+        append_run_manifest(tmp_path, selection_rule="universe=procurement-suppliers", salt="abc")
+
+        record = json.loads((tmp_path / "run_manifest.jsonl").read_text().splitlines()[0])
+
+        assert record["selection_rule"] == "universe=procurement-suppliers"
+        assert record["salt"] == "abc"
+        assert "recorded_at" in record
+
+
+def _make_company_entity(company_number: str, name: str = "Test Co Ltd") -> Entity:
+    return Entity.objects.create(
+        entity_type="company",
+        company_number=company_number,
+        registry_scheme="GB-COH",
+        registry_id=company_number,
+        name=name,
+    )
+
+
+def _make_officer_entity(registry_id: str, name: str = "SMITH, John") -> Entity:
+    return Entity.objects.create(
+        entity_type="person",
+        registry_scheme="GB-COH-OFFICER",
+        registry_id=registry_id,
+        name=name,
+    )
+
+
+def _make_officer_of_edge(
+    person: Entity, company: Entity, source_url: str, source_reference: str = "ref"
+) -> Edge:
+    edge = Edge.objects.create(edge_type="officer_of", source_entity=person, target_entity=company)
+    Attestation.objects.create(
+        edge=edge,
+        source_name="Companies House",
+        source_url=source_url,
+        source_reference=source_reference,
+        match_confidence=1.0,
+        match_method="identifier",
+    )
+    return edge
+
+
+class TestLoadOrCreateSalt:
+    def test_explicit_salt_always_wins(self, tmp_path):
+        """GIVEN an explicit salt WHEN loading THEN it is returned unchanged, even if a
+        manifest with a different salt already exists."""
+        append_run_manifest(tmp_path, selection_rule="prior run", salt="salt-from-manifest")
+
+        result = _load_or_create_salt(tmp_path, explicit_salt="salt-from-cli")
+
+        assert result == "salt-from-cli"
+
+    def test_reuses_salt_from_existing_manifest(self, tmp_path):
+        """GIVEN no explicit salt but an existing manifest recording one WHEN loading
+        THEN the manifest's salt is reused, not a freshly generated one."""
+        append_run_manifest(tmp_path, selection_rule="first run", salt="pinned-salt")
+
+        result = _load_or_create_salt(tmp_path, explicit_salt=None)
+
+        assert result == "pinned-salt"
+
+    def test_generates_a_new_salt_when_no_manifest_exists(self, tmp_path):
+        """GIVEN no explicit salt and no manifest file WHEN loading THEN a new 32-character
+        hex salt is generated (secrets.token_hex(16))."""
+        result = _load_or_create_salt(tmp_path, explicit_salt=None)
+
+        assert len(result) == 32
+        int(result, 16)  # raises ValueError if not valid hex
+
+    def test_reuses_earliest_recorded_salt_across_multiple_manifest_lines(self, tmp_path):
+        """GIVEN a manifest with two runs recording different salts WHEN loading THEN the
+        FIRST recorded salt wins -- the salt must stay pinned for the whole sweep, not
+        drift to whatever the most recent run happened to pass."""
+        append_run_manifest(tmp_path, selection_rule="run one", salt="salt-one")
+        append_run_manifest(tmp_path, selection_rule="run two", salt="salt-two")
+
+        result = _load_or_create_salt(tmp_path, explicit_salt=None)
+
+        assert result == "salt-one"

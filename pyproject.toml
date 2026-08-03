@@ -27,6 +27,14 @@ dev = [
     "pre-commit>=3.7",
     "types-pyyaml",
 ]
+pdf = [
+    "pypdf>=4.0",
+]
+ocr = [
+    "pytesseract>=0.3.10",
+    "pypdfium2>=4.0",
+    "pillow>=10.0",
+]
 
 [project.scripts]
 uncorrupt = "uncorrupt.cli:main"

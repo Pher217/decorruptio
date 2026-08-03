@@ -4,8 +4,12 @@ Spec (LOCKED, do not deviate): vault
 `02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
 including AMENDMENT v2 (temporal evidence ladder), v2.1 (unit of analysis +
 revised verdict set), v2.3 (manifest schema semantics + the narrowed case
-key) and v2.4 (control battery, per-stratum gating, freeze protocol).
-Sections 5-7 and all four amendments are binding.
+key), v2.4 (control battery, per-stratum gating, freeze protocol), v2.5-v2.6
+(snapshot ceiling, evidence-type stratification, office-holding-end-date
+clarification), v2.7 (precommitted cohort selection + retrieval_stratum),
+v2.8/SEALED COHORT v2 (retrieval strata assigned, the effective denominator --
+N_total=20, N_untestable=3 declared BY CONSTRUCTION). Sections 5-7 and every
+amendment are binding.
 
 This script does NOT implement a second path-search or resolution stack. It
 calls the same code the rest of Phase C already uses and already trusts:
@@ -95,14 +99,38 @@ collapsed (c) into a refutation and had to retract "0 of 52" because of it:
   (e) recovered_circular  -- spec SS3: recovery PROVEN to rest solely on a
                              source the row's own `excluded_from_retrieval`
                              names. Excluded from `cases_recovered`.
+  (f) recovered_unverifiable_provenance -- adversarial-review Severity 1
+                             finding 2: recovery rests only on unattested
+                             evidence -- nothing PROVES it circular, but
+                             nothing POSITIVELY VERIFIES it as permitted
+                             either. Publication-grade evidence fails
+                             CLOSED: also excluded from `cases_recovered`,
+                             reported separately, never silently folded
+                             into "clean".
 
-Only a resolved, non-PSC-only, non-circular pair with no path at all, dated
-or undated, is a genuine `not_recovered` miss.
+Only a resolved, non-PSC-only, non-circular, positively-verified pair with
+no path at all, dated or undated, is a genuine `not_recovered` miss.
 
-VERDICT SET (amendments v2.1 A2.1.2 and v2.4 A2.4.4):
+Qualification for (a)/(e)/(f) is decided PER PATH (`PathEvidence`,
+`classify_recovered_cases`) -- never by unioning taint or strata across a
+case's several found paths (adversarial-review Severity 1 finding 3). A
+single path spanning both a passing and a non-passing material stratum does
+NOT qualify merely because one of its strata passes, and a clean-but-
+unsupported-stratum path can never be paired with a circular-but-passing-
+stratum path from a DIFFERENT path on the same case to manufacture a
+qualification neither path earns on its own.
 
-  INSUFFICIENT-COHORT  testable cases fall short of the pre-registered
-                       20-case cohort. Checked first.
+VERDICT SET (amendments v2.1 A2.1.2, v2.4 A2.4.4, v2.8 A2.8.5):
+
+  INSUFFICIENT-COHORT  the manifest's case set is not exactly the sealed
+                       `PREREGISTERED_COHORT_SIZE`-case cohort, OR the
+                       testable count falls below what the sealed cohort's
+                       OWN precommitted `PREREGISTERED_UNTESTABLE_BY_CONSTRUCTION`
+                       subset allows (v2.8/SEALED COHORT v2: N_total=20,
+                       3 declared untestable BY CONSTRUCTION -- this does
+                       NOT block scoring; a degenerate testable count from a
+                       resolver regression or an outsized no_trace_by_design
+                       fraction does). Checked first.
   INVALID              the CoverageGate fails -- pipeline broken.
   INSTRUMENT-LIMITED   no material stratum passes at all, OR (when 0 cases
                        qualify) at least one material stratum is still
@@ -111,11 +139,15 @@ VERDICT SET (amendments v2.1 A2.1.2 and v2.4 A2.4.4):
   CONFIRMED / PARTIAL  >=4 (CONFIRMED) or 1-3 (PARTIAL) cases recovered
                        through a PASSING stratum's evidence -- source-
                        qualified: the verdict names which strata the
-                       recovered paths belong to (see `filter_by_passing_stratum`
+                       recovered paths belong to (see `classify_recovered_cases`
                        and `main()`'s reporting). A case recovered ONLY
                        through an unsupported stratum (e.g. Lords-only,
                        while Lords remains unavailable) does not count here;
-                       it is reported separately, per case.
+                       it is reported separately, per case. NOT gated on
+                       benchmark precision (adversarial-review Severity 2
+                       finding 7 -- precision is built from a diagnostic
+                       amendment v2.4 A2.4.1 retired to non-gating; gating
+                       CONFIRMED on it contradicted that retirement).
   REFUTED              0 cases recovered AND EVERY material stratum passes
                        its own retrieval and temporal controls (A2.4.4) --
                        the strongest, least available verdict. A passing
@@ -124,10 +156,15 @@ VERDICT SET (amendments v2.1 A2.1.2 and v2.4 A2.4.4):
                        verified Commons recovery (A2.4.4) -- this is why
                        CONFIRMED/PARTIAL use per-stratum qualification while
                        REFUTED requires the whole battery.
+  UNDEFINED-OUTCOME    any input combination the verdict table above does
+                       not partition (e.g. a negative `cases_recovered` from
+                       a caller defect) -- adversarial-review Severity 2
+                       finding 6: a loud, honest refusal to classify rather
+                       than a silent PARTIAL fall-through.
 
 COUNTRY_SWITCH IS NOT A VERDICT -- it is an action triggered by PARTIAL,
-REFUTED, or INSTRUMENT-LIMITED (never by INSUFFICIENT-COHORT or INVALID).
-See `country_switch_triggered`.
+REFUTED, or INSTRUMENT-LIMITED (never by INSUFFICIENT-COHORT, INVALID, or
+UNDEFINED-OUTCOME). See `country_switch_triggered`.
 
 Statistical reporting (amendment A2.5): a `0/N` control or negative-control
 count is never printed bare -- `wilson_upper_bound` computes the ~95%
@@ -149,6 +186,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -162,7 +200,12 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
-from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest  # noqa: E402
+from scripts.load_gold_manifest import (  # noqa: E402
+    GoldCase,
+    GoldRow,
+    ManifestLoadResult,
+    load_gold_manifest,
+)
 from scripts.phase_c_paths import (  # noqa: E402
     build_adjacency,
     find_paths,
@@ -184,6 +227,58 @@ CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
 # SS5). Applying them to a smaller -- or smaller-than-it-looks -- cohort
 # misrepresents statistical power. See PREREGISTERED_COHORT_SIZE below.
 PREREGISTERED_COHORT_SIZE = 20
+
+# SEALED COHORT v2 / amendment v2.8 §A2.8.5: of the sealed 20, exactly 3 are
+# declared untestable BY CONSTRUCTION (no ingested register could ever carry
+# their evidence -- a personal tie, NHS-accounts-only disclosure, a
+# journalism-only advisory role) -- precommitted BEFORE any retrieval result
+# was viewed, not discovered afterwards. Scoring the sealed cohort must not
+# demand these 3 "come back testable" -- that would contradict v2.8's whole
+# point (report `0/N_CH`, never `0/20`). The guard below therefore checks
+# COHORT MEMBERSHIP (are these the sealed 20 cases at all -- exactly
+# `PREREGISTERED_COHORT_SIZE` of them) separately from a DEGENERATE testable
+# count (protecting against a resolver regression or an unexpectedly large
+# no_trace_by_design fraction wiping out the denominator) -- never a demand
+# that all 20 be independently recoverable.
+PREREGISTERED_UNTESTABLE_BY_CONSTRUCTION = 3
+
+# Spec A2.4.5 freeze protocol: the 2-hop search budget is FROZEN, not a free
+# CLI knob -- Severity 3 finding 9. Widening it after seeing a result is
+# exactly the "adding hops" forbidden by spec SS6/A2.6.
+LOCKED_MAX_HOPS = 2
+
+# SEALED COHORT v2 (spec, "SEALED COHORT v2 -- 2026-08-03 -- recomputed after
+# verification removals (same salt)"): the awardee `company_number`s that ARE
+# the sealed 20, published so the selection is independently reproducible
+# from the manifest under the fixed salt `decorruptio-gold-cohort-v1:`
+# (v2.7 §A2.7.1). `11014884` replaced `09223972` after verification removed
+# it from the pool (v2.6/SEALED COHORT v2). Enforced here (Severity 3 finding
+# 9) so the runner cannot silently score the 24-case pool, an earlier 20, or
+# any other subset as if it were the locked cohort.
+SEALED_COHORT_V2_COMPANY_NUMBERS = frozenset(
+    {
+        "05437166",
+        "03456018",
+        "01428210",
+        "09618361",
+        "NI015738",
+        "08205551",
+        "12597000",
+        "SC149147",
+        "04398739",
+        "10268228",
+        "SC179860",
+        "03655958",
+        "08126173",
+        "04757301",
+        "00502663",
+        "08001168",
+        "10603870",
+        "NI622060",
+        "07042994",
+        "11014884",
+    }
+)
 
 # Material strata (spec A2.4.3) -- the minimum set the sealed benchmark
 # defines, independent of whatever the current ingest happens to contain.
@@ -243,6 +338,43 @@ def path_strata(path: list[Edge]) -> frozenset[str]:
     return frozenset(s for e in path if (s := classify_edge_stratum(e)) is not None)
 
 
+@dataclass(frozen=True)
+class PathEvidence:
+    """The evidence carried by ONE individual found path, kept SEPARATE from
+    every other path (spec A2.4.4, adversarial-review Severity 1 finding 3).
+
+    Both `RowEvaluation.path_evidences` and `CaseEvaluation.path_evidences`
+    are flat tuples of these -- never unioned or merged into a single
+    aggregate taint/strata pair. The defect this exists to prevent: unioning
+    across paths lets a single path that touches BOTH a passing and a
+    non-passing stratum qualify because the union merely INTERSECTS the
+    passing set, and lets a case combine a clean-but-unsupported-stratum path
+    with a circular-but-passing-stratum path into something that reads as
+    globally clean AND globally passing-stratum-touching, even though no
+    single path is both. Qualification (`passes_stratum_gates`) is therefore
+    always evaluated per evidence entry, never on a merged view.
+    """
+
+    taint: str  # "clean" | "tainted" | "unverifiable" -- spec SS3, this path alone
+    strata: frozenset[str]
+
+    @property
+    def is_positively_verified(self) -> bool:
+        """Spec SS3 / Severity 1 finding 2: only a path proven 'clean' -- not
+        merely 'not proven tainted' -- counts as positively verified
+        permitted provenance. 'unverifiable' (an unattested edge) and
+        'tainted' (a proven excluded-source match) both fail this."""
+        return self.taint == "clean"
+
+    def passes_stratum_gates(self, passing_strata: frozenset[str]) -> bool:
+        """Spec A2.4.4: THIS path qualifies only if it is positively
+        verified, touches at least one material stratum, and EVERY stratum
+        it touches is currently passing -- a subset check, not an
+        intersection. A path that also touches an unvalidated stratum must
+        never qualify merely because it ALSO touches a validated one."""
+        return self.is_positively_verified and bool(self.strata) and self.strata <= passing_strata
+
+
 @dataclass
 class RowEvaluation:
     case_id: str
@@ -250,7 +382,14 @@ class RowEvaluation:
     reason: str | None = None
     source_separation: str = "not_applicable"
     example_path: list[str] = field(default_factory=list)
-    strata: frozenset[str] = frozenset()
+    path_evidences: tuple[PathEvidence, ...] = ()
+
+    @property
+    def strata(self) -> frozenset[str]:
+        """Display-only union of every path's strata (spec A2.4.3 reporting).
+        NEVER used for qualification -- see `PathEvidence.passes_stratum_gates`
+        and `classify_recovered_cases`, which read `path_evidences` directly."""
+        return frozenset().union(*(pe.strata for pe in self.path_evidences))
 
 
 @dataclass
@@ -266,7 +405,13 @@ class CaseEvaluation:
     status: str  # recovered | undated_only | not_recovered | untestable | no_trace_by_design
     source_separation: str
     row_evaluations: list[RowEvaluation]
-    strata: frozenset[str] = frozenset()
+    path_evidences: tuple[PathEvidence, ...] = ()
+
+    @property
+    def strata(self) -> frozenset[str]:
+        """Display-only union across every contributing path -- see
+        `RowEvaluation.strata`'s docstring; never used for qualification."""
+        return frozenset().union(*(pe.strata for pe in self.path_evidences))
 
     @property
     def is_concentrated(self) -> bool:
@@ -300,10 +445,15 @@ class CoverageGate:
 
     @property
     def supplier_universe_passed(self) -> bool:
+        # Severity 3 finding 8: `covered` must be a genuine subset of `total`
+        # -- without the `covered <= total` bound, a malformed report (e.g.
+        # 2/1) would compute a ratio > 1.0 and pass regardless of
+        # `CONTROLS_PASS_FRACTION`.
         return (
             self.total is not None
             and self.total > 0
             and self.covered is not None
+            and 0 <= self.covered <= self.total
             and (self.covered / self.total) >= CONTROLS_PASS_FRACTION
         )
 
@@ -313,6 +463,7 @@ class CoverageGate:
             self.commons_total is not None
             and self.commons_total > 0
             and self.commons_covered is not None
+            and 0 <= self.commons_covered <= self.commons_total
             and (self.commons_covered / self.commons_total) >= CONTROLS_PASS_FRACTION
         )
 
@@ -321,7 +472,72 @@ class CoverageGate:
         return self.supplier_universe_passed and self.commons_universe_passed
 
 
-def load_coverage_gate(path: Path) -> CoverageGate:
+@dataclass(frozen=True)
+class GateBinding:
+    """Spec A2.4.5: a frozen coverage/stratum gate authorizes scoring only
+    for the EXACT graph + code + manifest state it was measured against --
+    never a floating trust token (Severity 3 finding 10). The caller (`main`)
+    supplies the CURRENT state; `load_coverage_gate`/`load_stratum_gates`
+    refuse (fail closed to the all-unavailable default) whenever the gate
+    JSON's own recorded state does not match -- a stale gate can never
+    authorize scoring against a different graph.
+
+    `binding=None` (the default) skips verification entirely -- used by
+    tests that only care about the retrieval/temporal-count logic and supply
+    no binding-relevant fields at all. `main()` always supplies a real one.
+    """
+
+    code_commit: str
+    graph_hash: str
+    manifest_hash: str
+
+    def matches(self, data: dict) -> bool:
+        return (
+            data.get("code_commit") == self.code_commit
+            and data.get("graph_hash") == self.graph_hash
+            and data.get("manifest_hash") == self.manifest_hash
+        )
+
+
+def compute_graph_hash() -> str:
+    """Canonical, order-independent graph hash (spec A2.4.5) -- a drift
+    detector, not a cryptographic commitment: sha256 over every edge's
+    (edge_type, source_entity_id, target_entity_id, valid_from) tuple,
+    sorted so insertion order never changes the hash."""
+    rows = sorted(
+        Edge.objects.values_list("edge_type", "source_entity_id", "target_entity_id", "valid_from")
+    )
+    h = hashlib.sha256()
+    for row in rows:
+        h.update("|".join(str(x) for x in row).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def current_code_commit() -> str:
+    """Spec A2.4.5's "code commit" binding field. Falls back to the literal
+    string "unknown" rather than raising -- a missing git checkout must not
+    crash a benchmark run -- but "unknown" can never match a real recorded
+    commit hash, so binding verification still fails closed."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def compute_manifest_hash(path: Path) -> str:
+    """Spec A2.4.5's "gold-manifest hash" binding field."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_coverage_gate(path: Path, binding: GateBinding | None = None) -> CoverageGate:
     """Load the spec A2.4.2 global coverage gate result, if measured.
 
     Expected JSON contract, produced by a separate coverage-measurement
@@ -329,15 +545,22 @@ def load_coverage_gate(path: Path) -> CoverageGate:
 
         {
           "supplier_universe_covered": int, "supplier_universe_total": int,
-          "commons_universe_covered": int, "commons_universe_total": int
+          "commons_universe_covered": int, "commons_universe_total": int,
+          "code_commit": str, "graph_hash": str, "manifest_hash": str
         }
 
     Returns the all-False default (`CoverageGate()`) if the file does not
-    exist -- a missing measurement is never an implicit pass.
+    exist -- a missing measurement is never an implicit pass. Likewise if
+    `binding` is supplied and the report's own `code_commit`/`graph_hash`/
+    `manifest_hash` do not match it (Severity 3 finding 10) -- a gate
+    measured against a different graph, code version, or manifest can never
+    silently authorize the CURRENT run.
     """
     if not path.exists():
         return CoverageGate()
     data = json.loads(path.read_text())
+    if binding is not None and not binding.matches(data):
+        return CoverageGate()
     return CoverageGate(
         covered=data.get("supplier_universe_covered"),
         total=data.get("supplier_universe_total"),
@@ -372,10 +595,14 @@ class StratumGate:
 
     @property
     def retrieval_passed(self) -> bool:
+        # Severity 3 finding 8: same 0 <= recovered <= total bound as
+        # CoverageGate -- a malformed 2/1-style report must not compute a
+        # >1.0 ratio and pass.
         return (
             self.retrieval_total is not None
             and self.retrieval_total > 0
             and self.retrieval_recovered is not None
+            and 0 <= self.retrieval_recovered <= self.retrieval_total
             and (self.retrieval_recovered / self.retrieval_total) >= CONTROLS_PASS_FRACTION
         )
 
@@ -385,6 +612,7 @@ class StratumGate:
             self.temporal_total is not None
             and self.temporal_total > 0
             and self.temporal_recovered is not None
+            and 0 <= self.temporal_recovered <= self.temporal_total
             and (self.temporal_recovered / self.temporal_total) >= CONTROLS_PASS_FRACTION
         )
 
@@ -393,12 +621,29 @@ class StratumGate:
         return self.available and self.retrieval_passed and self.temporal_passed
 
 
-def load_stratum_gates(path: Path) -> dict[str, StratumGate]:
+def _parse_json_bool(value: object) -> bool:
+    """Coerce a JSON gate field to a real boolean (Severity 3 finding 8).
+
+    A well-formed JSON `false` literal already parses to Python's `False`,
+    so bare `bool(...)` works for it. But a malformed report that writes the
+    QUOTED STRING `"false"` instead of the JSON literal `false` would
+    otherwise become truthy through bare `bool(...)` -- any non-empty string
+    is truthy in Python, so `bool("false") is True`. Reject that silently
+    wrong report instead: a string value is True only if it spells a
+    recognised affirmative token.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def load_stratum_gates(path: Path, binding: GateBinding | None = None) -> dict[str, StratumGate]:
     """Load the spec A2.4.3 per-material-stratum gate results.
 
     Expected JSON contract -- one entry per material stratum:
 
         {
+          "code_commit": str, "graph_hash": str, "manifest_hash": str,
           "commons_declared_interest": {
             "available": true,
             "retrieval_recovered": 9, "retrieval_total": 10,
@@ -411,18 +656,23 @@ def load_stratum_gates(path: Path) -> dict[str, StratumGate]:
     Every entry in `MATERIAL_STRATA` is always present in the returned dict
     -- a stratum missing from the file (or the file itself missing) defaults
     to `StratumGate()` (available=False), never silently omitted from the
-    all-strata-must-pass check REFUTED depends on.
+    all-strata-must-pass check REFUTED depends on. Likewise if `binding` is
+    supplied and the report's own `code_commit`/`graph_hash`/`manifest_hash`
+    do not match it (Severity 3 finding 10): every stratum defaults to
+    unavailable, exactly as if the file were missing.
     """
     gates = {name: StratumGate() for name in MATERIAL_STRATA}
     if not path.exists():
         return gates
     data = json.loads(path.read_text())
+    if binding is not None and not binding.matches(data):
+        return gates
     for name in MATERIAL_STRATA:
         entry = data.get(name)
         if not entry:
             continue
         gates[name] = StratumGate(
-            available=bool(entry.get("available", False)),
+            available=_parse_json_bool(entry.get("available", False)),
             retrieval_recovered=entry.get("retrieval_recovered"),
             retrieval_total=entry.get("retrieval_total"),
             temporal_recovered=entry.get("temporal_recovered"),
@@ -431,21 +681,62 @@ def load_stratum_gates(path: Path) -> dict[str, StratumGate]:
     return gates
 
 
+def validate_locked_protocol(manifest_result: ManifestLoadResult, max_hops: int) -> list[str]:
+    """Spec A2.4.5 freeze protocol: the runner must refuse to silently score
+    an un-sealed manifest or an unlocked hop budget (Severity 3 finding 9).
+
+    Pure and DB-free -- takes an already-loaded `ManifestLoadResult`, so it
+    is unit-testable without a manifest that resolves against real graph
+    data. Returns a list of violation messages; an empty list means the run
+    matches the locked protocol.
+    """
+    violations: list[str] = []
+    if max_hops != LOCKED_MAX_HOPS:
+        violations.append(
+            f"--max-hops={max_hops} does not match the locked two-hop setting "
+            f"({LOCKED_MAX_HOPS}, spec A2.4.5) -- the sealed benchmark may only be scored at "
+            "the frozen hop budget; widening it after seeing a result is forbidden (SS6/A2.6)."
+        )
+    actual = frozenset(c.company_number for c in manifest_result.cases)
+    if actual != SEALED_COHORT_V2_COMPANY_NUMBERS:
+        missing = sorted(SEALED_COHORT_V2_COMPANY_NUMBERS - actual)
+        extra = sorted(actual - SEALED_COHORT_V2_COMPANY_NUMBERS)
+        detail = []
+        if missing:
+            detail.append(f"missing from manifest: {missing}")
+        if extra:
+            detail.append(f"not part of the sealed cohort: {extra}")
+        violations.append(
+            "manifest case set does not match SEALED COHORT v2 (spec A2.7.1) -- "
+            + "; ".join(detail)
+        )
+    return violations
+
+
 def _resolve_referrer_entities(
     row: GoldRow, people_by_surname: dict[str, list[Entity]]
 ) -> list[Entity]:
-    """Registry ID first when the manifest supplies one, surname second.
+    """Registry ID first when the manifest supplies one; surname ONLY when it
+    does not.
 
-    Mirrors `resolve_supplier`'s own priority order (a registry identifier
-    beats name-derived matching) rather than inventing a different rule for
-    the person side of the row.
+    ADVERSARIAL FIX (Severity 1, finding 1): this used to fall through to
+    crude surname matching (`resolve_referrer`) whenever a supplied
+    `person_registry_id` failed to resolve. Surname matching is a deliberate
+    over-match (see `phase_c_paths.surname`'s own docstring: "a hit found
+    this way is a candidate ... not a claim about any individual"). Falling
+    back to it after a row has ASSERTED a specific registry identity means an
+    unrelated namesake's path becomes the named subject's "recovery" -- a
+    false accusation against a real person, and exactly the failure mode a
+    registry-ID assertion exists to rule out.
+
+    A row that names a `person_registry_id` and gets no match for it is
+    therefore `untestable` (empty list here becomes `untestable` via the
+    caller's existing "referrer did not resolve" branch) -- NEVER silently
+    downgraded to a same-surname candidate set. Surname matching is used only
+    for rows that never asserted a registry identifier in the first place.
     """
     if row.person_registry_id:
-        by_id = list(
-            Entity.objects.filter(entity_type="person", registry_id=row.person_registry_id)
-        )
-        if by_id:
-            return by_id
+        return list(Entity.objects.filter(entity_type="person", registry_id=row.person_registry_id))
     return resolve_referrer(row.person_name, people_by_surname)
 
 
@@ -537,26 +828,38 @@ def _resolve_pair(
         {r.id for r in referrers}, supplier.id, adj, max_hops, cutoff=cutoff
     )
 
+    lowered_excluded = [s.lower() for s in row.excluded_from_retrieval if s.strip()]
+
+    def _evidence(paths: list[list[Edge]]) -> tuple[PathEvidence, ...]:
+        """Per-PATH evidence (spec A2.4.4, Severity 1 finding 3) -- always
+        computed directly from `_path_taint`, NEVER through
+        `check_source_separation`'s aggregate-across-paths shortcut, so
+        qualification can require positively verified provenance AND a
+        passing stratum on the SAME path, not a union of the best taint seen
+        anywhere with the best strata seen anywhere."""
+        return tuple(
+            PathEvidence(taint=_path_taint(p, lowered_excluded), strata=path_strata(p))
+            for p in paths
+        )
+
     if pre_award:
         sep = check_source_separation(pre_award, row.excluded_from_retrieval)
-        strata = frozenset().union(*(path_strata(p) for p in pre_award))
         return RowEvaluation(
             case_id=row.case_id,
             status="recovered",
             source_separation=sep,
             example_path=[f"{e.edge_type}@{e.valid_from}" for e in pre_award[0]],
-            strata=strata,
+            path_evidences=_evidence(pre_award),
         )
     if undated:
         sep = check_source_separation(undated, row.excluded_from_retrieval)
-        strata = frozenset().union(*(path_strata(p) for p in undated))
         return RowEvaluation(
             case_id=row.case_id,
             status="undated_only",
             reason="path found but temporally undecidable (spec SS7.2)",
             source_separation=sep,
             example_path=[f"{e.edge_type}@{e.valid_from}" for e in undated[0]],
-            strata=strata,
+            path_evidences=_evidence(undated),
         )
     return RowEvaluation(case_id=row.case_id, status="not_recovered")
 
@@ -624,8 +927,14 @@ def evaluate_case(
     (recovered > undated_only > not_recovered > untestable >
     no_trace_by_design): a case counts as recovered if any one of the people
     tied to it produces a pre-award path, even if others don't resolve at
-    all. `strata` is the UNION of material strata across every row
-    contributing to that winning status (spec A2.4.4 source-qualification).
+    all. `path_evidences` is the CONCATENATION (never a union or merge) of
+    every contributing row's per-path evidence, so qualification
+    (`classify_recovered_cases`) can still require positively verified
+    provenance and a passing stratum on the SAME path (spec A2.4.4).
+    `source_separation` remains a human-readable summary only -- "ok" if any
+    contributing row found an independently clean path, else "cannot_verify"
+    if any is unverifiable, else "violation" only if every one is proven
+    tainted.
     """
     cutoff = case.earliest_award_date
     row_evals = [
@@ -647,12 +956,10 @@ def evaluate_case(
             sep = "violation"
         else:
             sep = "not_applicable"
-        strata = (
-            frozenset().union(*(r.strata for r in contributing)) if contributing else frozenset()
-        )
+        path_evidences = tuple(pe for r in contributing for pe in r.path_evidences)
     else:
         sep = "not_applicable"
-        strata = frozenset()
+        path_evidences = ()
 
     return CaseEvaluation(
         case_key=case.case_key,
@@ -664,66 +971,112 @@ def evaluate_case(
         status=status,
         source_separation=sep,
         row_evaluations=row_evals,
-        strata=strata,
+        path_evidences=path_evidences,
     )
 
 
-def split_recovered_by_source_separation(
+@dataclass(frozen=True)
+class RecoveredCaseSplit:
+    """The four-way, MUTUALLY EXCLUSIVE split of `status == "recovered"`
+    cases produced by `classify_recovered_cases`. Every recovered case
+    appears in exactly one bucket."""
+
+    qualifying: list[CaseEvaluation]
+    circular: list[CaseEvaluation]
+    unverifiable: list[CaseEvaluation]
+    instrument_limited: list[CaseEvaluation]
+
+
+def classify_recovered_cases(
     case_evaluations: list[CaseEvaluation],
-) -> tuple[list[CaseEvaluation], list[CaseEvaluation]]:
-    """Split `status == "recovered"` cases into (clean, circular).
-
-    Adversarial-review defect: a case whose `source_separation == "violation"`
-    means `check_source_separation` has already PROVEN every path found for
-    it is attested SOLELY by a source that row's own `excluded_from_retrieval`
-    names -- exactly the circularity spec SS3 exists to rule out ("if a
-    relationship is only recoverable because we ingested the newspaper
-    article that revealed it, we have measured our own ingest, not the
-    registers"). Counting such a case toward CONFIRMED would let the
-    project's own journalism/inquiry ingest manufacture an affirmative,
-    reputation-bearing claim about a named person or company.
-
-    `clean` is every other recovered case ("ok" -- an independent, permitted
-    path exists -- or "cannot_verify", where nothing PROVES circularity, only
-    an unattested edge). Only `clean` may ever count toward
-    CONFIRMED/PARTIAL/REFUTED thresholds; `circular` must be reported
-    prominently and never silently folded back in.
-
-    If a case has both a clean and a tainted path, `evaluate_case`'s own
-    roll-up already resolves this: source_separation is "ok" the moment ANY
-    contributing row's path is clean, so such a case lands in `clean` here
-    too -- the clean path carries it, as required.
-    """
-    recovered = [c for c in case_evaluations if c.status == "recovered"]
-    circular = [c for c in recovered if c.source_separation == "violation"]
-    clean = [c for c in recovered if c.source_separation != "violation"]
-    return clean, circular
-
-
-def filter_by_passing_stratum(
-    cases: list[CaseEvaluation],
     stratum_gates: dict[str, StratumGate],
-) -> tuple[list[CaseEvaluation], list[CaseEvaluation]]:
-    """Split recovered (already circularity-cleaned) cases into (qualifying,
-    instrument_limited) by whether their evidence touches a PASSING stratum.
+) -> RecoveredCaseSplit:
+    """Split `status == "recovered"` cases by PER-PATH qualification (spec
+    A2.4.4, A2.4.4/SS3), replacing the two-stage
+    split-then-filter that unioned taint and strata across paths (Severity 1
+    findings 2 and 3 of the adversarial review).
 
-    Spec A2.4.4: "recovered strict paths must belong to passing strata" --
-    a case whose recovered evidence touches NO passing stratum (e.g. its
-    only path is Lords-only, and Lords remains unavailable per A2.4.2)
-    cannot count toward CONFIRMED/PARTIAL/REFUTED. It is `instrument_limited`
-    FOR THAT CASE, reported separately, never silently dropped.
+    A case is `qualifying` iff AT LEAST ONE of its individual `path_evidences`
+    independently satisfies `PathEvidence.passes_stratum_gates` -- positively
+    verified permitted provenance (taint == "clean", never "cannot_verify" /
+    unverifiable and never a proven "tainted" violation) AND a non-empty
+    material stratum set AND every stratum that SAME path touches is
+    currently passing. This is a per-path AND, never a case-wide union:
 
-    A case whose evidence touches AT LEAST ONE passing stratum qualifies --
-    even if it ALSO touches an unsupported one -- because "an unvalidated
-    Lords gate must not erase a genuine, independently verified Commons
-    recovery" (A2.4.4).
+      * a single path spanning both a passing and a non-passing stratum does
+        NOT qualify merely because one of its strata passes (fixes finding 3a);
+      * a clean-but-unsupported-stratum path can never be combined with a
+        circular-but-passing-stratum path from a DIFFERENT path on the same
+        case to manufacture a false qualification (fixes finding 3b);
+      * a path whose only unattested/"cannot_verify" evidence is publication-
+        grade cannot rescue a case into CONFIRMED/PARTIAL/REFUTED merely
+        because nothing PROVES it is circular -- only a POSITIVELY verified
+        path counts (fixes finding 2: fail CLOSED, not open).
+
+    Non-qualifying recovered cases are further bucketed, for transparent
+    reporting only (none of these ever count toward CONFIRMED/PARTIAL/
+    REFUTED):
+
+      * `circular`   -- every one of its paths is proven `tainted`; SS3
+                        proves the case is recoverable ONLY through an
+                        excluded source.
+      * `unverifiable` -- no path is `tainted` either (not proven circular),
+                        but none is positively verified clean -- publication-
+                        grade evidence must fail CLOSED here, not credit an
+                        unproven provenance.
+      * `instrument_limited` -- at least one path IS positively verified
+                        clean, but none of its strata are currently passing
+                        (e.g. Lords-only while Lords remains unavailable).
     """
     passing = frozenset(
         name for name in MATERIAL_STRATA if stratum_gates.get(name, StratumGate()).passed
     )
-    qualifying = [c for c in cases if c.strata & passing]
-    instrument_limited = [c for c in cases if not (c.strata & passing)]
-    return qualifying, instrument_limited
+    recovered = [c for c in case_evaluations if c.status == "recovered"]
+
+    qualifying: list[CaseEvaluation] = []
+    circular: list[CaseEvaluation] = []
+    unverifiable: list[CaseEvaluation] = []
+    instrument_limited: list[CaseEvaluation] = []
+
+    for case in recovered:
+        evidences = case.path_evidences
+        if any(pe.passes_stratum_gates(passing) for pe in evidences):
+            qualifying.append(case)
+        elif evidences and all(pe.taint == "tainted" for pe in evidences):
+            circular.append(case)
+        elif any(pe.is_positively_verified for pe in evidences):
+            instrument_limited.append(case)
+        else:
+            unverifiable.append(case)
+
+    return RecoveredCaseSplit(
+        qualifying=qualifying,
+        circular=circular,
+        unverifiable=unverifiable,
+        instrument_limited=instrument_limited,
+    )
+
+
+def qualifying_strata_touched(
+    qualifying_recovered: list[CaseEvaluation],
+    stratum_gates: dict[str, StratumGate],
+) -> frozenset[str]:
+    """The strata actually carried by the PathEvidence entries that made each
+    qualifying case qualify -- NOT the display-only `case.strata` union,
+    which can include strata from OTHER, non-qualifying paths on the same
+    case (spec A2.4.4 reporting must name only the strata the recovery
+    itself depends on)."""
+    passing = frozenset(
+        name for name in MATERIAL_STRATA if stratum_gates.get(name, StratumGate()).passed
+    )
+    return frozenset().union(
+        *(
+            pe.strata
+            for case in qualifying_recovered
+            for pe in case.path_evidences
+            if pe.passes_stratum_gates(passing)
+        )
+    )
 
 
 def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
@@ -746,17 +1099,38 @@ def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
     return (centre + adjustment) / denom
 
 
+def negatives_recovered_from(negative_controls: dict) -> int:
+    """Severity 1 finding 4: the strict PRE-AWARD endpoint from the negative
+    controls JSON -- the same endpoint definition as `cases_recovered`
+    (clean, stratum-qualified, dated-before-the-award paths only).
+
+    `negative_controls["with_path"]` (ANY path, dated or not) must NEVER be
+    used here: it would measure `compute_precision`'s denominator at a
+    looser endpoint than its numerator, making the ratio meaningless.
+    `with_preaward` is the run_negative_controls.py field computed at the
+    matching strict endpoint.
+    """
+    return negative_controls["with_preaward"]
+
+
 def compute_precision(cases_recovered: int, negatives_recovered: int) -> float:
     """BENCHMARK precision over the constructed case-control sample (spec
-    SS5/A2.5) -- itself a non-gating historical diagnostic as of amendment
-    A2.4.1. `cases_recovered` (case-level, already circularity- and
-    stratum-qualification-filtered) against a spurious hit count from the
-    200 matched negatives.
+    SS5/A2.5) -- a non-gating historical diagnostic (amendment A2.4.1).
+    `cases_recovered` (case-level, already circularity- and
+    stratum-qualification-filtered, STRICT pre-award endpoint) against a
+    spurious hit count from the 200 matched negatives, measured at the SAME
+    strict pre-award endpoint (Severity 1 finding 4 -- see
+    `negatives_recovered`'s caller in `main()`, which now reads
+    `with_preaward`, not `with_path`, so both sides of this ratio share one
+    definition of "recovered").
 
     Spec A2.5 is explicit that this is benchmark precision on a constructed
     ~20:200 sample, NOT expected field precision at real-world prevalence --
     callers must label it as such and report sensitivity / false-positive
     rate as separate figures, never substitute this number for either.
+
+    NOT a gate (Severity 2 finding 7): `classify_outcome` does not accept a
+    precision argument at all -- see its docstring for why.
     """
     denom = cases_recovered + negatives_recovered
     return cases_recovered / denom if denom > 0 else 0.0
@@ -767,28 +1141,31 @@ def classify_outcome(
     cases_total: int,
     cases_untestable: int,
     cases_no_trace_by_design: int,
-    precision: float,
     coverage_gate: CoverageGate,
     stratum_gates: dict[str, StratumGate],
 ) -> str:
     """Spec A2.1.2 (v2.1) verdict set, RESTRUCTURED by amendment v2.4 for
-    per-stratum gating, all case-level.
+    per-stratum gating and amendment v2.8 for the sealed cohort's declared
+    untestable-by-construction subset, all case-level.
 
     Strict priority order:
 
-      0. testable cases < PREREGISTERED_COHORT_SIZE      -> INSUFFICIENT-COHORT
-      1. CoverageGate fails (A2.4.2)                      -> INVALID
-      2. no material stratum passes at all                -> INSTRUMENT-LIMITED
-      3. >=4 qualifying cases & >=80% precision            -> CONFIRMED
+      0a. cases_total != PREREGISTERED_COHORT_SIZE         -> INSUFFICIENT-COHORT
+      0b. testable cases too small to be the sealed cohort
+          minus its declared-by-construction untestables    -> INSUFFICIENT-COHORT
+      1. CoverageGate fails (A2.4.2)                       -> INVALID
+      2. no material stratum passes at all                 -> INSTRUMENT-LIMITED
+      3. >=4 qualifying cases                              -> CONFIRMED
       4. 0 qualifying cases:
-           every material stratum passes (A2.4.4)          -> REFUTED
-           otherwise                                       -> INSTRUMENT-LIMITED
-      5. 1-3 qualifying cases                              -> PARTIAL
+           every material stratum passes (A2.4.4)           -> REFUTED
+           otherwise                                        -> INSTRUMENT-LIMITED
+      5. 1-3 qualifying cases                               -> PARTIAL
+      6. anything else (a caller defect, e.g. a negative
+         `cases_recovered`)                                 -> UNDEFINED-OUTCOME
 
-    `cases_recovered` MUST already be filtered by the caller through BOTH
-    `split_recovered_by_source_separation` (excluding proven-circular
-    recoveries, spec SS3) AND `filter_by_passing_stratum` (excluding
-    recoveries whose evidence touches no passing stratum, spec A2.4.4) --
+    `cases_recovered` MUST already be filtered by the caller through
+    `classify_recovered_cases` (excluding proven-circular recoveries and
+    recoveries whose evidence touches no passing stratum, spec SS3/A2.4.4) --
     this function does not (and cannot) re-derive either exclusion from a
     bare count; it is the caller's responsibility, exactly like the retired
     single-gate design required for its temporal gate.
@@ -801,9 +1178,41 @@ def classify_outcome(
     demands the full battery: it is impossible to assert "0/20, and we are
     confident the instrument would have found something if it were there"
     while any material stratum remains unvalidated.
+
+    NO PRECISION ARGUMENT (Severity 2 finding 7, resolved): v2.1's locked §6
+    table required "'>=80% precision" for CONFIRMED, but that precision was
+    always computed from the 200-pair matched-negative diagnostic amendment
+    v2.4 A2.4.1 explicitly retired to NON-GATING status ("NEITHER feeds
+    classify_outcome nor may appear in the primary results table"). Gating
+    CONFIRMED on it was therefore a direct contradiction, not a matter of
+    interpretation -- this file's own `compute_precision` docstring already
+    asserted precision was non-gating before this fix made the code agree.
+    Un-retiring the negatives back to gating status is a spec-amendment
+    decision (would need a new dated, reviewed amendment, e.g. v2.9) that a
+    benchmark-scoring bugfix has no authority to make unilaterally, so the
+    resolution taken here is the other side of the choice the review offered
+    ("precision must not consume them"): CONFIRMED is decided by case count
+    alone, and `benchmark_precision` is reported purely as a labelled,
+    non-gating diagnostic (as A2.4.1 and A2.5 already require).
+
+    Branch 6 (Severity 2 finding 6, UNDEFINED-OUTCOME): with precision
+    removed from gating, branches 3/4/5 now exhaustively partition every
+    legitimate `cases_recovered` value (0, 1-3, and >=4 out of a cohort whose
+    size was already validated by branch 0a/0b) -- the specific ambiguous
+    scenario the review found ("4 recoveries at precision 0.79" silently
+    read as PARTIAL) cannot recur because precision no longer participates.
+    Branch 6 remains as an explicit, honest refusal for any input outside
+    that partition (e.g. a negative `cases_recovered` from a caller defect)
+    rather than a silent fall-through default -- "the scorer must not invent
+    an interpretation" applies to every unexpected input, not only the
+    precision case that prompted the finding.
     """
+    if cases_total != PREREGISTERED_COHORT_SIZE:
+        return "INSUFFICIENT-COHORT"
+
     testable = cases_total - cases_untestable - cases_no_trace_by_design
-    if testable < PREREGISTERED_COHORT_SIZE:
+    min_expected_testable = PREREGISTERED_COHORT_SIZE - PREREGISTERED_UNTESTABLE_BY_CONSTRUCTION
+    if testable < min_expected_testable:
         return "INSUFFICIENT-COHORT"
 
     if not coverage_gate.passed:
@@ -816,21 +1225,25 @@ def classify_outcome(
     if not any_stratum_passes:
         return "INSTRUMENT-LIMITED"
 
-    if cases_recovered >= CONFIRM_MIN_CASES and precision >= CONFIRM_MIN_PRECISION:
+    if cases_recovered >= CONFIRM_MIN_CASES:
         return "CONFIRMED"
     if cases_recovered == 0:
         return "REFUTED" if all_strata_pass else "INSTRUMENT-LIMITED"
-    return "PARTIAL"
+    if 1 <= cases_recovered < CONFIRM_MIN_CASES:
+        return "PARTIAL"
+    return "UNDEFINED-OUTCOME"
 
 
 def country_switch_triggered(outcome: str) -> bool:
     """Spec A2.1.2: COUNTRY_SWITCH is an ACTION, not a verdict.
 
     Triggered by PARTIAL, REFUTED, or INSTRUMENT-LIMITED -- i.e. by every
-    verdict except CONFIRMED, INVALID, and INSUFFICIENT-COHORT (a broken
-    pipeline or an inadequately-sized/tested cohort licenses no action at
-    all until it is fixed -- switching country does not fix a resolver
-    regression or a too-small manifest).
+    verdict except CONFIRMED, INVALID, INSUFFICIENT-COHORT, and
+    UNDEFINED-OUTCOME (a broken pipeline, an inadequately-sized/tested
+    cohort, or an input combination the pre-registration does not cover
+    licenses no action at all until it is fixed/understood -- switching
+    country does not fix a resolver regression, a too-small manifest, or an
+    unclassifiable result).
     """
     return outcome in ("PARTIAL", "REFUTED", "INSTRUMENT-LIMITED")
 
@@ -884,11 +1297,38 @@ def main() -> None:
             "re-running them. These are non-gating diagnostics only (spec A2.4.1)."
         ),
     )
+    parser.add_argument(
+        "--allow-protocol-deviation",
+        action="store_true",
+        help=(
+            "score anyway even if --max-hops or the manifest's case set does not match the "
+            "locked/sealed protocol (spec A2.4.5) -- for development/synthetic-manifest runs "
+            "only, never for the sealed gold benchmark."
+        ),
+    )
     args = parser.parse_args()
 
     manifest_result = load_gold_manifest(args.manifest)
     concentrated_cases = [c for c in manifest_result.cases if c.is_concentrated]
     psc_rows = [r for r in manifest_result.admissible if r.is_psc_sourced]
+
+    # Severity 3 finding 9: refuse to silently score a different manifest
+    # subset or a non-locked hop budget as if it were the sealed benchmark.
+    protocol_violations = validate_locked_protocol(manifest_result, args.max_hops)
+    if protocol_violations:
+        for violation in protocol_violations:
+            print(f"PROTOCOL: {violation}", file=sys.stderr)
+        if not args.allow_protocol_deviation:
+            raise SystemExit(
+                "Refusing to score: manifest/hop budget does not match the locked, sealed "
+                "protocol (spec A2.4.5). Pass --allow-protocol-deviation to score anyway "
+                "(development/synthetic manifests only -- never the sealed gold benchmark)."
+            )
+        print(
+            "WARNING: --allow-protocol-deviation set -- scoring despite the violation(s) "
+            "above. This run is NOT the sealed gold benchmark.",
+            file=sys.stderr,
+        )
 
     print(f"=== GOLD MANIFEST: {args.manifest} ===")
     print(f"admissible rows : {len(manifest_result.admissible)}")
@@ -937,11 +1377,26 @@ def main() -> None:
     # population false-positive estimate.
     diagnostic_regression_recovered = positive_controls["retrieved"]
     diagnostic_regression_total = positive_controls["n"]
-    negatives_recovered = negative_controls["with_path"]
+    # Severity 1 finding 4: `benchmark_precision`'s numerator (`cases_recovered`)
+    # is the STRICT pre-award endpoint -- clean, stratum-qualified,
+    # dated-before-the-award paths only. Reading `with_path` here (ANY path,
+    # dated or not) would measure the denominator at a looser endpoint than
+    # the numerator, making the ratio meaningless. `with_preaward` is the
+    # matching strict endpoint on the negative side, so both halves of this
+    # ratio share exactly one definition of "recovered".
+    negatives_recovered = negatives_recovered_from(negative_controls)
     negatives_total = negative_controls["n"]
 
-    coverage_gate = load_coverage_gate(Path(args.coverage_gate_report))
-    stratum_gates = load_stratum_gates(Path(args.stratum_gates_report))
+    # Severity 3 finding 10: bind the gate reports to the CURRENT graph, code
+    # commit and manifest -- a gate measured against a different state must
+    # fail closed, never silently authorize this run (spec A2.4.5).
+    binding = GateBinding(
+        code_commit=current_code_commit(),
+        graph_hash=compute_graph_hash(),
+        manifest_hash=compute_manifest_hash(Path(args.manifest)),
+    )
+    coverage_gate = load_coverage_gate(Path(args.coverage_gate_report), binding=binding)
+    stratum_gates = load_stratum_gates(Path(args.stratum_gates_report), binding=binding)
     if not coverage_gate.passed:
         print(
             f"\nWARNING: coverage gate not passing (report: {args.coverage_gate_report}) -- "
@@ -975,18 +1430,16 @@ def main() -> None:
     def _count(evals: list, status: str) -> int:
         return sum(1 for e in evals if e.status == status)
 
-    clean_recovered, circular_recovered = split_recovered_by_source_separation(case_evaluations)
-    qualifying_recovered, instrument_limited_recovered = filter_by_passing_stratum(
-        clean_recovered, stratum_gates
-    )
+    recovered_split = classify_recovered_cases(case_evaluations, stratum_gates)
+    qualifying_recovered = recovered_split.qualifying
+    circular_recovered = recovered_split.circular
+    unverifiable_recovered = recovered_split.unverifiable
+    instrument_limited_recovered = recovered_split.instrument_limited
     cases_recovered = len(qualifying_recovered)
     cases_recovered_circular = len(circular_recovered)
+    cases_recovered_unverifiable = len(unverifiable_recovered)
     cases_recovered_instrument_limited = len(instrument_limited_recovered)
-    qualifying_strata = (
-        frozenset().union(*(c.strata for c in qualifying_recovered))
-        if qualifying_recovered
-        else frozenset()
-    )
+    qualifying_strata = qualifying_strata_touched(qualifying_recovered, stratum_gates)
 
     cases_undated_only = _count(case_evaluations, "undated_only")
     cases_not_recovered = _count(case_evaluations, "not_recovered")
@@ -999,6 +1452,10 @@ def main() -> None:
     rows_untestable = _count(row_evaluations, "untestable")
     rows_no_trace_by_design = _count(row_evaluations, "no_trace_by_design")
 
+    # NON-GATING (Severity 2 finding 7): benchmark_precision is a reported
+    # diagnostic only -- classify_outcome takes no precision argument. Both
+    # sides of the ratio now share the strict pre-award endpoint (Severity 1
+    # finding 4).
     benchmark_precision = compute_precision(cases_recovered, negatives_recovered)
     # Denominator is EVERY case, including untestable and no_trace_by_design
     # ones -- named explicitly so a reader cannot mistake a low figure here
@@ -1014,7 +1471,6 @@ def main() -> None:
         len(manifest_result.cases),
         cases_untestable,
         cases_no_trace_by_design,
-        benchmark_precision,
         coverage_gate,
         stratum_gates,
     )
@@ -1025,7 +1481,11 @@ def main() -> None:
     # `circular_recovered` (above) is the verdict-critical subset.
     violations = [c for c in case_evaluations if c.source_separation == "violation"]
     undated_only_violations = [c for c in violations if c.status == "undated_only"]
-    unverifiable = [c for c in case_evaluations if c.source_separation == "cannot_verify"]
+    # Case-level SUMMARY diagnostic (display only, via the aggregate
+    # `source_separation` field) -- distinct from `unverifiable_recovered`
+    # above, which is the PER-PATH exclusion (Severity 1 finding 2) actually
+    # subtracted from `cases_recovered`.
+    unverifiable_summary = [c for c in case_evaluations if c.source_separation == "cannot_verify"]
 
     print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops, case-level) ===")
     print(f"cases total (distinct awardees)    : {len(manifest_result.cases)}")
@@ -1036,6 +1496,10 @@ def main() -> None:
     print(
         f"  recovered_circular (SS3 violation): {cases_recovered_circular}"
         "  -- PROVEN circular, EXCLUDED from recovered/CONFIRMED/REFUTED"
+    )
+    print(
+        f"  recovered_unverifiable_provenance : {cases_recovered_unverifiable}"
+        "  -- no path positively verified clean, EXCLUDED from recovered (fail CLOSED)"
     )
     print(
         f"  recovered_instrument_limited      : {cases_recovered_instrument_limited}"
@@ -1074,10 +1538,19 @@ def main() -> None:
         f"{diagnostic_regression_total}"
     )
     print(
-        f"  negative spurious rate (any path): {negatives_recovered}/{negatives_total} "
+        f"  negative spurious rate (pre-award, strict): {negatives_recovered}/{negatives_total} "
         f"(95% CI upper bound: {negatives_fp_upper_95:.1%}) -- spec A2.5: never a bare zero"
     )
-    print(f"  benchmark precision (NOT field precision): {benchmark_precision:.3f}")
+    print(
+        f"  benchmark precision (NOT field precision, NOT gating -- A2.4.1/finding 7): "
+        f"{benchmark_precision:.3f}"
+    )
+    if cases_recovered > 0 and benchmark_precision < CONFIRM_MIN_PRECISION:
+        print(
+            f"  NOTE: benchmark precision {benchmark_precision:.3f} is below the historical "
+            f"{CONFIRM_MIN_PRECISION:.0%} figure -- reported for transparency only; it does NOT "
+            "affect the outcome above (finding 7)."
+        )
     print(
         f"  sensitivity (recall, over ALL {len(manifest_result.cases)} cases incl. "
         f"untestable/no_trace_by_design): {sensitivity_over_all_cases:.3f}"
@@ -1095,6 +1568,12 @@ def main() -> None:
             f"path (excluded from the recovered count above): "
             f"{[c.case_key for c in circular_recovered]}"
         )
+    if unverifiable_recovered:
+        print(
+            f"\nNOTE: {cases_recovered_unverifiable} recovered case(s) had no path with "
+            f"positively verified permitted provenance (excluded from the recovered count, "
+            f"fail-CLOSED per finding 2): {[c.case_key for c in unverifiable_recovered]}"
+        )
     if instrument_limited_recovered:
         print(
             f"\nNOTE: {cases_recovered_instrument_limited} recovered case(s) depend entirely on "
@@ -1108,10 +1587,11 @@ def main() -> None:
             f"never counts as recovered -- but is a real circularity in that evidence): "
             f"{[c.case_key for c in undated_only_violations]}"
         )
-    if unverifiable:
+    if unverifiable_summary:
         print(
-            f"\nNOTE: source separation could NOT be verified for {len(unverifiable)} case(s) "
-            f"(unattested edge on every found path): {[c.case_key for c in unverifiable]}"
+            f"\nNOTE: source separation could NOT be verified for {len(unverifiable_summary)} "
+            f"case(s) (unattested edge on every found path): "
+            f"{[c.case_key for c in unverifiable_summary]}"
         )
 
     report = {
@@ -1119,6 +1599,7 @@ def main() -> None:
         "country_switch_triggered": switch_action,
         "qualifying_strata": sorted(qualifying_strata),
         "benchmark_precision": benchmark_precision,
+        "benchmark_precision_note": "non-gating diagnostic only -- see finding 7 / A2.4.1",
         "sensitivity_over_all_cases": sensitivity_over_all_cases,
         "false_positive_rate": false_positive_rate,
         "false_positive_rate_upper_bound_95pct": negatives_fp_upper_95,
@@ -1126,12 +1607,16 @@ def main() -> None:
             "total": len(manifest_result.cases),
             "recovered": cases_recovered,
             "recovered_circular": cases_recovered_circular,
+            "recovered_unverifiable_provenance": cases_recovered_unverifiable,
             "recovered_instrument_limited": cases_recovered_instrument_limited,
             "undated_only": cases_undated_only,
             "not_recovered": cases_not_recovered,
             "untestable": cases_untestable,
             "no_trace_by_design": cases_no_trace_by_design,
             "recovered_circular_case_keys": [c.case_key for c in circular_recovered],
+            "recovered_unverifiable_provenance_case_keys": [
+                c.case_key for c in unverifiable_recovered
+            ],
             "recovered_instrument_limited_case_keys": [
                 c.case_key for c in instrument_limited_recovered
             ],
@@ -1179,9 +1664,13 @@ def main() -> None:
                 "total": diagnostic_regression_total,
             },
             "negative_controls_topology_snapshot": {
-                "any_path": negatives_recovered,
+                "pre_award_strict": negatives_recovered,
                 "n": negatives_total,
                 "upper_bound_95pct": negatives_fp_upper_95,
+                "note": (
+                    "pre-award, strict endpoint -- same definition of 'recovered' as the "
+                    "positive side of benchmark_precision (finding 4)"
+                ),
             },
         },
         "source_separation": {
@@ -1192,7 +1681,7 @@ def main() -> None:
             "violations_undated_only_no_verdict_impact": [
                 c.case_key for c in undated_only_violations
             ],
-            "unverifiable": [c.case_key for c in unverifiable],
+            "unverifiable": [c.case_key for c in unverifiable_summary],
             "known_limits": (
                 "Best-effort Attestation.source_name substring match only. Cannot detect an "
                 "excluded source that shaped resolution/ingestion without being logged as an "

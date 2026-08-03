@@ -108,6 +108,11 @@ from uncorrupt.staging.companies_house import normalise_company_number  # noqa: 
 # `intermediary_company_number` and `awardee_confirmed` added by spec
 # amendment v2.3 (A2.3.1). `held_office_at_award` and
 # `office_holding_start_date` added by spec amendment v2.2 (A2.2.2).
+# `office_holding_end_date` added by amendment v2.6 (A2.6.1 -- "at or before"
+# was ambiguous; office ended before the award must also be caught).
+# `retrieval_stratum` added by amendment v2.7 (A2.7.2 -- precommitted before
+# any retrieval result is viewed). `stratum_confidence` added by amendment
+# v2.8 (A2.8.4 -- flags e.g. a kinship-gap case as low-confidence).
 REQUIRED_COLUMNS = (
     "case_id",
     "person_name",
@@ -124,11 +129,44 @@ REQUIRED_COLUMNS = (
     "awardee_confirmed",
     "held_office_at_award",
     "office_holding_start_date",
+    "office_holding_end_date",
+    "retrieval_stratum",
+    "stratum_confidence",
 )
 
 # spec A2.3.3: the established_by value flagging a row whose relationship
 # rests only on Persons-with-Significant-Control data.
 PSC_LABEL_SOURCE = "PSC"
+
+# Spec amendment v2.5 A2.5.3: `relationship_type` is a CONTROLLED vocabulary,
+# not free text -- sourcing produced 19 distinct values across 34 rows
+# (including full prose) before this was enforced, breaking the
+# evidence-type stratification A2.5.2 keys on. "consultancy" is the one
+# addition the amendment names beyond the base §4 list.
+RELATIONSHIP_TYPE_VOCABULARY = frozenset(
+    {"directorship", "shareholding", "donation", "family", "employment", "consultancy"}
+)
+
+# Spec amendment v2.7 A2.7.2: each case's retrieval_stratum names the
+# register(s) its recovery depends on, assigned BEFORE any retrieval result
+# is viewed. A multi-source case may combine tokens with " + " (mirroring
+# the pre-registration's own table notation, e.g. "companies_house +
+# electoral_commission") -- each token individually must be in this set.
+RETRIEVAL_STRATUM_VOCABULARY = frozenset(
+    {
+        "companies_house",
+        "electoral_commission",
+        "commons_register",
+        "lords_register",
+        "register_of_interests",
+        "unknown",
+    }
+)
+
+# Spec amendment v2.8 A2.8.4: a case may be flagged `stratum_confidence: low`
+# when its recovery rests on a structurally shaky anchor (e.g. the kinship
+# gap -- a family member's directorship, not the official's own).
+STRATUM_CONFIDENCE_VOCABULARY = frozenset({"high", "low"})
 
 # Shared truthy/falsy vocabulary for the two explicit-assertion columns
 # (`awardee_confirmed`, `held_office_at_award`) -- both follow the same rule:
@@ -163,6 +201,9 @@ class GoldRow:
     excluded_from_retrieval: tuple[str, ...]
     intermediary_company_number: str | None
     office_holding_start_date: date
+    office_holding_end_date: date | None = None
+    retrieval_stratum: str | None = None
+    stratum_confidence: str | None = None
 
     @property
     def is_psc_sourced(self) -> bool:
@@ -373,6 +414,63 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                     f"award_date {award_date} (spec SS2.4)"
                 )
 
+        # Spec amendment v2.5 A2.5.3: relationship_type is a CONTROLLED
+        # vocabulary, never free text -- a naive exact match on uncontrolled
+        # prose silently undercounts the evidence-type stratification A2.5.2
+        # depends on.
+        relationship_type = (raw.get("relationship_type") or "").strip()
+        if relationship_type.lower() not in RELATIONSHIP_TYPE_VOCABULARY:
+            reasons.append(
+                f"relationship_type {relationship_type!r} is not in the controlled "
+                f"vocabulary {sorted(RELATIONSHIP_TYPE_VOCABULARY)} (spec A2.5.3) -- "
+                "normalise to the controlled set (preserving the original in `notes`) "
+                "before sealing the manifest"
+            )
+
+        # Spec amendment v2.7 A2.7.2: retrieval_stratum names the register(s)
+        # a case's recovery depends on. Blank is permitted here -- whether it
+        # was actually assigned BEFORE any retrieval result was viewed is a
+        # curation-time precommitment this loader cannot verify from the CSV
+        # alone -- but a value that IS supplied must be drawn from the
+        # controlled vocabulary (tokens joined by " + " for multi-source
+        # cases, mirroring the pre-registration's own table notation).
+        retrieval_stratum_raw = (raw.get("retrieval_stratum") or "").strip()
+        retrieval_stratum: str | None = retrieval_stratum_raw or None
+        if retrieval_stratum_raw:
+            tokens = [t.strip().lower() for t in retrieval_stratum_raw.split("+")]
+            bad_tokens = [t for t in tokens if t not in RETRIEVAL_STRATUM_VOCABULARY]
+            if bad_tokens:
+                reasons.append(
+                    f"retrieval_stratum token(s) {bad_tokens} not in the controlled "
+                    f"vocabulary {sorted(RETRIEVAL_STRATUM_VOCABULARY)} (spec A2.7.2)"
+                )
+
+        # Spec amendment v2.8 A2.8.4: stratum_confidence flags a
+        # structurally shaky recovery anchor (e.g. the kinship gap). Blank is
+        # permitted (no annotation); a supplied value must be "high" or "low".
+        stratum_confidence_raw = (raw.get("stratum_confidence") or "").strip()
+        stratum_confidence: str | None = stratum_confidence_raw.lower() or None
+        if stratum_confidence_raw and stratum_confidence not in STRATUM_CONFIDENCE_VOCABULARY:
+            reasons.append(
+                f"stratum_confidence {stratum_confidence_raw!r} is not in "
+                f"{sorted(STRATUM_CONFIDENCE_VOCABULARY)} (spec A2.8.4)"
+            )
+
+        # Spec amendment v2.6 A2.6.1: office_holding_end_date is OPTIONAL --
+        # blank means "no known end / still serving" and adds no constraint.
+        # A supplied value must parse as an ISO date; whether it disqualifies
+        # the row (office had already ended before the award) is decided
+        # below, alongside the existing start-date check.
+        office_holding_end_date_raw = (raw.get("office_holding_end_date") or "").strip()
+        office_holding_end_date: date | None = None
+        if office_holding_end_date_raw:
+            office_holding_end_date = _parse_iso_date(office_holding_end_date_raw)
+            if office_holding_end_date is None:
+                reasons.append(
+                    f"office_holding_end_date {office_holding_end_date_raw!r} is not a "
+                    "valid ISO date (spec A2.6.1)"
+                )
+
         # `held_office_at_award` is the curator's DIRECT assertion (spec
         # SS2.5), not a re-derivable duplicate of `awardee_confirmed`'s
         # pattern: an explicit 'no' means the sourcing agent has determined
@@ -410,19 +508,40 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
         # fires on EITHER signal: the curator's direct 'no', or (even if the
         # curator said 'yes') the date itself proving otherwise -- an
         # inconsistent 'yes' does not get to override the date.
-        if not held_office_at_award or office_holding_start_date > award_date:
-            reason = (
-                f"office_holding_start_date {office_holding_start_date} post-dates "
-                f"award_date {award_date}"
-                if held_office_at_award
-                else "held_office_at_award is 'no'"
-            )
+        #
+        # Spec amendment v2.6 A2.6.1: "at or before the award date" was
+        # ambiguous -- holding office at some earlier, ENDED point does not
+        # satisfy §2.5 either (the trustee who resigned one month before the
+        # award). A supplied office_holding_end_date strictly before the
+        # award is therefore an EQUALLY valid out-of-scope trigger alongside
+        # the original start-date check, never overridden by an otherwise
+        # 'yes' held_office_at_award.
+        office_ended_before_award = (
+            office_holding_end_date is not None and office_holding_end_date < award_date
+        )
+        if (
+            not held_office_at_award
+            or office_holding_start_date > award_date
+            or office_ended_before_award
+        ):
+            if not held_office_at_award:
+                reason = "held_office_at_award is 'no'"
+            elif office_holding_start_date > award_date:
+                reason = (
+                    f"office_holding_start_date {office_holding_start_date} post-dates "
+                    f"award_date {award_date}"
+                )
+            else:
+                reason = (
+                    f"office_holding_end_date {office_holding_end_date} pre-dates "
+                    f"award_date {award_date} (spec A2.6.1 -- office had already ended)"
+                )
             result.out_of_scope.append(
                 OutOfScopeRow(
                     case_id=case_id,
                     reason=(
                         f"{reason} -- no public function to influence at the time "
-                        f"(spec A2.2.2); out of scope, not a refutation"
+                        f"(spec A2.2.2/A2.6.1); out of scope, not a refutation"
                     ),
                     raw=raw,
                 )
@@ -436,7 +555,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                 person_registry_id=(raw.get("person_registry_id") or "").strip() or None,
                 company_name=(raw.get("company_name") or "").strip(),
                 company_number=company_number,
-                relationship_type=(raw.get("relationship_type") or "").strip(),
+                relationship_type=relationship_type,
                 established_by=(raw.get("established_by") or "").strip(),
                 label_source_url=label_source_url,
                 award_date=award_date,
@@ -444,6 +563,9 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                 excluded_from_retrieval=_split_sources(raw.get("excluded_from_retrieval")),
                 intermediary_company_number=intermediary_company_number,
                 office_holding_start_date=office_holding_start_date,
+                office_holding_end_date=office_holding_end_date,
+                retrieval_stratum=retrieval_stratum,
+                stratum_confidence=stratum_confidence,
             )
         )
 

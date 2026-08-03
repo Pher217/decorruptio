@@ -583,3 +583,184 @@ class TestExtractionUnreliable:
 
         assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
         assert calls == []
+
+
+class TestScanTruncation:
+    """C5: the fuzzy-match scan is bounded by `_MAX_SENTENCES_CONSIDERED` so
+    one huge document cannot make verification pathologically slow -- but a
+    scan that stops early must never be read as proof the quote is absent
+    from the part of the document it never reached."""
+
+    def test_quote_beyond_the_scan_window_is_not_absent_and_reports_truncation(self, monkeypatch):
+        """GIVEN the sentence-scan window is capped at 5 sentences and the real
+        quote (differing only in case) sits at sentence index 8, beyond the cap
+        WHEN verified THEN the status is EXTRACTION_UNRELIABLE, never ABSENT,
+        and `result.truncated` is True -- a scan that never reached the quote
+        cannot prove it is missing."""
+        import uncorrupt.research.citation_verifier as verifier_module
+
+        monkeypatch.setattr(verifier_module, "_MAX_SENTENCES_CONSIDERED", 5)
+
+        sentences = [
+            f"Filler sentence number {i} about routine committee business." for i in range(10)
+        ]
+        real_quote = "The minister confirmed the contract was awarded without competitive tender."
+        sentences[8] = real_quote
+        doc = " ".join(sentences)
+        claimed_quote = real_quote.upper()  # differs only in case -- not an exact VERBATIM match
+
+        result = verify_citation(
+            "https://example.test/long-report",
+            claimed_quote,
+            fetched_text=doc,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+        assert result.status != CitationStatus.ABSENT
+        assert result.truncated is True
+
+    def test_near_match_found_inside_the_window_still_reports_truncated_true(self, monkeypatch):
+        """GIVEN the sentence-scan window is capped at 5 sentences and a
+        paraphrase-quality match sits inside that window (sentence index 2)
+        WHEN verified THEN the status is NEAR as normal, but `result.truncated`
+        is still True -- the document had more sentences than were scanned, so
+        callers should know a better match could exist further in even though
+        one was already found."""
+        import uncorrupt.research.citation_verifier as verifier_module
+
+        monkeypatch.setattr(verifier_module, "_MAX_SENTENCES_CONSIDERED", 5)
+
+        sentences = [
+            f"Filler sentence number {i} about routine committee business." for i in range(10)
+        ]
+        sentences[2] = VERBATIM_QUOTE
+        doc = " ".join(sentences)
+
+        result = verify_citation(
+            "https://example.test/long-report-2",
+            PARAPHRASE_QUOTE,
+            fetched_text=doc,
+        )
+
+        assert result.status == CitationStatus.NEAR
+        assert result.truncated is True
+
+    def test_genuine_absence_in_a_long_document_under_the_scan_cap_is_still_absent(self):
+        """GIVEN a document with many more sentences than a short paragraph, but
+        fewer than the default scan cap, and a quote genuinely absent from it
+        WHEN verified THEN the status is still ABSENT and `result.truncated` is
+        False -- the truncation fix must not swallow the defect-detection this
+        tool exists for when the scan wasn't actually truncated."""
+        sentences = [
+            f"The committee reviewed procurement record number {i} for the year in detail."
+            for i in range(60)
+        ]
+        doc = " ".join(sentences)
+
+        result = verify_citation(
+            "https://example.test/long-report-3",
+            ABSENT_QUOTE,
+            fetched_text=doc,
+        )
+
+        assert result.status == CitationStatus.ABSENT
+        assert result.truncated is False
+
+
+class TestUnpunctuatedRegionMatching:
+    """C6: a punctuation-free run (a table, a list, a heading block) never
+    hits a `[.!?]` sentence boundary, so it collapses into one giant
+    "sentence" candidate whose SequenceMatcher ratio against a short quote
+    collapses toward zero regardless of content -- the ratio is bounded by
+    combined length. A sliding quote-length window must still find a
+    near-identical row inside it."""
+
+    def test_quote_in_unpunctuated_table_region_is_found_as_near_not_absent(self):
+        """GIVEN a document containing an unpunctuated table of ~400 rows (no
+        `[.!?]` anywhere in the block, so it is one giant sentence) and a
+        claimed quote that reproduces one row with a single-character
+        difference WHEN verified THEN the status is NEAR with high similarity,
+        never ABSENT -- the sliding-window fallback finds the near-identical
+        row instead of scoring the whole table as one candidate."""
+        rows = [
+            f"Company{i} LTD | Officer{i} Smith | Appointed {2000 + i % 20}-01-01 "
+            f"| Status Active | Ref {i:05d}"
+            for i in range(400)
+        ]
+        table_block = " ".join(rows)
+        doc = (
+            "Normal prose sentence one. Normal prose sentence two. "
+            + table_block
+            + " Normal prose sentence three."
+        )
+        claimed_quote = (
+            "Company217 Ltd | Officer217 Smith | Appointed 2017-01-01 "
+            "| Status Active | Ref 00217"
+        )  # "Ltd" vs the table's "LTD" -- not an exact substring of the table row
+
+        result = verify_citation(
+            "https://example.test/officer-register-table",
+            claimed_quote,
+            fetched_text=doc,
+        )
+
+        assert result.status == CitationStatus.NEAR
+        assert result.status != CitationStatus.ABSENT
+        assert result.similarity is not None
+        assert result.similarity > 0.9
+
+
+class TestPartialPdfExtraction:
+    """S1: a PDF whose text layer decoded for some pages (e.g. a cover page or
+    table of contents) but not others (scanned-image body pages) can clear the
+    plain min-text-length backstop on total length alone, and PDFs have no
+    `raw_markup` for the text-to-markup ratio signal to apply either. Per
+    ADR-008, a failed text layer must never read as quote-absent."""
+
+    def test_pdf_with_real_front_matter_but_failed_body_pages_is_extraction_unreliable(
+        self, monkeypatch
+    ):
+        """GIVEN a PDF whose extracted text has >200 normalised characters of
+        real front-matter text on page 1, followed by several pages whose text
+        layer produced nothing (simulating scanned-image body pages) WHEN
+        verified for a quote that would only be on one of the failed pages THEN
+        the status is EXTRACTION_UNRELIABLE, never ABSENT -- the per-page
+        signal catches what the plain length backstop misses."""
+        import uncorrupt.research.citation_verifier as verifier_module
+
+        monkeypatch.setattr(verifier_module.shutil, "which", lambda _name: "/usr/bin/pdftotext")
+
+        # >200 characters even after whitespace normalisation, so the plain
+        # EXTRACTION_UNRELIABLE_MIN_TEXT_LENGTH backstop alone would not fire.
+        front_matter = (
+            "Annual Report and Accounts 2013-14. This document sets out the governance "
+            "arrangements, the financial statements, and the remuneration disclosures for "
+            "the department during the reporting period under review by the audit "
+            "committee and external auditors this year."
+        )
+        raw_pdf_text = "\x0c".join([front_matter, "", "", "", "", "", ""])
+
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = raw_pdf_text.encode("utf-8")
+
+        monkeypatch.setattr(
+            verifier_module.subprocess, "run", lambda *a, **k: FakeCompletedProcess()
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"%PDF-fake-bytes", headers={"content-type": "application/pdf"}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/report.pdf",
+            "The minister confirmed the contract was awarded following a fair process.",
+            client=client,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+        assert result.status != CitationStatus.ABSENT
+        assert "partial" in (result.detail or "")

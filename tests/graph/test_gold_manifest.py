@@ -25,15 +25,24 @@ import pytest
 from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest
 from scripts.phase_c_paths import build_adjacency, surname
 from scripts.run_gold_benchmark import (
+    MATERIAL_STRATA,
+    STRATUM_CH_OFFICER,
+    STRATUM_COMMONS,
+    STRATUM_LORDS,
     CaseEvaluation,
-    TemporalGate,
+    CoverageGate,
+    StratumGate,
     check_source_separation,
+    classify_edge_stratum,
     classify_outcome,
     compute_precision,
     country_switch_triggered,
     evaluate_case,
     evaluate_row,
-    load_temporal_gate,
+    filter_by_passing_stratum,
+    load_coverage_gate,
+    load_stratum_gates,
+    path_strata,
     split_recovered_by_source_separation,
     wilson_upper_bound,
 )
@@ -445,129 +454,144 @@ class TestGoldCase:
         assert case.award_count == 1
 
 
+def _all_passing_stratum_gates() -> dict[str, StratumGate]:
+    """Every material stratum passing -- retrieval and temporal both clear
+    the >=90% bar, and each is marked available."""
+    return {
+        name: StratumGate(
+            available=True,
+            retrieval_recovered=10,
+            retrieval_total=10,
+            temporal_recovered=10,
+            temporal_total=10,
+        )
+        for name in MATERIAL_STRATA
+    }
+
+
+def _passing_coverage_gate() -> CoverageGate:
+    return CoverageGate(covered=10, total=10, commons_covered=10, commons_total=10)
+
+
 class TestClassifyOutcome:
-    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, case-level, plus the
-    INSUFFICIENT-COHORT guard added after an adversarial review found the
-    original five verdicts had no floor on how many cases were actually
-    tested -- a manifest where every case is untestable, or a manifest
-    smaller than the pre-registered 20, must never reach REFUTED or
-    CONFIRMED on raw counts alone.
+    """Spec A2.1.2 (v2.1) verdict set, case-level, RESTRUCTURED by amendment
+    v2.4 for per-stratum gating, plus the INSUFFICIENT-COHORT guard added
+    after an adversarial review found the original five verdicts had no
+    floor on how many cases were actually tested.
 
     Unless a test is specifically exercising the cohort-size guard, all
     tests here use a "healthy" cohort (20 total, 0 untestable, 0
-    no_trace_by_design) so the ORIGINAL verdict logic is exercised exactly
-    as before.
+    no_trace_by_design) so the verdict logic under test is isolated from the
+    cohort-size guard.
     """
 
-    PASSING_GATE = TemporalGate(passed=True, overall_recovered=28, overall_total=30)
-    FAILING_GATE = TemporalGate(passed=False, overall_recovered=13, overall_total=30)
-
-    def test_invalid_fires_below_nine_of_ten_retrieval_controls(self):
-        """GIVEN retrieval controls recovered only 8 out of 10
+    def test_invalid_fires_when_coverage_gate_fails(self):
+        """GIVEN the CoverageGate fails (e.g. supplier-universe CH officer
+        rosters are incomplete)
         WHEN the outcome is classified
-        THEN it is INVALID regardless of cases recovered or the temporal
-        gate -- spec: the positives result 'must not be reported'."""
+        THEN it is INVALID regardless of cases recovered or stratum gates --
+        spec A2.4.2: the pipeline itself is broken."""
         outcome = classify_outcome(
             cases_recovered=20,
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=1.0,
-            retrieval_controls_recovered=8,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=CoverageGate(),  # all-False default
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "INVALID"
 
-    def test_instrument_limited_fires_when_temporal_gate_fails(self):
-        """GIVEN retrieval controls pass but the temporal control gate fails
+    def test_instrument_limited_fires_when_no_stratum_passes_at_all(self):
+        """GIVEN the coverage gate passes but NOT ONE material stratum has a
+        passing gate
         WHEN the outcome is classified
-        THEN it is INSTRUMENT-LIMITED, never REFUTED (spec A2.3)."""
+        THEN it is INSTRUMENT-LIMITED -- nothing about the instrument has
+        been validated at all."""
         outcome = classify_outcome(
             cases_recovered=0,
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=0.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.FAILING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates={name: StratumGate() for name in MATERIAL_STRATA},
         )
         assert outcome == "INSTRUMENT-LIMITED"
 
-    def test_instrument_limited_fires_when_temporal_gate_not_measured(self):
-        """GIVEN no temporal control gate has been measured yet (None)
+    def test_refuted_requires_every_material_stratum_to_pass(self):
+        """ADVERSARIAL TEST -- sneak past REFUTED via one unvalidated stratum.
+
+        GIVEN 0 qualifying cases recovered, the coverage gate passes, and
+        Commons + CH-officer strata pass but Lords remains `available=False`
+        (spec A2.4.2: "Lords source coverage -- gating -- currently
+        unavailable") -- i.e. EVERYTHING else about the run looks clean
         WHEN the outcome is classified
-        THEN it is INSTRUMENT-LIMITED -- an unmeasured gate is never an
-        implicit pass, so REFUTED can never be emitted without one."""
+        THEN it is INSTRUMENT-LIMITED, NEVER REFUTED -- spec A2.4.4: REFUTED
+        is available only if EVERY material stratum passes its own
+        retrieval and temporal controls. A passing Commons+CH-officer
+        battery cannot rescue an unvalidated Lords stratum into a full
+        refutation."""
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+
         outcome = classify_outcome(
             cases_recovered=0,
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=0.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=None,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=gates,
         )
+
         assert outcome == "INSTRUMENT-LIMITED"
 
-    def test_confirmed_fires_at_locked_thresholds_with_temporal_gate_passing(self):
-        """GIVEN >=4/20 cases recovered, >=80% precision, retrieval controls
-        passing, AND the temporal gate passing
+    def test_refuted_fires_when_every_stratum_genuinely_passes(self):
+        """GIVEN 0 qualifying cases recovered, coverage gate passing, AND
+        every one of the three material strata passing its own retrieval
+        and temporal controls
         WHEN the outcome is classified
-        THEN it is CONFIRMED."""
+        THEN it is REFUTED -- the full battery is the only thing that makes
+        this the strongest, least-available verdict."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            precision=0.0,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
+        )
+        assert outcome == "REFUTED"
+
+    def test_confirmed_reachable_via_passing_strata_even_with_lords_unvalidated(self):
+        """GIVEN >=4 qualifying cases recovered (already filtered by the
+        caller to touch only PASSING strata) and >=80% precision, while
+        Commons + CH-officer pass but Lords remains unavailable
+        WHEN the outcome is classified
+        THEN it is CONFIRMED -- spec A2.4.4: 'an unvalidated Lords gate must
+        not erase a genuine, independently verified Commons recovery'.
+        CONFIRMED/PARTIAL are source-qualified per passing stratum, unlike
+        REFUTED which needs the whole battery."""
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+
         outcome = classify_outcome(
             cases_recovered=4,
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=0.80,
-            retrieval_controls_recovered=9,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=gates,
         )
+
         assert outcome == "CONFIRMED"
 
-    def test_confirmed_is_blocked_by_a_failing_temporal_gate_even_at_full_thresholds(self):
-        """GIVEN cases recovered and precision both clear the CONFIRMED bar
-        but the temporal gate fails
-        WHEN the outcome is classified
-        THEN it is INSTRUMENT-LIMITED, not CONFIRMED -- the temporal gate is
-        a hard requirement, not merely advisory."""
-        outcome = classify_outcome(
-            cases_recovered=10,
-            cases_total=20,
-            cases_untestable=0,
-            cases_no_trace_by_design=0,
-            precision=1.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.FAILING_GATE,
-        )
-        assert outcome == "INSTRUMENT-LIMITED"
-
-    def test_refuted_fires_at_zero_cases_with_both_gates_passing(self):
-        """GIVEN 0/20 cases recovered, on a full 20-case testable cohort,
-        while retrieval controls AND the temporal gate both pass
-        WHEN the outcome is classified
-        THEN it is REFUTED."""
-        outcome = classify_outcome(
-            cases_recovered=0,
-            cases_total=20,
-            cases_untestable=0,
-            cases_no_trace_by_design=0,
-            precision=0.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
-        )
-        assert outcome == "REFUTED"
-
-    def test_partial_fires_for_one_to_three_cases_with_both_gates_passing(self):
-        """GIVEN both gates pass but cases recovered is short of the
-        CONFIRMED threshold without being exactly zero, on a full 20-case
-        testable cohort
+    def test_partial_fires_for_one_to_three_qualifying_cases(self):
+        """GIVEN every stratum passing but qualifying cases recovered is
+        short of the CONFIRMED threshold without being exactly zero
         WHEN the outcome is classified
         THEN it is PARTIAL -- real traces below the pre-registered
         confirmation bar, never rendered as a confirmation."""
@@ -577,9 +601,8 @@ class TestClassifyOutcome:
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=1.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "PARTIAL"
 
@@ -588,8 +611,8 @@ class TestClassifyOutcome:
 
         GIVEN all 20 gold cases fail to resolve (a resolver regression, or an
         ingestion gap for exactly those companies) so cases_recovered == 0,
-        while retrieval controls and the temporal gate -- measured on a
-        disjoint entity set -- both pass independently
+        while the coverage gate and every stratum gate -- measured on a
+        disjoint entity set -- pass independently
         WHEN the outcome is classified
         THEN it is INSUFFICIENT-COHORT, never REFUTED -- a testable
         denominator of 0 can never support "0/20 recovered" as a refutation
@@ -601,9 +624,8 @@ class TestClassifyOutcome:
             cases_untestable=20,
             cases_no_trace_by_design=0,
             precision=0.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "INSUFFICIENT-COHORT"
 
@@ -611,7 +633,7 @@ class TestClassifyOutcome:
         """ADVERSARIAL TEST -- sneak past CONFIRMED via a too-small manifest.
 
         GIVEN only 10 total cases in the manifest (half the pre-registered
-        20) with 8 recovered and full precision/controls/temporal-gate pass
+        20) with 8 recovered and full precision/coverage/stratum-gate pass
         WHEN the outcome is classified
         THEN it is INSUFFICIENT-COHORT, never CONFIRMED -- the locked
         '>=4/20' bar is calibrated to a 20-case cohort; applying it to a
@@ -622,9 +644,8 @@ class TestClassifyOutcome:
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=1.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "INSUFFICIENT-COHORT"
 
@@ -642,9 +663,8 @@ class TestClassifyOutcome:
             cases_untestable=0,
             cases_no_trace_by_design=15,
             precision=0.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "INSUFFICIENT-COHORT"
 
@@ -660,9 +680,8 @@ class TestClassifyOutcome:
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=0.80,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=self.PASSING_GATE,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "CONFIRMED"
 
@@ -754,9 +773,8 @@ class TestSplitRecoveredBySourceSeparation:
             cases_untestable=0,
             cases_no_trace_by_design=0,
             precision=1.0,
-            retrieval_controls_recovered=10,
-            retrieval_controls_total=10,
-            temporal_gate=TemporalGate(passed=True, overall_recovered=28, overall_total=30),
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome != "CONFIRMED"
 
@@ -1093,117 +1111,326 @@ class TestEvaluateCase:
         assert result.status == "undated_only"
 
 
-class TestLoadTemporalGate:
-    """Spec A2.3: the temporal control gate is measured by a separate
-    classifier; this loader only consumes its result."""
+class TestLoadCoverageGate:
+    """Spec A2.4.2: the global coverage gate is measured by a separate
+    process; this loader only consumes its result, always recomputing
+    pass/fail from the underlying counts."""
 
-    def test_missing_report_returns_none(self, tmp_path):
-        """GIVEN no temporal gate report file exists at the given path
+    def test_missing_report_defaults_to_failing(self, tmp_path):
+        """GIVEN no coverage gate report file exists at the given path
         WHEN it is loaded
-        THEN None is returned -- treated by classify_outcome as a failing
-        gate, never an implicit pass."""
-        assert load_temporal_gate(tmp_path / "does_not_exist.json") is None
-
-    def test_present_report_is_parsed(self, tmp_path):
-        """GIVEN a temporal gate report file written by the (separate)
-        temporal-lift classifier
-        WHEN it is loaded
-        THEN its passed/recovered/total/failing_strata fields are parsed
-        into a TemporalGate."""
-        path = tmp_path / "temporal_gate.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "passed": False,
-                    "overall_recovered": 13,
-                    "overall_total": 30,
-                    "failing_strata": ["declared_interest/Lords"],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        gate = load_temporal_gate(path)
-
-        assert gate == TemporalGate(
-            passed=False,
-            overall_recovered=13,
-            overall_total=30,
-            failing_strata=("declared_interest/Lords",),
-        )
-
-    def test_claimed_passed_true_is_not_trusted_when_numbers_do_not_support_it(self, tmp_path):
-        """ADVERSARIAL TEST -- a producer script claims 'passed: true' but
-        its own numbers (13/30, well below the ~27/30 bar) do not support it.
-
-        GIVEN a temporal gate report whose 'passed' field is 'true' but whose
-        overall_recovered/overall_total fail the spec A2.3 ratio
-        WHEN it is loaded
-        THEN `passed` is False -- recomputed from the numbers, never trusted
-        verbatim from the file."""
-        path = tmp_path / "temporal_gate.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "passed": True,
-                    "overall_recovered": 13,
-                    "overall_total": 30,
-                    "failing_strata": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        gate = load_temporal_gate(path)
-
+        THEN the result is the all-False default -- never an implicit
+        pass."""
+        gate = load_coverage_gate(tmp_path / "does_not_exist.json")
         assert gate.passed is False
 
-    def test_claimed_passed_false_is_overridden_when_numbers_do_support_it(self, tmp_path):
-        """GIVEN a temporal gate report whose 'passed' field is 'false' but
-        whose numbers (28/30, no failing strata) DO clear the spec A2.3 bar
+    def test_present_report_with_passing_counts_passes(self, tmp_path):
+        """GIVEN a coverage gate report where both supplier-universe and
+        Commons-universe counts clear the >=90% bar
         WHEN it is loaded
-        THEN `passed` is True -- the recomputation is symmetric, not merely
-        a one-directional distrust of an optimistic claim."""
-        path = tmp_path / "temporal_gate.json"
+        THEN `passed` is True."""
+        path = tmp_path / "coverage_gate.json"
         path.write_text(
             json.dumps(
                 {
-                    "passed": False,
-                    "overall_recovered": 28,
-                    "overall_total": 30,
-                    "failing_strata": [],
+                    "supplier_universe_covered": 95,
+                    "supplier_universe_total": 100,
+                    "commons_universe_covered": 4057,
+                    "commons_universe_total": 4057,
                 }
             ),
             encoding="utf-8",
         )
-
-        gate = load_temporal_gate(path)
-
+        gate = load_coverage_gate(path)
         assert gate.passed is True
 
-    def test_nonempty_failing_strata_blocks_passed_even_with_a_high_overall_ratio(self, tmp_path):
-        """GIVEN a temporal gate report with a strong overall ratio (29/30)
-        but a non-empty failing_strata list
+    def test_one_failing_universe_fails_the_whole_gate(self, tmp_path):
+        """GIVEN supplier-universe coverage clears the bar but Commons
+        universe coverage does not (only 50 of 4,057 records ingested)
         WHEN it is loaded
-        THEN `passed` is False -- spec A2.3 requires the overall ratio AND
-        every material stratum individually clearing its own bar; an
-        aggregate pass cannot hide a failing stratum."""
-        path = tmp_path / "temporal_gate.json"
+        THEN `passed` is False -- BOTH universe checks must pass (spec
+        A2.4.2), one cannot compensate for the other."""
+        path = tmp_path / "coverage_gate.json"
         path.write_text(
             json.dumps(
                 {
-                    "passed": True,
-                    "overall_recovered": 29,
-                    "overall_total": 30,
-                    "failing_strata": ["declared_interest/Lords"],
+                    "supplier_universe_covered": 100,
+                    "supplier_universe_total": 100,
+                    "commons_universe_covered": 50,
+                    "commons_universe_total": 4057,
                 }
             ),
             encoding="utf-8",
         )
-
-        gate = load_temporal_gate(path)
-
+        gate = load_coverage_gate(path)
         assert gate.passed is False
+
+
+class TestLoadStratumGates:
+    """Spec A2.4.3: per-material-stratum gates are measured by a separate
+    control-battery process; this loader only consumes results, always
+    recomputing pass/fail from the underlying counts and defaulting any
+    missing stratum to unavailable."""
+
+    def test_missing_report_defaults_every_stratum_to_unavailable(self, tmp_path):
+        """GIVEN no stratum gates report file exists
+        WHEN it is loaded
+        THEN every material stratum defaults to an unavailable
+        (never-passing) gate."""
+        gates = load_stratum_gates(tmp_path / "does_not_exist.json")
+        assert set(gates) == set(MATERIAL_STRATA)
+        assert all(not g.passed for g in gates.values())
+
+    def test_missing_stratum_entry_defaults_to_unavailable(self, tmp_path):
+        """GIVEN a report that only supplies Commons and CH-officer entries
+        (Lords omitted -- spec A2.4.2: 'Lords source coverage -- gating --
+        currently unavailable')
+        WHEN it is loaded
+        THEN the Lords stratum defaults to an unavailable gate, never
+        silently passing by omission."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_COMMONS: {
+                        "available": True,
+                        "retrieval_recovered": 9,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 9,
+                        "temporal_total": 10,
+                    },
+                    STRATUM_CH_OFFICER: {
+                        "available": True,
+                        "retrieval_recovered": 10,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 10,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_LORDS].available is False
+        assert gates[STRATUM_LORDS].passed is False
+        assert gates[STRATUM_COMMONS].passed is True
+
+    def test_claimed_available_true_is_not_trusted_without_supporting_numbers(self, tmp_path):
+        """ADVERSARIAL TEST -- a stratum entry claims available:true but its
+        own retrieval/temporal numbers (3/10) do not clear the bar.
+
+        GIVEN a stratum marked available with counts well below 90%
+        WHEN it is loaded
+        THEN `passed` is False -- pass/fail is always recomputed from the
+        numbers, never a trusted flag."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_COMMONS: {
+                        "available": True,
+                        "retrieval_recovered": 3,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 3,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_COMMONS].passed is False
+
+    def test_available_but_only_retrieval_passing_is_not_a_full_pass(self, tmp_path):
+        """GIVEN a stratum whose retrieval numbers clear the bar but whose
+        temporal numbers do not
+        WHEN it is loaded
+        THEN `passed` is False -- both retrieval AND temporal must pass."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_CH_OFFICER: {
+                        "available": True,
+                        "retrieval_recovered": 10,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 2,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_CH_OFFICER].retrieval_passed is True
+        assert gates[STRATUM_CH_OFFICER].temporal_passed is False
+        assert gates[STRATUM_CH_OFFICER].passed is False
+
+
+@pytest.mark.django_db
+class TestClassifyEdgeStratum:
+    """Spec A2.4.3: mapping a path edge to a material stratum. Commons and
+    Lords `declared_interest` edges share the same entity registry_scheme,
+    so only the attesting source_name distinguishes them."""
+
+    def test_officer_of_edge_is_ch_officer_stratum(self):
+        """GIVEN an officer_of edge
+        WHEN its stratum is classified
+        THEN it is the CH officer/appointment stratum."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=person, target_entity=company
+        )
+        assert classify_edge_stratum(edge) == STRATUM_CH_OFFICER
+
+    def test_declared_interest_attested_by_commons_is_commons_stratum(self):
+        """GIVEN a declared_interest edge attested by the Commons register
+        WHEN its stratum is classified
+        THEN it is the Commons declared_interest stratum."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        Attestation.objects.create(edge=edge, source_name="UK Parliament Register of Interests")
+        assert classify_edge_stratum(edge) == STRATUM_COMMONS
+
+    def test_declared_interest_attested_by_lords_is_lords_stratum(self):
+        """GIVEN a declared_interest edge attested by the Lords register
+        (the SAME edge_type and entity registry_scheme as a Commons entry)
+        WHEN its stratum is classified
+        THEN it is the Lords declared_interest stratum -- distinguished only
+        by the attesting source_name."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        Attestation.objects.create(edge=edge, source_name="UK House of Lords Register of Interests")
+        assert classify_edge_stratum(edge) == STRATUM_LORDS
+
+    def test_donation_edge_has_no_material_stratum(self):
+        """GIVEN an edge type that is not one of the three material strata
+        WHEN its stratum is classified
+        THEN it is None."""
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        party = Entity.objects.create(entity_type="political_party", name="Party A")
+        edge = Edge.objects.create(edge_type="donation", source_entity=company, target_entity=party)
+        assert classify_edge_stratum(edge) is None
+
+
+@pytest.mark.django_db
+class TestPathStrata:
+    """A path's stratum set is the union of its edges' material strata."""
+
+    def test_single_edge_path_has_one_stratum(self):
+        """GIVEN a one-edge path via officer_of
+        WHEN its strata are computed
+        THEN the set contains exactly the CH-officer stratum."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=person, target_entity=company
+        )
+        assert path_strata([edge]) == frozenset({STRATUM_CH_OFFICER})
+
+    def test_two_edge_path_unions_both_strata(self):
+        """GIVEN a two-edge path: one officer_of edge and one Commons
+        declared_interest edge
+        WHEN its strata are computed
+        THEN the set contains BOTH material strata."""
+        person_a = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        person_b = Entity.objects.create(entity_type="person", name="Sam Otherperson")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge_officer = Edge.objects.create(
+            edge_type="officer_of", source_entity=person_a, target_entity=company
+        )
+        edge_commons = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person_a, target_entity=person_b
+        )
+        Attestation.objects.create(
+            edge=edge_commons, source_name="UK Parliament Register of Interests"
+        )
+        assert path_strata([edge_officer, edge_commons]) == frozenset(
+            {STRATUM_CH_OFFICER, STRATUM_COMMONS}
+        )
+
+    def test_same_as_edge_contributes_no_stratum(self):
+        """GIVEN a path containing a same_as identity-bridge edge alongside
+        a material one
+        WHEN its strata are computed
+        THEN only the material edge's stratum appears -- same_as is not
+        evidence of a relationship."""
+        person_a = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        person_b = Entity.objects.create(entity_type="person", name="Jane Testperson (CH)")
+        company = Entity.objects.create(entity_type="company", name="Example Ltd")
+        edge_same_as = Edge.objects.create(
+            edge_type="same_as", source_entity=person_a, target_entity=person_b
+        )
+        edge_officer = Edge.objects.create(
+            edge_type="officer_of", source_entity=person_b, target_entity=company
+        )
+        assert path_strata([edge_same_as, edge_officer]) == frozenset({STRATUM_CH_OFFICER})
+
+
+class TestFilterByPassingStratum:
+    """Spec A2.4.4: a recovered case must belong to at least one PASSING
+    stratum to count toward CONFIRMED/PARTIAL/REFUTED."""
+
+    def _case(self, strata: frozenset[str], key: str = "01234567") -> CaseEvaluation:
+        return CaseEvaluation(
+            case_key=key,
+            company_number=key,
+            row_count=1,
+            award_count=1,
+            earliest_award_date="2021-06-01",
+            row_case_ids=["SYNTH-1"],
+            status="recovered",
+            source_separation="ok",
+            row_evaluations=[],
+            strata=strata,
+        )
+
+    def test_case_touching_a_passing_stratum_qualifies(self):
+        """GIVEN a case whose evidence touches the Commons stratum, which
+        passes
+        WHEN cases are filtered by passing stratum
+        THEN it is qualifying, not instrument-limited."""
+        case = self._case(frozenset({STRATUM_COMMONS}))
+        gates = _all_passing_stratum_gates()
+        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
+        assert qualifying == [case]
+        assert instrument_limited == []
+
+    def test_case_touching_only_an_unsupported_stratum_is_instrument_limited(self):
+        """ADVERSARIAL TEST -- a case recovered ONLY through Lords evidence
+        while Lords remains unavailable.
+
+        GIVEN a case whose ONLY evidence is the Lords stratum, and Lords is
+        unavailable
+        WHEN cases are filtered by passing stratum
+        THEN it is instrument-limited, NOT qualifying -- it must never
+        count toward CONFIRMED/PARTIAL/REFUTED (spec A2.4.4)."""
+        case = self._case(frozenset({STRATUM_LORDS}))
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
+        assert qualifying == []
+        assert instrument_limited == [case]
+
+    def test_case_touching_both_a_passing_and_unsupported_stratum_qualifies(self):
+        """GIVEN a case whose evidence touches BOTH Commons (passing) and
+        Lords (unavailable)
+        WHEN cases are filtered by passing stratum
+        THEN it qualifies -- spec A2.4.4: an unvalidated Lords gate must not
+        erase a genuine, independently verified Commons recovery."""
+        case = self._case(frozenset({STRATUM_COMMONS, STRATUM_LORDS}))
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
+        assert qualifying == [case]
+        assert instrument_limited == []
 
 
 @pytest.mark.django_db

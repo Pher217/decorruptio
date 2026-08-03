@@ -3,8 +3,9 @@
 Spec (LOCKED, do not deviate): vault
 `02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
 including AMENDMENT v2 (temporal evidence ladder), v2.1 (unit of analysis +
-revised verdict set) and v2.3 (manifest schema semantics + the narrowed case
-key). Sections 5-7 and all three amendments are binding.
+revised verdict set), v2.3 (manifest schema semantics + the narrowed case
+key) and v2.4 (control battery, per-stratum gating, freeze protocol).
+Sections 5-7 and all four amendments are binding.
 
 This script does NOT implement a second path-search or resolution stack. It
 calls the same code the rest of Phase C already uses and already trusts:
@@ -14,42 +15,74 @@ calls the same code the rest of Phase C already uses and already trusts:
   * `scripts.phase_c_paths.resolve_referrer` -- person-side (surname) resolution
   * `scripts.phase_c_paths.build_adjacency`  -- the adjacency index
   * `scripts/run_positive_controls.py` / `scripts/run_negative_controls.py`
-    -- invoked as subprocesses (never re-implemented) for the RETRIEVAL
-    control numbers.
+    -- invoked as subprocesses (never re-implemented), now RECLASSIFIED as
+    historical, non-gating diagnostics (see CONTROL BATTERY below).
 
-It also does NOT implement the spec A2.3 temporal control gate (the level-1/2
-evidence classifier living in `src/uncorrupt/graph/register_snapshots.py` and
-`scripts/measure_temporal_lift.py`, built separately). It only requires that
-gate's *result* as an explicit input -- see `TemporalGate` / `load_temporal_gate`
--- so this runner can never emit REFUTED (or CONFIRMED) without one having
-actually been measured.
+CONTROL BATTERY (amendment v2.4, A2.4.1/A2.4.2) -- retiring the old single
+control set: the graph-derived 30 positive controls and the 200 negative
+pairs were quoted throughout this project as if they validated the
+instrument. They do not: the 30 are selected FROM relationships already in
+the graph, so they test traversal/resolution conditional on the data already
+being ingested -- partly tautological, and structurally unable to detect a
+missing-ingestion failure (the dominant failure mode: officer coverage is
+54/13,129, Commons ~3% ingested). Both are now HISTORICAL DIAGNOSTICS ONLY --
+the 30 a regression fixture, the 0/200 a topology snapshot -- and NEITHER
+feeds `classify_outcome` nor may appear in the primary results table.
+
+Gating is now split into two INDEPENDENT inputs this script consumes but
+does NOT compute (built by a separate control-battery measurement process,
+out of this script's scope -- see "SCOPE" below):
+
+  * `CoverageGate` (A2.4.2) -- the two GLOBAL pipeline-validity checks
+    (supplier-universe CH officer-roster coverage; Commons universe ingest
+    completeness). Either failing means the pipeline itself is broken --
+    INVALID, before any stratum is even considered.
+  * `StratumGate`, one per MATERIAL STRATUM (A2.4.3) -- externally specified,
+    fixed-independently-of-the-graph controls testing retrieval AND
+    temporal recovery for exactly that stratum:
+      1. Commons `declared_interest`, dated
+      2. Lords `declared_interest`, snapshot-dated or atemporal
+      3. Companies House officer/appointment paths
+    The 10 externally-sourced Commons controls gate ONLY stratum 1; they say
+    nothing about Lords or officer-roster completeness. The graph's 5,690
+    Lords edges do NOT make Lords validated -- graph abundance is not source
+    coverage (A2.4.3). "Lords source coverage" is explicitly "gating --
+    currently unavailable" (A2.4.2): until an external Lords control exists,
+    `stratum_gates["lords_declared_interest"]` defaults to `available=False`
+    and can never pass.
+
+SCOPE -- what this script does NOT implement: the actual MEASUREMENT behind
+`CoverageGate`/`StratumGate` (comparing frozen source snapshots against what
+the graph actually ingested), the freeze protocol (A2.4.5 -- sealing graph
+hashes, source-snapshot dates, control/negative/gold-manifest hashes across
+graph versions), and the 2x2 ablation (A2.4.6 -- base / +officer-expansion /
++Commons-fix / +both, run on controls only, gold spent once on the final
+state). These are project-level measurement and process disciplines, not
+benchmark-SCORING logic -- they belong in their own tooling. This script only
+requires their *results* as explicit, safely-defaulting-to-failing inputs
+(`load_coverage_gate`, `load_stratum_gates`), exactly as it already does for
+the manifest itself.
 
 UNIT OF ANALYSIS (amendment v2.1 A2.1.1, NARROWED by v2.3 A2.3.2): every
 threshold below is scored at CASE level, not row level, and a case is the
 distinct AWARDEE `company_number` alone -- not `(company_number, award_date)`
-as v2.1 first set it. PPE Medpro's two separate DHSC awards (2020-06-12,
-2020-06-25) arising from one underlying relationship must never score as two
-recovered cases: what determines recovery is officer coverage of the
-awardee company, so rows sharing an awardee are correlated, not independent.
-`evaluate_case` rolls a case's constituent rows up into one status
-(recovered beats undated_only beats not_recovered beats untestable beats
-no_trace_by_design) using the case's EARLIEST qualifying award date as the
-cutoff for every row -- the strictest cutoff available, since a relationship
-pre-dating the earliest award necessarily pre-dates every later one too.
-Row-level counts, and each case's row/award counts, are still computed and
-reported, but never as the headline figure (A2.1.1: "Row-level alone is
-forbidden as a headline").
+as v2.1 first set it. `evaluate_case` rolls a case's constituent rows up into
+one status (recovered beats undated_only beats not_recovered beats
+untestable beats no_trace_by_design) using the case's EARLIEST qualifying
+award date as the cutoff for every row.
 
 `company_number` always means the AWARDEE (spec A2.3.1) -- the loader
 (`scripts/load_gold_manifest.py`) rejects any row that does not explicitly
 confirm this, so this script can assume it throughout.
 
-Four per-row / per-case outcomes that MUST NOT be conflated -- Phase C v1
+Five per-row / per-case outcomes that MUST NOT be conflated -- Phase C v1
 collapsed (c) into a refutation and had to retract "0 of 52" because of it:
 
   (a) recovered           -- a path was found and every edge on it dates
                              before the case's earliest award_date (H1's
-                             actual claim).
+                             actual claim). Attributed to the material
+                             stratum(s) its evidence belongs to
+                             (`classify_edge_stratum`/`path_strata`).
   (b) undated_only        -- a path was found but at least one edge on it
                              has no valid_from, so pre-award is UNDECIDABLE,
                              not false.
@@ -57,80 +90,59 @@ collapsed (c) into a refutation and had to retract "0 of 52" because of it:
                              a graph entity. Excluded from every denominator;
                              reported separately with the specific reason.
   (d) no_trace_by_design  -- spec A2.3.3: the row's only evidence is
-                             Persons-with-Significant-Control data
-                             (`established_by: PSC`, `GoldRow.is_psc_sourced`).
-                             PSC is a label source only, never ingested for
-                             retrieval, so a `not_recovered` result on such a
-                             row is an EXPECTED, honest "no trace" -- never a
-                             refutation. Only a `not_recovered` PSC row is
-                             relabelled this way; a PSC row that IS recovered
-                             through independent register evidence is a
-                             genuine recovery and is left alone.
+                             Persons-with-Significant-Control data. Expected
+                             non-recovery, never a refutation.
+  (e) recovered_circular  -- spec SS3: recovery PROVEN to rest solely on a
+                             source the row's own `excluded_from_retrieval`
+                             names. Excluded from `cases_recovered`.
 
-Only a resolved, non-PSC-only pair with no path at all, dated or undated, is
-a genuine `not_recovered` miss.
+Only a resolved, non-PSC-only, non-circular pair with no path at all, dated
+or undated, is a genuine `not_recovered` miss.
 
-Source separation (spec SS3): a row's `excluded_from_retrieval` sources must
-never be what makes its path recoverable. `check_source_separation` is a
-BEST-EFFORT check against `Attestation.source_name` -- see its docstring for
-exactly what it can and cannot prove.
+VERDICT SET (amendments v2.1 A2.1.2 and v2.4 A2.4.4):
 
-VERDICT SET (amendment v2.1, A2.1.2 -- replaces the old SS6 table -- plus
-INSUFFICIENT-COHORT, added after an adversarial review found the original
-five had no floor on how many cases were actually tested):
+  INSUFFICIENT-COHORT  testable cases fall short of the pre-registered
+                       20-case cohort. Checked first.
+  INVALID              the CoverageGate fails -- pipeline broken.
+  INSTRUMENT-LIMITED   no material stratum passes at all, OR (when 0 cases
+                       qualify) at least one material stratum is still
+                       unvalidated -- the UK strict hypothesis, or that
+                       part of it, is untestable with these sources.
+  CONFIRMED / PARTIAL  >=4 (CONFIRMED) or 1-3 (PARTIAL) cases recovered
+                       through a PASSING stratum's evidence -- source-
+                       qualified: the verdict names which strata the
+                       recovered paths belong to (see `filter_by_passing_stratum`
+                       and `main()`'s reporting). A case recovered ONLY
+                       through an unsupported stratum (e.g. Lords-only,
+                       while Lords remains unavailable) does not count here;
+                       it is reported separately, per case.
+  REFUTED              0 cases recovered AND EVERY material stratum passes
+                       its own retrieval and temporal controls (A2.4.4) --
+                       the strongest, least available verdict. A passing
+                       Commons gate never rescues Lords, and an unvalidated
+                       Lords gate never erases a genuine, independently
+                       verified Commons recovery (A2.4.4) -- this is why
+                       CONFIRMED/PARTIAL use per-stratum qualification while
+                       REFUTED requires the whole battery.
 
-  INSUFFICIENT-COHORT  testable cases (total minus untestable minus
-                       no_trace_by_design) fall short of the pre-registered
-                       20-case cohort (`PREREGISTERED_COHORT_SIZE`) -- the
-                       "4/20"/"0/20" thresholds are not meaningful against a
-                       smaller or mostly-untestable denominator. Checked
-                       FIRST, before anything else.
-  INVALID              retrieval controls <9/10 -- pipeline broken, positives
-                       result must not be reported.
-  INSTRUMENT-LIMITED    retrieval controls pass but the temporal control gate
-                       (A2.3) fails -- the UK strict hypothesis is untestable
-                       with these sources.
-  CONFIRMED             >=4/20 cases recovered, >=80% benchmark precision,
-                       retrieval AND temporal gates both pass.
-  REFUTED               0/20 cases recovered, retrieval AND temporal gates
-                       both pass.
-  PARTIAL               1-3/20 cases recovered, retrieval AND temporal gates
-                       both pass. Real traces below the confirmation bar --
-                       never rendered as a confirmation.
-
-`classify_outcome` evaluates these in a strict priority order (INSUFFICIENT-
-COHORT, then INVALID, then INSTRUMENT-LIMITED, then the case-count-dependent
-branches) so every verdict above maps to exactly one branch with no residual
-ambiguity -- unlike the SS6 table's REFUTED/COUNTRY SWITCH overlap this
-amendment fixes.
-
-ADVERSARIAL-REVIEW FIX -- `cases_recovered` fed into `classify_outcome` MUST
-already exclude any case whose recovery is PROVEN circular (spec SS3: every
-path found for it is attested solely by a source that row's own
-`excluded_from_retrieval` names -- see `split_recovered_by_source_separation`
-and the `recovered_circular` figure in `main()`). Counting such a case would
-let the project's own journalism/inquiry ingest manufacture an affirmative
-claim about a named person or company -- the single most damaging failure
-mode this script can produce, worse than a null.
-
-COUNTRY_SWITCH IS NOT A VERDICT (A2.1.2) -- it is an action triggered by
-PARTIAL, REFUTED, or INSTRUMENT-LIMITED (never by INSUFFICIENT-COHORT or
-INVALID). See `country_switch_triggered`.
+COUNTRY_SWITCH IS NOT A VERDICT -- it is an action triggered by PARTIAL,
+REFUTED, or INSTRUMENT-LIMITED (never by INSUFFICIENT-COHORT or INVALID).
+See `country_switch_triggered`.
 
 Statistical reporting (amendment A2.5): a `0/N` control or negative-control
 count is never printed bare -- `wilson_upper_bound` computes the ~95%
 one-sided upper bound reported alongside it, including alongside
-`false_positive_rate` itself, not just the raw negative-control count.
-Benchmark precision (on the constructed 20-ish-case : 200-negative sample)
+`false_positive_rate` itself. Benchmark precision (on the constructed
+20-ish-case : 200-negative sample -- itself a non-gating diagnostic, A2.4.1)
 is reported labelled as such, never as an operational/field precision
-figure, alongside sensitivity (denominator explicitly named as ALL cases,
-including untestable/no_trace_by_design ones) and false-positive rate as
-separate, explicitly named metrics.
+figure, alongside sensitivity (denominator explicitly named as ALL cases)
+and false-positive rate as separate, explicitly named metrics.
 
 Usage:
     PYTHONPATH=.:src python scripts/run_gold_benchmark.py \\
         --manifest data/gold_manifest.csv \\
-        --temporal-gate-report experiments/temporal_gate.json \\
+        --coverage-gate-report experiments/coverage_gate.json \\
+        --stratum-gates-report experiments/stratum_gates.json \\
         --out experiments/gold_benchmark.json
 """
 
@@ -164,7 +176,7 @@ from uncorrupt.graph.models import Edge, Entity  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Spec SS6 / A2.1.2 LOCKED thresholds.
-CONTROLS_PASS_FRACTION = 0.9  # >=9/10 retrieval controls
+CONTROLS_PASS_FRACTION = 0.9  # >=9/10 per material stratum (A2.4.3)
 CONFIRM_MIN_CASES = 4  # >=4/20 cases (not rows -- A2.1.1)
 CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
 
@@ -172,6 +184,20 @@ CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
 # SS5). Applying them to a smaller -- or smaller-than-it-looks -- cohort
 # misrepresents statistical power. See PREREGISTERED_COHORT_SIZE below.
 PREREGISTERED_COHORT_SIZE = 20
+
+# Material strata (spec A2.4.3) -- the minimum set the sealed benchmark
+# defines, independent of whatever the current ingest happens to contain.
+STRATUM_COMMONS = "commons_declared_interest"
+STRATUM_LORDS = "lords_declared_interest"
+STRATUM_CH_OFFICER = "ch_officer_appointment"
+MATERIAL_STRATA = (STRATUM_COMMONS, STRATUM_LORDS, STRATUM_CH_OFFICER)
+
+# Commons and Lords `declared_interest` edges share the SAME entity
+# registry_scheme (UK-PARLIAMENT-MEMBER covers both Houses -- Parliament's
+# member-ID scheme does not distinguish chambers), so the only mechanical way
+# to tell them apart is which register ATTESTED the edge.
+COMMONS_SOURCE_NAME = "UK Parliament Register of Interests"
+LORDS_SOURCE_NAME = "UK House of Lords Register of Interests"
 
 # Priority order for rolling per-row statuses up to a case (higher wins).
 # no_trace_by_design (spec A2.3.3) ranks lowest: it is an EXPECTED non-result
@@ -188,6 +214,35 @@ _STATUS_PRIORITY = {
 _Z_95 = 1.959963984540054  # two-sided 95% normal quantile
 
 
+def classify_edge_stratum(edge: Edge) -> str | None:
+    """Map one path edge to a spec A2.4.3 material stratum, or None.
+
+    `same_as` identity bridges and non-material edge types (donation,
+    ownership, referred_to_lane, associate_of, supplier_of) return None --
+    they carry no stratum and are excluded from source-qualification.
+
+    KNOWN LIMIT: if an edge somehow carries attestations from BOTH the
+    Commons and Lords source names (a data anomaly -- the two registers are
+    disjoint by construction), this returns "commons_declared_interest" and
+    silently under-reports the Lords attribution. Flagged, not fixed, since
+    it should not occur given how the registers are ingested.
+    """
+    if edge.edge_type == "officer_of":
+        return STRATUM_CH_OFFICER
+    if edge.edge_type == "declared_interest":
+        source_names = {a.source_name for a in edge.attestations.all()}
+        if COMMONS_SOURCE_NAME in source_names:
+            return STRATUM_COMMONS
+        if LORDS_SOURCE_NAME in source_names:
+            return STRATUM_LORDS
+    return None
+
+
+def path_strata(path: list[Edge]) -> frozenset[str]:
+    """The set of material strata a single path's evidence touches."""
+    return frozenset(s for e in path if (s := classify_edge_stratum(e)) is not None)
+
+
 @dataclass
 class RowEvaluation:
     case_id: str
@@ -195,6 +250,7 @@ class RowEvaluation:
     reason: str | None = None
     source_separation: str = "not_applicable"
     example_path: list[str] = field(default_factory=list)
+    strata: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -210,6 +266,7 @@ class CaseEvaluation:
     status: str  # recovered | undated_only | not_recovered | untestable | no_trace_by_design
     source_separation: str
     row_evaluations: list[RowEvaluation]
+    strata: frozenset[str] = frozenset()
 
     @property
     def is_concentrated(self) -> bool:
@@ -217,71 +274,161 @@ class CaseEvaluation:
 
 
 @dataclass(frozen=True)
-class TemporalGate:
-    """Spec A2.3 temporal control gate -- a REQUIRED input to `classify_outcome`.
+class CoverageGate:
+    """Spec A2.4.2 global pipeline-validity coverage controls: supplier-
+    universe CH officer-roster coverage, Commons universe ingest
+    completeness. Either failing means the pipeline itself is broken --
+    INVALID, before any stratum is even considered.
 
-    Built by a separate classifier out of this script's scope
-    (`src/uncorrupt/graph/register_snapshots.py`,
-    `scripts/measure_temporal_lift.py`). This script never computes it; it
-    only requires the caller supply the result, so REFUTED (and CONFIRMED)
-    can never be emitted without one having actually been measured.
+    Like `StratumGate`, pass/fail is a PROPERTY recomputed from the
+    underlying counts every time, never a stored/trusted flag -- a producer
+    cannot force a pass without the numbers to back it.
 
-    `passed` reflects spec A2.3 in full: ~27/30 controls recovered at
-    evidence level 1 (event-dated) or level 2 (pre-award observed) overall,
-    AND >=9/10 within each material relationship-type/source stratum
-    (`failing_strata` names any stratum that did not clear that bar).
+    NOTE: spec A2.4.2 describes these as testing whether coverage is
+    "complete"/"received complete officer rosters" without stating a
+    numeric bar. This implementation uses the same >=90% threshold as
+    everything else in the battery (`CONTROLS_PASS_FRACTION`) as the most
+    defensible default pending an explicit definition from whoever builds
+    the actual measurement -- flagged here rather than silently guessed at
+    elsewhere.
     """
 
-    passed: bool
-    overall_recovered: int | None = None
-    overall_total: int | None = None
-    failing_strata: tuple[str, ...] = ()
+    covered: int | None = None
+    total: int | None = None
+    commons_covered: int | None = None
+    commons_total: int | None = None
+
+    @property
+    def supplier_universe_passed(self) -> bool:
+        return (
+            self.total is not None
+            and self.total > 0
+            and self.covered is not None
+            and (self.covered / self.total) >= CONTROLS_PASS_FRACTION
+        )
+
+    @property
+    def commons_universe_passed(self) -> bool:
+        return (
+            self.commons_total is not None
+            and self.commons_total > 0
+            and self.commons_covered is not None
+            and (self.commons_covered / self.commons_total) >= CONTROLS_PASS_FRACTION
+        )
+
+    @property
+    def passed(self) -> bool:
+        return self.supplier_universe_passed and self.commons_universe_passed
 
 
-def load_temporal_gate(path: Path) -> TemporalGate | None:
-    """Load the spec A2.3 temporal control gate result, if it has been measured.
+def load_coverage_gate(path: Path) -> CoverageGate:
+    """Load the spec A2.4.2 global coverage gate result, if measured.
 
-    Expected JSON contract, produced by the separate temporal-lift classifier
-    (not implemented here):
+    Expected JSON contract, produced by a separate coverage-measurement
+    process (not implemented here):
 
         {
-          "passed": bool,
-          "overall_recovered": int,
-          "overall_total": int,
-          "failing_strata": ["<relationship_type/source>", ...]
+          "supplier_universe_covered": int, "supplier_universe_total": int,
+          "commons_universe_covered": int, "commons_universe_total": int
         }
 
-    Returns None if the file does not exist. `classify_outcome` treats `None`
-    exactly like `passed=False` -- a missing measurement is never an implicit
-    pass (spec A2.3: "REFUTED may be reported only when ... the temporal
-    control gate passes").
-
-    The JSON's own `"passed"` flag is NOT trusted verbatim -- `passed` is
-    RECOMPUTED here from `overall_recovered`/`overall_total`/`failing_strata`
-    in the same payload (spec A2.3: ~27/30 i.e. >=90% overall, AND every
-    material stratum individually clearing its own bar, i.e.
-    `failing_strata` empty). A producer that writes `"passed": true` without
-    the numbers actually supporting it cannot force a pass this way.
+    Returns the all-False default (`CoverageGate()`) if the file does not
+    exist -- a missing measurement is never an implicit pass.
     """
     if not path.exists():
-        return None
+        return CoverageGate()
     data = json.loads(path.read_text())
-    overall_recovered = data.get("overall_recovered")
-    overall_total = data.get("overall_total")
-    failing_strata = tuple(data.get("failing_strata", ()))
-    recomputed_passed = (
-        overall_recovered is not None
-        and overall_total is not None
-        and overall_total > 0
-        and (overall_recovered / overall_total) >= CONTROLS_PASS_FRACTION
-        and not failing_strata
+    return CoverageGate(
+        covered=data.get("supplier_universe_covered"),
+        total=data.get("supplier_universe_total"),
+        commons_covered=data.get("commons_universe_covered"),
+        commons_total=data.get("commons_universe_total"),
     )
-    return TemporalGate(
-        passed=recomputed_passed,
-        overall_recovered=overall_recovered,
-        overall_total=overall_total,
-        failing_strata=failing_strata,
-    )
+
+
+@dataclass(frozen=True)
+class StratumGate:
+    """One material stratum's gate (spec A2.4.3/A2.4.4).
+
+    Built by a separate, externally-specified control-battery measurement
+    out of this script's scope. `retrieval_passed`/`temporal_passed` are
+    PROPERTIES recomputed from the underlying counts every time -- there is
+    no stored boolean to trust or distrust, closing the same "claimed passed
+    without the numbers to back it" gap the single-gate design (retired)
+    needed a special fix for.
+
+    `available=False` (the default) means no external gating control exists
+    for this stratum AT ALL -- the mechanism spec A2.4.2 demands for "Lords
+    source coverage -- gating -- currently unavailable": omit the entry (or
+    set available: false) and it can never pass, so REFUTED (which requires
+    every stratum to pass) can never fire while Lords lacks one.
+    """
+
+    available: bool = False
+    retrieval_recovered: int | None = None
+    retrieval_total: int | None = None
+    temporal_recovered: int | None = None
+    temporal_total: int | None = None
+
+    @property
+    def retrieval_passed(self) -> bool:
+        return (
+            self.retrieval_total is not None
+            and self.retrieval_total > 0
+            and self.retrieval_recovered is not None
+            and (self.retrieval_recovered / self.retrieval_total) >= CONTROLS_PASS_FRACTION
+        )
+
+    @property
+    def temporal_passed(self) -> bool:
+        return (
+            self.temporal_total is not None
+            and self.temporal_total > 0
+            and self.temporal_recovered is not None
+            and (self.temporal_recovered / self.temporal_total) >= CONTROLS_PASS_FRACTION
+        )
+
+    @property
+    def passed(self) -> bool:
+        return self.available and self.retrieval_passed and self.temporal_passed
+
+
+def load_stratum_gates(path: Path) -> dict[str, StratumGate]:
+    """Load the spec A2.4.3 per-material-stratum gate results.
+
+    Expected JSON contract -- one entry per material stratum:
+
+        {
+          "commons_declared_interest": {
+            "available": true,
+            "retrieval_recovered": 9, "retrieval_total": 10,
+            "temporal_recovered": 9, "temporal_total": 10
+          },
+          "lords_declared_interest": {"available": false},
+          "ch_officer_appointment": {...}
+        }
+
+    Every entry in `MATERIAL_STRATA` is always present in the returned dict
+    -- a stratum missing from the file (or the file itself missing) defaults
+    to `StratumGate()` (available=False), never silently omitted from the
+    all-strata-must-pass check REFUTED depends on.
+    """
+    gates = {name: StratumGate() for name in MATERIAL_STRATA}
+    if not path.exists():
+        return gates
+    data = json.loads(path.read_text())
+    for name in MATERIAL_STRATA:
+        entry = data.get(name)
+        if not entry:
+            continue
+        gates[name] = StratumGate(
+            available=bool(entry.get("available", False)),
+            retrieval_recovered=entry.get("retrieval_recovered"),
+            retrieval_total=entry.get("retrieval_total"),
+            temporal_recovered=entry.get("temporal_recovered"),
+            temporal_total=entry.get("temporal_total"),
+        )
+    return gates
 
 
 def _resolve_referrer_entities(
@@ -368,7 +515,8 @@ def _resolve_pair(
 
     Shared by `evaluate_row` (the row's own `award_date`) and `evaluate_case`
     (the case's `earliest_award_date`, spec A2.3.2) so the resolve + path
-    search + source-separation logic exists in exactly one place.
+    search + source-separation + stratum-attribution logic exists in exactly
+    one place.
     """
     supplier = resolve_supplier(row.company_name, ch_cache, row.company_number)
     referrers = _resolve_referrer_entities(row, people_by_surname)
@@ -391,20 +539,24 @@ def _resolve_pair(
 
     if pre_award:
         sep = check_source_separation(pre_award, row.excluded_from_retrieval)
+        strata = frozenset().union(*(path_strata(p) for p in pre_award))
         return RowEvaluation(
             case_id=row.case_id,
             status="recovered",
             source_separation=sep,
             example_path=[f"{e.edge_type}@{e.valid_from}" for e in pre_award[0]],
+            strata=strata,
         )
     if undated:
         sep = check_source_separation(undated, row.excluded_from_retrieval)
+        strata = frozenset().union(*(path_strata(p) for p in undated))
         return RowEvaluation(
             case_id=row.case_id,
             status="undated_only",
             reason="path found but temporally undecidable (spec SS7.2)",
             source_separation=sep,
             example_path=[f"{e.edge_type}@{e.valid_from}" for e in undated[0]],
+            strata=strata,
         )
     return RowEvaluation(case_id=row.case_id, status="not_recovered")
 
@@ -472,11 +624,8 @@ def evaluate_case(
     (recovered > undated_only > not_recovered > untestable >
     no_trace_by_design): a case counts as recovered if any one of the people
     tied to it produces a pre-award path, even if others don't resolve at
-    all. This is exactly "additional people on the same case may raise
-    confidence within that case; they never multiply it" -- five recovered
-    rows on one case still contribute exactly ONE recovered case, never
-    five; likewise multiple awards to the same company are one case, not one
-    per award.
+    all. `strata` is the UNION of material strata across every row
+    contributing to that winning status (spec A2.4.4 source-qualification).
     """
     cutoff = case.earliest_award_date
     row_evals = [
@@ -498,8 +647,12 @@ def evaluate_case(
             sep = "violation"
         else:
             sep = "not_applicable"
+        strata = (
+            frozenset().union(*(r.strata for r in contributing)) if contributing else frozenset()
+        )
     else:
         sep = "not_applicable"
+        strata = frozenset()
 
     return CaseEvaluation(
         case_key=case.case_key,
@@ -511,6 +664,7 @@ def evaluate_case(
         status=status,
         source_separation=sep,
         row_evaluations=row_evals,
+        strata=strata,
     )
 
 
@@ -546,6 +700,32 @@ def split_recovered_by_source_separation(
     return clean, circular
 
 
+def filter_by_passing_stratum(
+    cases: list[CaseEvaluation],
+    stratum_gates: dict[str, StratumGate],
+) -> tuple[list[CaseEvaluation], list[CaseEvaluation]]:
+    """Split recovered (already circularity-cleaned) cases into (qualifying,
+    instrument_limited) by whether their evidence touches a PASSING stratum.
+
+    Spec A2.4.4: "recovered strict paths must belong to passing strata" --
+    a case whose recovered evidence touches NO passing stratum (e.g. its
+    only path is Lords-only, and Lords remains unavailable per A2.4.2)
+    cannot count toward CONFIRMED/PARTIAL/REFUTED. It is `instrument_limited`
+    FOR THAT CASE, reported separately, never silently dropped.
+
+    A case whose evidence touches AT LEAST ONE passing stratum qualifies --
+    even if it ALSO touches an unsupported one -- because "an unvalidated
+    Lords gate must not erase a genuine, independently verified Commons
+    recovery" (A2.4.4).
+    """
+    passing = frozenset(
+        name for name in MATERIAL_STRATA if stratum_gates.get(name, StratumGate()).passed
+    )
+    qualifying = [c for c in cases if c.strata & passing]
+    instrument_limited = [c for c in cases if not (c.strata & passing)]
+    return qualifying, instrument_limited
+
+
 def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
     """Wilson score interval upper bound for a binomial proportion.
 
@@ -568,8 +748,10 @@ def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
 
 def compute_precision(cases_recovered: int, negatives_recovered: int) -> float:
     """BENCHMARK precision over the constructed case-control sample (spec
-    SS5/A2.5): `cases_recovered` (case-level, per A2.1.1/A2.3.2) against a
-    spurious hit count from the 200 matched negatives.
+    SS5/A2.5) -- itself a non-gating historical diagnostic as of amendment
+    A2.4.1. `cases_recovered` (case-level, already circularity- and
+    stratum-qualification-filtered) against a spurious hit count from the
+    200 matched negatives.
 
     Spec A2.5 is explicit that this is benchmark precision on a constructed
     ~20:200 sample, NOT expected field precision at real-world prevalence --
@@ -586,70 +768,58 @@ def classify_outcome(
     cases_untestable: int,
     cases_no_trace_by_design: int,
     precision: float,
-    retrieval_controls_recovered: int,
-    retrieval_controls_total: int,
-    temporal_gate: TemporalGate | None,
+    coverage_gate: CoverageGate,
+    stratum_gates: dict[str, StratumGate],
 ) -> str:
-    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, all case-level.
+    """Spec A2.1.2 (v2.1) verdict set, RESTRUCTURED by amendment v2.4 for
+    per-stratum gating, all case-level.
 
-    Strict priority order -- each of the six verdicts (five from A2.1.2 plus
-    INSUFFICIENT-COHORT, added below) maps to exactly one branch, with no
-    overlap:
+    Strict priority order:
 
-      0. testable cases < PREREGISTERED_COHORT_SIZE  -> INSUFFICIENT-COHORT
-      1. retrieval controls fail (<9/10)              -> INVALID
-      2. temporal gate fails (A2.3)                    -> INSTRUMENT-LIMITED
-      3. (both gates pass) >=4 cases & >=80%           -> CONFIRMED
-      4. (both gates pass) 0 cases                     -> REFUTED
-      5. (both gates pass) 1-3 cases                   -> PARTIAL
+      0. testable cases < PREREGISTERED_COHORT_SIZE      -> INSUFFICIENT-COHORT
+      1. CoverageGate fails (A2.4.2)                      -> INVALID
+      2. no material stratum passes at all                -> INSTRUMENT-LIMITED
+      3. >=4 qualifying cases & >=80% precision            -> CONFIRMED
+      4. 0 qualifying cases:
+           every material stratum passes (A2.4.4)          -> REFUTED
+           otherwise                                       -> INSTRUMENT-LIMITED
+      5. 1-3 qualifying cases                              -> PARTIAL
 
-    ADVERSARIAL-REVIEW FIX (INSUFFICIENT-COHORT, checked FIRST): the locked
-    "4/20" and "0/20" thresholds are calibrated to a 20-case cohort where
-    those 20 cases actually produced a recovered/undated_only/not_recovered
-    verdict. `cases_untestable` (resolution failures) and
-    `cases_no_trace_by_design` (PSC, spec A2.3.3) are cases that were never
-    really put to the test -- if every gold case fails to resolve, that is a
-    resolver regression or an ingestion gap for those specific companies, NOT
-    evidence against H1, yet `cases_recovered == 0` would otherwise satisfy
-    REFUTED's condition regardless of how many cases were actually testable
-    (Phase C v1's exact defect, reintroduced one level up). The guard is
-    `cases_total - cases_untestable - cases_no_trace_by_design <
-    PREREGISTERED_COHORT_SIZE`, which subsumes a too-small raw manifest too
-    (a smaller total can only ever produce a smaller-or-equal testable
-    count), and is applied uniformly -- it also blocks a false CONFIRMED
-    against a small, unrepresentative partial manifest, not just a false
-    REFUTED.
+    `cases_recovered` MUST already be filtered by the caller through BOTH
+    `split_recovered_by_source_separation` (excluding proven-circular
+    recoveries, spec SS3) AND `filter_by_passing_stratum` (excluding
+    recoveries whose evidence touches no passing stratum, spec A2.4.4) --
+    this function does not (and cannot) re-derive either exclusion from a
+    bare count; it is the caller's responsibility, exactly like the retired
+    single-gate design required for its temporal gate.
 
-    `cases_recovered` MUST already exclude any case whose only recovered
-    evidence is a PROVEN source-separation violation (spec SS3) -- see
-    `split_recovered_by_source_separation`. This function does not (and
-    cannot) re-derive that exclusion from a bare count; it is the caller's
-    responsibility, exactly like the temporal gate.
-
-    `temporal_gate` is REQUIRED and may be `None` (not yet measured);
-    `None` is treated identically to a failing gate -- it can NEVER route to
-    CONFIRMED or REFUTED. This is the mechanism spec A2.3 demands: "REFUTED
-    may be reported only when ... the temporal control gate passes."
+    Branch 3 (CONFIRMED) and branch 5 (PARTIAL) can fire even when NOT every
+    material stratum passes, as long as enough cases qualify through the
+    strata that DO pass -- "a passing Commons gate must not rescue Lords;
+    an unvalidated Lords gate must not erase a verified Commons recovery"
+    (A2.4.4). Only REFUTED (branch 4's true-until-any-stratum-fails path)
+    demands the full battery: it is impossible to assert "0/20, and we are
+    confident the instrument would have found something if it were there"
+    while any material stratum remains unvalidated.
     """
     testable = cases_total - cases_untestable - cases_no_trace_by_design
     if testable < PREREGISTERED_COHORT_SIZE:
         return "INSUFFICIENT-COHORT"
 
-    retrieval_pass = (
-        retrieval_controls_total > 0
-        and (retrieval_controls_recovered / retrieval_controls_total) >= CONTROLS_PASS_FRACTION
-    )
-    if not retrieval_pass:
+    if not coverage_gate.passed:
         return "INVALID"
 
-    temporal_pass = temporal_gate is not None and temporal_gate.passed
-    if not temporal_pass:
+    gates = {name: stratum_gates.get(name, StratumGate()) for name in MATERIAL_STRATA}
+    any_stratum_passes = any(g.passed for g in gates.values())
+    all_strata_pass = all(g.passed for g in gates.values())
+
+    if not any_stratum_passes:
         return "INSTRUMENT-LIMITED"
 
     if cases_recovered >= CONFIRM_MIN_CASES and precision >= CONFIRM_MIN_PRECISION:
         return "CONFIRMED"
     if cases_recovered == 0:
-        return "REFUTED"
+        return "REFUTED" if all_strata_pass else "INSTRUMENT-LIMITED"
     return "PARTIAL"
 
 
@@ -688,12 +858,21 @@ def main() -> None:
     parser.add_argument("--controls-n", type=int, default=10)
     parser.add_argument("--negatives-n", type=int, default=200)
     parser.add_argument(
-        "--temporal-gate-report",
-        default="experiments/temporal_gate.json",
+        "--coverage-gate-report",
+        default="experiments/coverage_gate.json",
         help=(
-            "path to the spec A2.3 temporal control gate result, produced by the "
-            "separate temporal-lift classifier (scripts/measure_temporal_lift.py). "
-            "If absent, the gate is treated as failing -- see load_temporal_gate()."
+            "path to the spec A2.4.2 global coverage gate result (supplier-universe CH "
+            "coverage, Commons universe coverage). If absent, treated as failing -- see "
+            "load_coverage_gate()."
+        ),
+    )
+    parser.add_argument(
+        "--stratum-gates-report",
+        default="experiments/stratum_gates.json",
+        help=(
+            "path to the spec A2.4.3 per-material-stratum gate results. If absent, or a "
+            "stratum's entry is absent, that stratum defaults to unavailable -- see "
+            "load_stratum_gates()."
         ),
     )
     parser.add_argument("--out", default="experiments/gold_benchmark.json")
@@ -702,8 +881,7 @@ def main() -> None:
         action="store_true",
         help=(
             "reuse experiments/positive_controls.json and negative_controls.json instead of "
-            "re-running them. NOT recommended: spec SS7.1 says the negative rate expires after "
-            "every ingest."
+            "re-running them. These are non-gating diagnostics only (spec A2.4.1)."
         ),
     )
     args = parser.parse_args()
@@ -744,32 +922,38 @@ def main() -> None:
             (REPO_ROOT / "experiments" / "negative_controls.json").read_text()
         )
     else:
-        print("\nrunning positive (retrieval) controls (fresh)...")
+        print("\nrunning graph-derived positive controls (fresh -- NON-GATING, spec A2.4.1)...")
         positive_controls = _run_control_script(
             "run_positive_controls.py", ["--n", str(args.controls_n)]
         )
-        print("running negative controls (fresh -- spec SS7.1: this rate expires per ingest)...")
+        print("running negative controls (fresh -- NON-GATING topology snapshot, spec A2.4.1)...")
         negative_controls = _run_control_script(
             "run_negative_controls.py", ["--n", str(args.negatives_n)]
         )
 
-    retrieval_controls_recovered = positive_controls["retrieved"]
-    retrieval_controls_total = positive_controls["n"]
-    if retrieval_controls_total != 10:
-        print(
-            f"NOTE: retrieval controls_total={retrieval_controls_total}, not the spec SS5/SS6 "
-            f"cohort size of 10 -- the >=9/10 threshold is applied proportionally.",
-            file=sys.stderr,
-        )
+    # Spec A2.4.1: these are HISTORICAL, NON-GATING DIAGNOSTICS. Neither feeds
+    # classify_outcome. The graph-derived positive controls are a regression
+    # fixture; the negative-pair rate is a topology snapshot, not a
+    # population false-positive estimate.
+    diagnostic_regression_recovered = positive_controls["retrieved"]
+    diagnostic_regression_total = positive_controls["n"]
     negatives_recovered = negative_controls["with_path"]
     negatives_total = negative_controls["n"]
 
-    temporal_gate = load_temporal_gate(Path(args.temporal_gate_report))
-    if temporal_gate is None:
+    coverage_gate = load_coverage_gate(Path(args.coverage_gate_report))
+    stratum_gates = load_stratum_gates(Path(args.stratum_gates_report))
+    if not coverage_gate.passed:
         print(
-            f"\nWARNING: no temporal control gate report at {args.temporal_gate_report} -- "
-            "spec A2.3 requires one before REFUTED or CONFIRMED can be reported. This run's "
-            "outcome is capped at INSTRUMENT-LIMITED (or INVALID) until it exists.",
+            f"\nWARNING: coverage gate not passing (report: {args.coverage_gate_report}) -- "
+            "spec A2.4.2 requires this before anything else can be evaluated. Outcome is "
+            "capped at INVALID.",
+            file=sys.stderr,
+        )
+    unavailable_strata = [name for name in MATERIAL_STRATA if not stratum_gates[name].available]
+    if unavailable_strata:
+        print(
+            f"\nNOTE: stratum gate(s) unavailable: {unavailable_strata} -- spec A2.4.4: REFUTED "
+            "can never fire while any material stratum lacks a passing gate.",
             file=sys.stderr,
         )
 
@@ -792,8 +976,18 @@ def main() -> None:
         return sum(1 for e in evals if e.status == status)
 
     clean_recovered, circular_recovered = split_recovered_by_source_separation(case_evaluations)
-    cases_recovered = len(clean_recovered)
+    qualifying_recovered, instrument_limited_recovered = filter_by_passing_stratum(
+        clean_recovered, stratum_gates
+    )
+    cases_recovered = len(qualifying_recovered)
     cases_recovered_circular = len(circular_recovered)
+    cases_recovered_instrument_limited = len(instrument_limited_recovered)
+    qualifying_strata = (
+        frozenset().union(*(c.strata for c in qualifying_recovered))
+        if qualifying_recovered
+        else frozenset()
+    )
+
     cases_undated_only = _count(case_evaluations, "undated_only")
     cases_not_recovered = _count(case_evaluations, "not_recovered")
     cases_untestable = _count(case_evaluations, "untestable")
@@ -821,9 +1015,8 @@ def main() -> None:
         cases_untestable,
         cases_no_trace_by_design,
         benchmark_precision,
-        retrieval_controls_recovered,
-        retrieval_controls_total,
-        temporal_gate,
+        coverage_gate,
+        stratum_gates,
     )
     switch_action = country_switch_triggered(outcome)
 
@@ -836,10 +1029,17 @@ def main() -> None:
 
     print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops, case-level) ===")
     print(f"cases total (distinct awardees)    : {len(manifest_result.cases)}")
-    print(f"  recovered (pre-award, clean)     : {cases_recovered}")
+    print(
+        f"  recovered (pre-award, qualifying): {cases_recovered}"
+        f"  -- strata: {sorted(qualifying_strata) or 'none'}"
+    )
     print(
         f"  recovered_circular (SS3 violation): {cases_recovered_circular}"
         "  -- PROVEN circular, EXCLUDED from recovered/CONFIRMED/REFUTED"
+    )
+    print(
+        f"  recovered_instrument_limited      : {cases_recovered_instrument_limited}"
+        "  -- evidence touches NO passing stratum, EXCLUDED from recovered (A2.4.4)"
     )
     print(
         f"  undated_only (temporal unknown)  : {cases_undated_only}"
@@ -856,31 +1056,34 @@ def main() -> None:
         f"undated_only={rows_undated_only} not_recovered={rows_not_recovered} "
         f"untestable={rows_untestable} no_trace_by_design={rows_no_trace_by_design}"
     )
-    print(
-        f"retrieval controls                : {retrieval_controls_recovered}/"
-        f"{retrieval_controls_total}"
-    )
-    print(
-        "temporal control gate              : "
-        f"{'PASS' if temporal_gate and temporal_gate.passed else 'FAIL/UNMEASURED'}"
-        + (
-            f" ({temporal_gate.overall_recovered}/{temporal_gate.overall_total}, "
-            f"failing strata: {list(temporal_gate.failing_strata)})"
-            if temporal_gate is not None
-            else ""
+    print(f"coverage gate (A2.4.2)             : {'PASS' if coverage_gate.passed else 'FAIL'}")
+    print("stratum gates (A2.4.3/A2.4.4):")
+    for name in MATERIAL_STRATA:
+        g = stratum_gates[name]
+        print(
+            f"  {name:28s}: {'PASS' if g.passed else 'FAIL'} "
+            f"(available={g.available}, retrieval={g.retrieval_passed}, "
+            f"temporal={g.temporal_passed})"
         )
+    print(
+        "\n[non-gating diagnostics, spec A2.4.1 -- historical only, never in the primary "
+        "results table]"
     )
     print(
-        f"negative spurious rate (any path)  : {negatives_recovered}/{negatives_total} "
+        f"  graph-derived regression controls: {diagnostic_regression_recovered}/"
+        f"{diagnostic_regression_total}"
+    )
+    print(
+        f"  negative spurious rate (any path): {negatives_recovered}/{negatives_total} "
         f"(95% CI upper bound: {negatives_fp_upper_95:.1%}) -- spec A2.5: never a bare zero"
     )
-    print(f"benchmark precision (NOT field precision, spec A2.5): {benchmark_precision:.3f}")
+    print(f"  benchmark precision (NOT field precision): {benchmark_precision:.3f}")
     print(
-        f"sensitivity (recall, over ALL {len(manifest_result.cases)} cases incl. "
+        f"  sensitivity (recall, over ALL {len(manifest_result.cases)} cases incl. "
         f"untestable/no_trace_by_design): {sensitivity_over_all_cases:.3f}"
     )
     print(
-        f"false_positive_rate                : {false_positive_rate:.3f} "
+        f"  false_positive_rate              : {false_positive_rate:.3f} "
         f"(95% CI upper bound: {negatives_fp_upper_95:.1%})"
     )
     print(f"\n>>> OUTCOME: {outcome} <<<")
@@ -891,6 +1094,12 @@ def main() -> None:
             f"{cases_recovered_circular} case(s) recovered ONLY through a proven-circular "
             f"path (excluded from the recovered count above): "
             f"{[c.case_key for c in circular_recovered]}"
+        )
+    if instrument_limited_recovered:
+        print(
+            f"\nNOTE: {cases_recovered_instrument_limited} recovered case(s) depend entirely on "
+            f"an unsupported stratum (spec A2.4.4 -- excluded from the recovered count, not a "
+            f"refutation): {[c.case_key for c in instrument_limited_recovered]}"
         )
     if undated_only_violations:
         print(
@@ -908,6 +1117,7 @@ def main() -> None:
     report = {
         "outcome": outcome,
         "country_switch_triggered": switch_action,
+        "qualifying_strata": sorted(qualifying_strata),
         "benchmark_precision": benchmark_precision,
         "sensitivity_over_all_cases": sensitivity_over_all_cases,
         "false_positive_rate": false_positive_rate,
@@ -916,11 +1126,15 @@ def main() -> None:
             "total": len(manifest_result.cases),
             "recovered": cases_recovered,
             "recovered_circular": cases_recovered_circular,
+            "recovered_instrument_limited": cases_recovered_instrument_limited,
             "undated_only": cases_undated_only,
             "not_recovered": cases_not_recovered,
             "untestable": cases_untestable,
             "no_trace_by_design": cases_no_trace_by_design,
             "recovered_circular_case_keys": [c.case_key for c in circular_recovered],
+            "recovered_instrument_limited_case_keys": [
+                c.case_key for c in instrument_limited_recovered
+            ],
             "concentrated": [
                 {
                     "case_key": c.case_key,
@@ -941,21 +1155,34 @@ def main() -> None:
             "psc_sourced": [r.case_id for r in psc_rows],
             "note": "secondary figure only -- spec A2.1.1 forbids row-level as a headline",
         },
-        "retrieval_controls": {
-            "recovered": retrieval_controls_recovered,
-            "total": retrieval_controls_total,
+        "coverage_gate": {
+            "passed": coverage_gate.passed,
+            "supplier_universe_passed": coverage_gate.supplier_universe_passed,
+            "commons_universe_passed": coverage_gate.commons_universe_passed,
         },
-        "temporal_gate": {
-            "measured": temporal_gate is not None,
-            "passed": bool(temporal_gate and temporal_gate.passed),
-            "overall_recovered": temporal_gate.overall_recovered if temporal_gate else None,
-            "overall_total": temporal_gate.overall_total if temporal_gate else None,
-            "failing_strata": list(temporal_gate.failing_strata) if temporal_gate else [],
+        "stratum_gates": {
+            name: {
+                "available": stratum_gates[name].available,
+                "retrieval_passed": stratum_gates[name].retrieval_passed,
+                "temporal_passed": stratum_gates[name].temporal_passed,
+                "passed": stratum_gates[name].passed,
+            }
+            for name in MATERIAL_STRATA
         },
-        "negative_controls": {
-            "any_path": negatives_recovered,
-            "n": negatives_total,
-            "upper_bound_95pct": negatives_fp_upper_95,
+        "non_gating_diagnostics": {
+            "note": (
+                "Spec A2.4.1: historical diagnostics only. Neither feeds classify_outcome, "
+                "neither may appear in a primary results table or a before/after comparison."
+            ),
+            "graph_derived_regression_controls": {
+                "recovered": diagnostic_regression_recovered,
+                "total": diagnostic_regression_total,
+            },
+            "negative_controls_topology_snapshot": {
+                "any_path": negatives_recovered,
+                "n": negatives_total,
+                "upper_bound_95pct": negatives_fp_upper_95,
+            },
         },
         "source_separation": {
             "violations": [c.case_key for c in violations],
@@ -986,6 +1213,7 @@ def main() -> None:
                 "row_case_ids": c.row_case_ids,
                 "status": c.status,
                 "source_separation": c.source_separation,
+                "strata": sorted(c.strata),
             }
             for c in case_evaluations
         ],

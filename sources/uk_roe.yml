@@ -1,0 +1,31 @@
+source_id: uk_roe
+name: UK Register of Overseas Entities (Companies House)
+jurisdictions: [GB]
+data_class: A2
+tier: a
+license: "Open Government Licence v3.0"
+redistribution: open
+legal_basis: "Economic Crime (Transparency and Enforcement) Act 2022 — public register of overseas entities owning UK land and their beneficial owners"
+access_method: bulk-api
+robots_tos_reviewed: 2026-08-03
+freshness_sla_days: 7
+dpia_cleared: false
+notes: >-
+  Companies House REST API (company profile, persons-with-significant-control,
+  officers), reused exactly as for ordinary UK companies — overseas entities
+  get OE-prefixed company numbers and the same endpoints, distinguished by
+  `company_type=registered-overseas-entity` and PSC `kind` values ending in
+  `-beneficial-owner`. Verified live 2026-08-03: `/advanced-search/companies`
+  enumerates all ~33,400 entities (offset-capped at 10,000 like GLEIF, sliceable
+  by `incorporated_from`/`incorporated_to`, verified with real date windows).
+  data_class A2 because managing-officer identity (mirroring the ch_officers.py
+  bare-name allowlist precedent already accepted in this codebase) is the only
+  named-individual data path; dpia_cleared stays false pending an explicit
+  LIA/DPIA. Beneficial owners who are natural persons are NEVER persisted
+  (name/DOB/nationality/address) — only a count of their existence
+  (`uncorrupt.graph.overseas_entities`, ADR-004 D1). HM Land Registry's OCOD
+  land-title join is deliberately NOT implemented by this source: OCOD requires
+  an authenticated "Use land and property data" account (not a bulk anonymous
+  download) and has no dedicated OE-number column — only a generic "Company
+  Registration No." field HMLR's own docs admit can be missing or wrong. See
+  the ROE connector module docstring for the full writeup.

@@ -1,9 +1,9 @@
 """Run the pre-registered Phase C gold-manifest benchmark -- ONE verdict.
 
 Spec (LOCKED, do not deviate): vault
-`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`.
-Sections 5 (cohort composition), 6 (acceptance thresholds) and 7 (standing
-caveats) are binding here.
+`02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
+including AMENDMENT v2 (temporal evidence ladder) and AMENDMENT v2.1 (unit of
+analysis + revised verdict set). Sections 5-7 and both amendments are binding.
 
 This script does NOT implement a second path-search or resolution stack. It
 calls the same code the rest of Phase C already uses and already trusts:
@@ -13,62 +13,86 @@ calls the same code the rest of Phase C already uses and already trusts:
   * `scripts.phase_c_paths.resolve_referrer` -- person-side (surname) resolution
   * `scripts.phase_c_paths.build_adjacency`  -- the adjacency index
   * `scripts/run_positive_controls.py` / `scripts/run_negative_controls.py`
-    -- invoked as subprocesses (never re-implemented) so the control numbers
-    quoted are exactly the ones the project already relies on.
+    -- invoked as subprocesses (never re-implemented) for the RETRIEVAL
+    control numbers.
 
-Three outcomes for a single manifest row that MUST NOT be conflated -- Phase
-C v1 collapsed (c) into a refutation and had to retract "0 of 52" because of
-it:
+It also does NOT implement the spec A2.3 temporal control gate (the level-1/2
+evidence classifier living in `src/uncorrupt/graph/register_snapshots.py` and
+`scripts/measure_temporal_lift.py`, built separately). It only requires that
+gate's *result* as an explicit input -- see `TemporalGate` / `load_temporal_gate`
+-- so this runner can never emit REFUTED (or CONFIRMED) without one having
+actually been measured.
+
+UNIT OF ANALYSIS (amendment v2.1, A2.1.1): every threshold below is scored at
+CASE level, not row level. A case is a distinct `(company_number, award_date)`
+pair (`scripts.load_gold_manifest.GoldCase`); one heavily-populated case (e.g.
+five people tied to one company and one award) must never look like five
+recovered cases. `evaluate_case` rolls up all of a case's constituent rows
+into one status: recovered beats undated_only beats not_recovered beats
+untestable, i.e. a case counts as testable/recovered if ANY of its rows
+achieves that status. Row-level counts are still computed and reported, but
+never as the headline figure (A2.1.1: "Row-level alone is forbidden as a
+headline").
+
+Three per-row / per-case outcomes that MUST NOT be conflated -- Phase C v1
+collapsed (c) into a refutation and had to retract "0 of 52" because of it:
 
   (a) recovered      -- a path was found and every edge on it dates before
                         the row's own award_date (H1's actual claim).
   (b) undated_only    -- a path was found but at least one edge on it has no
-                        valid_from, so pre-award is UNDECIDABLE for this row,
-                        not false. Standing caveat SS7.2: only ~0.4% of
-                        `declared_interest` edges carry a date at all (the
-                        Lords register publishes no start dates), against
-                        92.3% of `officer_of`. A row whose only graph
-                        evidence is a declared-interest edge lands here BY
-                        CONSTRUCTION regardless of whether the relationship
-                        is real. Never counted as a recovery, never as a
-                        refutation.
+                        valid_from, so pre-award is UNDECIDABLE, not false.
+                        Superseded in spirit by the A2.2 evidence ladder
+                        (levels 1/2 vs 3), whose actual level classification
+                        lives in the separate temporal-lift script; this
+                        script's own dated/undated split is the coarse
+                        version it can determine locally without that
+                        classifier.
   (c) untestable      -- the supplier or the referrer never resolved to a
-                        graph entity. Excluded from every denominator below;
+                        graph entity. Excluded from every denominator;
                         reported separately with the specific reason.
 
 Only a resolved pair with no path at all, dated or undated, is a genuine
-`not_recovered` miss -- the only category that is real evidence against H1
-for that row.
+`not_recovered` miss.
 
 Source separation (spec SS3): a row's `excluded_from_retrieval` sources must
-never be what makes its path recoverable. `check_source_separation` below is
-a BEST-EFFORT check against `Attestation.source_name` on the recovered
-path(s) -- see its docstring for exactly what it can and cannot prove. It is
-not a guarantee, and this script's output says so explicitly rather than
-implying enforcement it cannot deliver.
+never be what makes its path recoverable. `check_source_separation` is a
+BEST-EFFORT check against `Attestation.source_name` -- see its docstring for
+exactly what it can and cannot prove.
 
-Two places this script makes an explicit judgement call where the spec text
-underspecifies the mechanism -- both are logged loudly in the printed report,
-not buried:
+VERDICT SET (amendment v2.1, A2.1.2 -- replaces the old SS6 table):
 
-  * REFUTED vs COUNTRY_SWITCH (spec SS6 table): both rows key off "controls
-    pass AND positives fail". REFUTED is treated as the strict 0/20 case
-    (the one with a stated statistical bound); COUNTRY_SWITCH is the general
-    "did not confirm" case for any other shortfall (1-3/20, or precision
-    below 80%). INVALID is checked first, per SS6's "must not be reported".
-  * Precision's false-positive term uses the negative controls' `with_path`
-    (ANY 2-hop connection, dated or not) rather than `with_preaward`. The
-    negative-control script's own pre-award figure is pinned to a fixed,
-    VIP-lane-specific cutoff (2020-03-01) that has no relationship to the
-    gold manifest's per-row award dates, so it is not a fair like-for-like
-    false-positive baseline here. `with_path` is cutoff-agnostic and, if
-    anything, an over-count of noise -- a conservative (lower) bound on true
-    precision, which is the safer direction to err on for a pre-registered
-    confirmatory test.
+  INVALID            retrieval controls <9/10 -- pipeline broken, positives
+                      result must not be reported.
+  INSTRUMENT-LIMITED  retrieval controls pass but the temporal control gate
+                      (A2.3) fails -- the UK strict hypothesis is untestable
+                      with these sources.
+  CONFIRMED           >=4/20 cases recovered, >=80% benchmark precision,
+                      retrieval AND temporal gates both pass.
+  REFUTED             0/20 cases recovered, retrieval AND temporal gates
+                      both pass.
+  PARTIAL             1-3/20 cases recovered, retrieval AND temporal gates
+                      both pass. Real traces below the confirmation bar --
+                      never rendered as a confirmation.
+
+`classify_outcome` evaluates these in a strict priority order (INVALID, then
+INSTRUMENT-LIMITED, then the case-count-dependent branches) so every one of
+the five rows above maps to exactly one branch with no residual ambiguity --
+unlike the SS6 table's REFUTED/COUNTRY SWITCH overlap this amendment fixes.
+
+COUNTRY_SWITCH IS NOT A VERDICT (A2.1.2) -- it is an action triggered by
+PARTIAL, REFUTED, or INSTRUMENT-LIMITED. See `country_switch_triggered`.
+
+Statistical reporting (amendment A2.5): a `0/N` control or negative-control
+count is never printed bare -- `wilson_upper_bound` computes the ~95%
+one-sided upper bound reported alongside it. Benchmark precision (on the
+constructed 20-ish-case : 200-negative sample) is reported labelled as such,
+never as an operational/field precision figure, alongside sensitivity and
+false-positive rate as separate, explicitly named metrics.
 
 Usage:
     PYTHONPATH=.:src python scripts/run_gold_benchmark.py \\
         --manifest data/gold_manifest.csv \\
+        --temporal-gate-report experiments/temporal_gate.json \\
         --out experiments/gold_benchmark.json
 """
 
@@ -87,7 +111,7 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
-from scripts.load_gold_manifest import GoldRow, load_gold_manifest  # noqa: E402
+from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest  # noqa: E402
 from scripts.phase_c_paths import (  # noqa: E402
     build_adjacency,
     find_paths,
@@ -100,10 +124,15 @@ from uncorrupt.graph.models import Edge, Entity  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Spec SS6 LOCKED thresholds.
-CONTROLS_PASS_FRACTION = 0.9  # >=9/10
-CONFIRM_MIN_RECOVERED = 4  # >=4/20
-CONFIRM_MIN_PRECISION = 0.80  # >=80%
+# Spec SS6 / A2.1.2 LOCKED thresholds.
+CONTROLS_PASS_FRACTION = 0.9  # >=9/10 retrieval controls
+CONFIRM_MIN_CASES = 4  # >=4/20 cases (not rows -- A2.1.1)
+CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
+
+# Priority order for rolling per-row statuses up to a case (higher wins).
+_STATUS_PRIORITY = {"recovered": 3, "undated_only": 2, "not_recovered": 1, "untestable": 0}
+
+_Z_95 = 1.959963984540054  # two-sided 95% normal quantile
 
 
 @dataclass
@@ -113,6 +142,74 @@ class RowEvaluation:
     reason: str | None = None
     source_separation: str = "not_applicable"
     example_path: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CaseEvaluation:
+    """The case-level roll-up of one `GoldCase`'s constituent rows (A2.1.1)."""
+
+    case_key: str
+    company_number: str
+    award_date: str
+    row_case_ids: list[str]
+    status: str  # "recovered" | "undated_only" | "not_recovered" | "untestable"
+    source_separation: str
+    row_evaluations: list[RowEvaluation]
+
+    @property
+    def is_concentrated(self) -> bool:
+        return len(self.row_case_ids) > 1
+
+
+@dataclass(frozen=True)
+class TemporalGate:
+    """Spec A2.3 temporal control gate -- a REQUIRED input to `classify_outcome`.
+
+    Built by a separate classifier out of this script's scope
+    (`src/uncorrupt/graph/register_snapshots.py`,
+    `scripts/measure_temporal_lift.py`). This script never computes it; it
+    only requires the caller supply the result, so REFUTED (and CONFIRMED)
+    can never be emitted without one having actually been measured.
+
+    `passed` reflects spec A2.3 in full: ~27/30 controls recovered at
+    evidence level 1 (event-dated) or level 2 (pre-award observed) overall,
+    AND >=9/10 within each material relationship-type/source stratum
+    (`failing_strata` names any stratum that did not clear that bar).
+    """
+
+    passed: bool
+    overall_recovered: int | None = None
+    overall_total: int | None = None
+    failing_strata: tuple[str, ...] = ()
+
+
+def load_temporal_gate(path: Path) -> TemporalGate | None:
+    """Load the spec A2.3 temporal control gate result, if it has been measured.
+
+    Expected JSON contract, produced by the separate temporal-lift classifier
+    (not implemented here):
+
+        {
+          "passed": bool,
+          "overall_recovered": int,
+          "overall_total": int,
+          "failing_strata": ["<relationship_type/source>", ...]
+        }
+
+    Returns None if the file does not exist. `classify_outcome` treats `None`
+    exactly like `passed=False` -- a missing measurement is never an implicit
+    pass (spec A2.3: "REFUTED may be reported only when ... the temporal
+    control gate passes").
+    """
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    return TemporalGate(
+        passed=bool(data["passed"]),
+        overall_recovered=data.get("overall_recovered"),
+        overall_total=data.get("overall_total"),
+        failing_strata=tuple(data.get("failing_strata", ())),
+    )
 
 
 def _resolve_referrer_entities(
@@ -157,25 +254,21 @@ def _path_taint(path: list[Edge], lowered_excluded: list[str]) -> str:
 
 
 def check_source_separation(paths: list[list[Edge]], excluded_sources: tuple[str, ...]) -> str:
-    """Best-effort spec SS3 check: did an excluded source make this row recoverable?
+    """Best-effort spec SS3 check: did an excluded source make this recoverable?
 
-    A row's recovery is judged 'ok' if AT LEAST ONE of its found paths is
-    'clean' (no excluded-source attestation, no unattested gap) -- an
-    independent, permitted path exists. If none are clean but at least one
-    is 'unverifiable', the result is 'cannot_verify'. Only when every path
-    is positively 'tainted' is the result 'violation'.
+    Judged 'ok' if AT LEAST ONE found path is 'clean' (no excluded-source
+    attestation, no unattested gap) -- an independent, permitted path exists.
+    If none are clean but at least one is 'unverifiable', the result is
+    'cannot_verify'. Only when every path is positively 'tainted' is the
+    result 'violation'.
 
-    KNOWN LIMITS (reported, not hidden -- see the module docstring's
-    "PRECISION" note for the sibling caveat on the negative-control cutoff):
-      * This can only see what was recorded as an `Attestation.source_name`.
-        It cannot detect an excluded source that shaped entity resolution or
+    KNOWN LIMITS (reported, not hidden):
+      * Can only see what was recorded as an `Attestation.source_name`. It
+        cannot detect an excluded source that shaped entity resolution or
         ingestion without ever being logged as an attestation.
-      * Matching is a free-text, case-insensitive substring test. It is only
-        as good as how closely a manifest's `excluded_from_retrieval`
-        wording matches this project's own `source_name` conventions
-        ("Companies House", "Electoral Commission", ...). A worded-
-        differently exclusion will silently read as 'ok' or 'cannot_verify'
-        rather than 'violation'.
+      * Matching is a free-text, case-insensitive substring test -- only as
+        good as how closely `excluded_from_retrieval` wording matches this
+        project's own `source_name` conventions.
     """
     if not excluded_sources or not paths:
         return "not_applicable"
@@ -244,39 +337,135 @@ def evaluate_row(
     return RowEvaluation(case_id=row.case_id, status="not_recovered")
 
 
-def compute_precision(positives_recovered: int, negatives_recovered: int) -> float:
-    """Precision over the pooled labelled evaluation set (spec SS5: 20
-    positives + 200 matched negatives). `negatives_recovered` should be the
-    negative controls' ANY-path spurious count -- see the module docstring
-    for why `with_preaward` is not used here.
+def evaluate_case(
+    case: GoldCase,
+    adj: dict[int, list[Edge]],
+    people_by_surname: dict[str, list[Entity]],
+    ch_cache: dict,
+    max_hops: int,
+) -> CaseEvaluation:
+    """Roll up every row in a case into ONE case-level status (spec A2.1.1).
+
+    A case's status is the STRONGEST status achieved by any of its rows
+    (recovered > undated_only > not_recovered > untestable): a case counts as
+    recovered if any one of the people tied to it produces a pre-award path,
+    even if others don't resolve at all. This is exactly "additional people
+    on the same case may raise confidence within that case; they never
+    multiply it" -- five recovered rows on one case still contribute exactly
+    ONE recovered case, never five.
     """
-    denom = positives_recovered + negatives_recovered
-    return positives_recovered / denom if denom > 0 else 0.0
+    row_evals = [evaluate_row(row, adj, people_by_surname, ch_cache, max_hops) for row in case.rows]
+    status = max(row_evals, key=lambda r: _STATUS_PRIORITY[r.status]).status
+
+    if status in ("recovered", "undated_only"):
+        contributing = [r for r in row_evals if r.status == status]
+        seps = [r.source_separation for r in contributing]
+        if "ok" in seps:
+            sep = "ok"
+        elif "cannot_verify" in seps:
+            sep = "cannot_verify"
+        elif "violation" in seps:
+            sep = "violation"
+        else:
+            sep = "not_applicable"
+    else:
+        sep = "not_applicable"
+
+    return CaseEvaluation(
+        case_key=case.case_key,
+        company_number=case.company_number,
+        award_date=case.award_date.isoformat(),
+        row_case_ids=[r.case_id for r in case.rows],
+        status=status,
+        source_separation=sep,
+        row_evaluations=row_evals,
+    )
+
+
+def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
+    """Wilson score interval upper bound for a binomial proportion.
+
+    Spec A2.5: "0/200 is not a zero false-positive rate" -- its approximate
+    95% upper bound must always be reported alongside a raw count, never a
+    bare zero. This uses the standard Wilson interval (works for any x, not
+    just x=0) rather than the simpler rule-of-three heuristic (`3/n`) the
+    amendment text illustrates its point with; at x=0, n=200 this gives
+    ~1.9% versus the amendment's quoted ~1.5% -- both are approximations of
+    the same 95% bound, and this is the more general, standard one.
+    """
+    if n == 0:
+        return 0.0
+    phat = successes / n
+    denom = 1 + z * z / n
+    centre = phat + z * z / (2 * n)
+    adjustment = z * ((phat * (1 - phat) / n + z * z / (4 * n * n)) ** 0.5)
+    return (centre + adjustment) / denom
+
+
+def compute_precision(cases_recovered: int, negatives_recovered: int) -> float:
+    """BENCHMARK precision over the constructed case-control sample (spec
+    SS5/A2.5): `cases_recovered` (case-level, per A2.1.1) against a spurious
+    hit count from the 200 matched negatives.
+
+    Spec A2.5 is explicit that this is benchmark precision on a constructed
+    ~20:200 sample, NOT expected field precision at real-world prevalence --
+    callers must label it as such and report sensitivity / false-positive
+    rate as separate figures, never substitute this number for either.
+    """
+    denom = cases_recovered + negatives_recovered
+    return cases_recovered / denom if denom > 0 else 0.0
 
 
 def classify_outcome(
-    positives_recovered: int,
+    cases_recovered: int,
     precision: float,
-    controls_recovered: int,
-    controls_total: int,
+    retrieval_controls_recovered: int,
+    retrieval_controls_total: int,
+    temporal_gate: TemporalGate | None,
 ) -> str:
-    """Spec SS6 LOCKED acceptance thresholds.
+    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, all case-level.
 
-    INVALID is checked first: SS6 says explicitly the positives result "must
-    not be reported" when controls fail, so nothing about positives may
-    influence the outcome once that gate fires. See the module docstring for
-    the REFUTED vs COUNTRY_SWITCH reading adopted here.
+    Strict priority order -- each of the five verdicts maps to exactly one
+    branch, with no overlap (unlike the original SS6 table's REFUTED/COUNTRY
+    SWITCH ambiguity this amendment replaces):
+
+      1. retrieval controls fail (<9/10)      -> INVALID
+      2. temporal gate fails (A2.3)            -> INSTRUMENT-LIMITED
+      3. (both gates pass) >=4 cases & >=80%   -> CONFIRMED
+      4. (both gates pass) 0 cases             -> REFUTED
+      5. (both gates pass) 1-3 cases           -> PARTIAL
+
+    `temporal_gate` is REQUIRED and may be `None` (not yet measured);
+    `None` is treated identically to a failing gate -- it can NEVER route to
+    CONFIRMED or REFUTED. This is the mechanism spec A2.3 demands: "REFUTED
+    may be reported only when ... the temporal control gate passes."
     """
-    controls_pass = (
-        controls_total > 0 and (controls_recovered / controls_total) >= CONTROLS_PASS_FRACTION
+    retrieval_pass = (
+        retrieval_controls_total > 0
+        and (retrieval_controls_recovered / retrieval_controls_total) >= CONTROLS_PASS_FRACTION
     )
-    if not controls_pass:
+    if not retrieval_pass:
         return "INVALID"
-    if positives_recovered >= CONFIRM_MIN_RECOVERED and precision >= CONFIRM_MIN_PRECISION:
+
+    temporal_pass = temporal_gate is not None and temporal_gate.passed
+    if not temporal_pass:
+        return "INSTRUMENT-LIMITED"
+
+    if cases_recovered >= CONFIRM_MIN_CASES and precision >= CONFIRM_MIN_PRECISION:
         return "CONFIRMED"
-    if positives_recovered == 0:
+    if cases_recovered == 0:
         return "REFUTED"
-    return "COUNTRY_SWITCH"
+    return "PARTIAL"
+
+
+def country_switch_triggered(outcome: str) -> bool:
+    """Spec A2.1.2: COUNTRY_SWITCH is an ACTION, not a verdict.
+
+    Triggered by PARTIAL, REFUTED, or INSTRUMENT-LIMITED -- i.e. by every
+    verdict except CONFIRMED and INVALID (a broken pipeline licenses no
+    action at all until it is fixed).
+    """
+    return outcome in ("PARTIAL", "REFUTED", "INSTRUMENT-LIMITED")
 
 
 def _run_control_script(script_name: str, extra_args: list[str]) -> dict:
@@ -301,6 +490,15 @@ def main() -> None:
     parser.add_argument("--max-hops", type=int, default=2)
     parser.add_argument("--controls-n", type=int, default=10)
     parser.add_argument("--negatives-n", type=int, default=200)
+    parser.add_argument(
+        "--temporal-gate-report",
+        default="experiments/temporal_gate.json",
+        help=(
+            "path to the spec A2.3 temporal control gate result, produced by the "
+            "separate temporal-lift classifier (scripts/measure_temporal_lift.py). "
+            "If absent, the gate is treated as failing -- see load_temporal_gate()."
+        ),
+    )
     parser.add_argument("--out", default="experiments/gold_benchmark.json")
     parser.add_argument(
         "--skip-controls",
@@ -314,11 +512,18 @@ def main() -> None:
     args = parser.parse_args()
 
     manifest_result = load_gold_manifest(args.manifest)
+    concentrated_cases = [c for c in manifest_result.cases if c.is_concentrated]
+
     print(f"=== GOLD MANIFEST: {args.manifest} ===")
-    print(f"admissible  : {len(manifest_result.admissible)}")
-    print(f"inadmissible: {len(manifest_result.inadmissible)}")
+    print(f"admissible rows : {len(manifest_result.admissible)}")
+    print(f"distinct cases  : {len(manifest_result.cases)}  (unit of analysis -- spec A2.1.1)")
+    print(f"inadmissible    : {len(manifest_result.inadmissible)}")
     for row in manifest_result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
+    if concentrated_cases:
+        print("\nconcentrated cases (>1 row -- spec A2.1.1 requires these listed explicitly):")
+        for case in concentrated_cases:
+            print(f"  {case.case_key}: {case.row_count} rows -- {[r.case_id for r in case.rows]}")
 
     if args.skip_controls:
         positive_controls = json.loads(
@@ -328,7 +533,7 @@ def main() -> None:
             (REPO_ROOT / "experiments" / "negative_controls.json").read_text()
         )
     else:
-        print("\nrunning positive controls (fresh)...")
+        print("\nrunning positive (retrieval) controls (fresh)...")
         positive_controls = _run_control_script(
             "run_positive_controls.py", ["--n", str(args.controls_n)]
         )
@@ -337,15 +542,25 @@ def main() -> None:
             "run_negative_controls.py", ["--n", str(args.negatives_n)]
         )
 
-    controls_recovered = positive_controls["retrieved"]
-    controls_total = positive_controls["n"]
-    if controls_total != 10:
+    retrieval_controls_recovered = positive_controls["retrieved"]
+    retrieval_controls_total = positive_controls["n"]
+    if retrieval_controls_total != 10:
         print(
-            f"NOTE: controls_total={controls_total}, not the spec SS5/SS6 cohort size of 10 -- "
-            f"the >=9/10 threshold is applied proportionally.",
+            f"NOTE: retrieval controls_total={retrieval_controls_total}, not the spec SS5/SS6 "
+            f"cohort size of 10 -- the >=9/10 threshold is applied proportionally.",
             file=sys.stderr,
         )
     negatives_recovered = negative_controls["with_path"]
+    negatives_total = negative_controls["n"]
+
+    temporal_gate = load_temporal_gate(Path(args.temporal_gate_report))
+    if temporal_gate is None:
+        print(
+            f"\nWARNING: no temporal control gate report at {args.temporal_gate_report} -- "
+            "spec A2.3 requires one before REFUTED or CONFIRMED can be reported. This run's "
+            "outcome is capped at INSTRUMENT-LIMITED (or INVALID) until it exists.",
+            file=sys.stderr,
+        )
 
     people_by_surname: dict[str, list[Entity]] = {}
     for person in Entity.objects.filter(entity_type="person"):
@@ -356,67 +571,134 @@ def main() -> None:
     adj = build_adjacency()
     print(f"\ngraph: {Entity.objects.count()} entities, {Edge.objects.count()} edges")
 
-    evaluations = [
-        evaluate_row(row, adj, people_by_surname, {}, args.max_hops)
-        for row in manifest_result.admissible
+    case_evaluations = [
+        evaluate_case(case, adj, people_by_surname, {}, args.max_hops)
+        for case in manifest_result.cases
     ]
+    row_evaluations = [re for ce in case_evaluations for re in ce.row_evaluations]
 
-    recovered = [e for e in evaluations if e.status == "recovered"]
-    undated_only = [e for e in evaluations if e.status == "undated_only"]
-    not_recovered = [e for e in evaluations if e.status == "not_recovered"]
-    untestable = [e for e in evaluations if e.status == "untestable"]
+    def _count(evals: list, status: str) -> int:
+        return sum(1 for e in evals if e.status == status)
 
-    positives_recovered = len(recovered)
-    precision = compute_precision(positives_recovered, negatives_recovered)
-    outcome = classify_outcome(positives_recovered, precision, controls_recovered, controls_total)
+    cases_recovered = _count(case_evaluations, "recovered")
+    cases_undated_only = _count(case_evaluations, "undated_only")
+    cases_not_recovered = _count(case_evaluations, "not_recovered")
+    cases_untestable = _count(case_evaluations, "untestable")
 
-    violations = [e for e in evaluations if e.source_separation == "violation"]
-    unverifiable = [e for e in evaluations if e.source_separation == "cannot_verify"]
+    rows_recovered = _count(row_evaluations, "recovered")
+    rows_undated_only = _count(row_evaluations, "undated_only")
+    rows_not_recovered = _count(row_evaluations, "not_recovered")
+    rows_untestable = _count(row_evaluations, "untestable")
 
-    print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops) ===")
-    print(f"positives total (admissible)     : {len(manifest_result.admissible)}")
-    print(f"  recovered (pre-award)           : {positives_recovered}")
+    benchmark_precision = compute_precision(cases_recovered, negatives_recovered)
+    sensitivity = cases_recovered / len(manifest_result.cases) if manifest_result.cases else 0.0
+    false_positive_rate = negatives_recovered / negatives_total if negatives_total else 0.0
+    negatives_fp_upper_95 = wilson_upper_bound(negatives_recovered, negatives_total)
+
+    outcome = classify_outcome(
+        cases_recovered,
+        benchmark_precision,
+        retrieval_controls_recovered,
+        retrieval_controls_total,
+        temporal_gate,
+    )
+    switch_action = country_switch_triggered(outcome)
+
+    violations = [c for c in case_evaluations if c.source_separation == "violation"]
+    unverifiable = [c for c in case_evaluations if c.source_separation == "cannot_verify"]
+
+    print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops, case-level) ===")
+    print(f"cases total (distinct)            : {len(manifest_result.cases)}")
+    print(f"  recovered (pre-award)            : {cases_recovered}")
     print(
-        f"  undated_only (temporal unknown) : {len(undated_only)}"
+        f"  undated_only (temporal unknown)  : {cases_undated_only}"
         "  -- never recovery, never refutation"
     )
-    print(f"  not_recovered (real miss)       : {len(not_recovered)}")
+    print(f"  not_recovered (real miss)        : {cases_not_recovered}")
+    print(f"  untestable (unresolved)          : {cases_untestable}  -- excluded from denominators")
     print(
-        f"  untestable (unresolved)         : {len(untestable)}  -- excluded from every denominator"
+        f"rows (secondary, non-headline)    : recovered={rows_recovered} "
+        f"undated_only={rows_undated_only} not_recovered={rows_not_recovered} "
+        f"untestable={rows_untestable}"
     )
-    print(f"controls (register-visible)      : {controls_recovered}/{controls_total}")
-    print(f"negative spurious rate (any path): {negatives_recovered}/{negative_controls['n']}")
-    print(f"precision                        : {precision:.3f}")
+    print(
+        f"retrieval controls                : {retrieval_controls_recovered}/"
+        f"{retrieval_controls_total}"
+    )
+    print(
+        "temporal control gate              : "
+        f"{'PASS' if temporal_gate and temporal_gate.passed else 'FAIL/UNMEASURED'}"
+        + (
+            f" ({temporal_gate.overall_recovered}/{temporal_gate.overall_total}, "
+            f"failing strata: {list(temporal_gate.failing_strata)})"
+            if temporal_gate is not None
+            else ""
+        )
+    )
+    print(
+        f"negative spurious rate (any path)  : {negatives_recovered}/{negatives_total} "
+        f"(95% CI upper bound: {negatives_fp_upper_95:.1%}) -- spec A2.5: never a bare zero"
+    )
+    print(f"benchmark precision (NOT field precision, spec A2.5): {benchmark_precision:.3f}")
+    print(f"sensitivity (recall)               : {sensitivity:.3f}")
+    print(f"false_positive_rate                : {false_positive_rate:.3f}")
     print(f"\n>>> OUTCOME: {outcome} <<<")
+    print(f">>> COUNTRY_SWITCH action triggered: {switch_action} <<<")
     if violations:
         print(
             f"\nWARNING: spec SS3 source-separation VIOLATION on "
-            f"{len(violations)} row(s): {[e.case_id for e in violations]}"
+            f"{len(violations)} case(s): {[c.case_key for c in violations]}"
         )
     if unverifiable:
         print(
-            f"\nNOTE: source separation could NOT be verified for {len(unverifiable)} row(s) "
-            f"(unattested edge on every found path): {[e.case_id for e in unverifiable]}"
+            f"\nNOTE: source separation could NOT be verified for {len(unverifiable)} case(s) "
+            f"(unattested edge on every found path): {[c.case_key for c in unverifiable]}"
         )
 
     report = {
         "outcome": outcome,
-        "precision": precision,
-        "positives": {
-            "admissible_total": len(manifest_result.admissible),
-            "recovered": positives_recovered,
-            "undated_only": len(undated_only),
-            "not_recovered": len(not_recovered),
-            "untestable": len(untestable),
+        "country_switch_triggered": switch_action,
+        "benchmark_precision": benchmark_precision,
+        "sensitivity": sensitivity,
+        "false_positive_rate": false_positive_rate,
+        "cases": {
+            "total": len(manifest_result.cases),
+            "recovered": cases_recovered,
+            "undated_only": cases_undated_only,
+            "not_recovered": cases_not_recovered,
+            "untestable": cases_untestable,
+            "concentrated": [
+                {"case_key": c.case_key, "row_count": c.row_count, "row_case_ids": c.row_case_ids}
+                for c in concentrated_cases
+            ],
         },
-        "controls": {"recovered": controls_recovered, "total": controls_total},
+        "rows": {
+            "total": len(manifest_result.admissible),
+            "recovered": rows_recovered,
+            "undated_only": rows_undated_only,
+            "not_recovered": rows_not_recovered,
+            "untestable": rows_untestable,
+            "note": "secondary figure only -- spec A2.1.1 forbids row-level as a headline",
+        },
+        "retrieval_controls": {
+            "recovered": retrieval_controls_recovered,
+            "total": retrieval_controls_total,
+        },
+        "temporal_gate": {
+            "measured": temporal_gate is not None,
+            "passed": bool(temporal_gate and temporal_gate.passed),
+            "overall_recovered": temporal_gate.overall_recovered if temporal_gate else None,
+            "overall_total": temporal_gate.overall_total if temporal_gate else None,
+            "failing_strata": list(temporal_gate.failing_strata) if temporal_gate else [],
+        },
         "negative_controls": {
             "any_path": negatives_recovered,
-            "n": negative_controls["n"],
+            "n": negatives_total,
+            "upper_bound_95pct": negatives_fp_upper_95,
         },
         "source_separation": {
-            "violations": [e.case_id for e in violations],
-            "unverifiable": [e.case_id for e in unverifiable],
+            "violations": [c.case_key for c in violations],
+            "unverifiable": [c.case_key for c in unverifiable],
             "known_limits": (
                 "Best-effort Attestation.source_name substring match only. Cannot detect an "
                 "excluded source that shaped resolution/ingestion without being logged as an "
@@ -427,15 +709,16 @@ def main() -> None:
         "inadmissible_rows": [
             {"case_id": r.case_id, "reasons": list(r.reasons)} for r in manifest_result.inadmissible
         ],
-        "rows": [
+        "case_detail": [
             {
-                "case_id": e.case_id,
-                "status": e.status,
-                "reason": e.reason,
-                "source_separation": e.source_separation,
-                "example_path": e.example_path,
+                "case_key": c.case_key,
+                "company_number": c.company_number,
+                "award_date": c.award_date,
+                "row_case_ids": c.row_case_ids,
+                "status": c.status,
+                "source_separation": c.source_separation,
             }
-            for e in evaluations
+            for c in case_evaluations
         ],
     }
 

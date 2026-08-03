@@ -30,6 +30,17 @@ Company numbers are normalised with the project's canonical Companies House
 normaliser (`uncorrupt.staging.companies_house.normalise_company_number`)
 rather than re-implementing the zero-padding rule a second time.
 
+UNIT OF ANALYSIS (spec amendment v2.1, A2.1.1): a CASE is the distinct pair
+`(company_number, award_date)`, not a row. Candidate sourcing produced rows
+that are not independent -- one company+award event can be named by several
+people, and the same case can be surfaced twice by different sourcing
+families. Recovering one heavily-populated case must never look like
+recovering several. Every admissible row is therefore grouped into a
+`GoldCase` at load time (`ManifestLoadResult.cases`); multiple rows on one
+case collapse into that ONE case, and the benchmark runner scores cases, not
+rows (row-level counts are still reported, but only as a secondary figure --
+see spec A2.1.1: "Row-level alone is forbidden as a headline.").
+
 Usage:
     PYTHONPATH=.:src python scripts/load_gold_manifest.py data/gold_manifest.csv
 """
@@ -41,6 +52,7 @@ import csv
 import json
 import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -96,10 +108,59 @@ class InadmissibleRow:
     raw: dict[str, str]
 
 
+@dataclass(frozen=True)
+class GoldCase:
+    """One distinct case (spec A2.1.1): the pair `(company_number, award_date)`.
+
+    Multiple admissible rows sharing this key -- multiple people tied to the
+    same company and award event, or the same case surfaced twice by
+    different sourcing families -- collapse into ONE case. They may raise
+    within-case confidence (more independent people named for the same
+    company+award is stronger evidence); they never multiply the case count
+    a threshold is measured against.
+    """
+
+    company_number: str
+    award_date: date
+    rows: tuple[GoldRow, ...]
+
+    @property
+    def case_key(self) -> str:
+        return f"{self.company_number}@{self.award_date.isoformat()}"
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
+
+    @property
+    def is_concentrated(self) -> bool:
+        """True if more than one row collapsed into this case -- spec
+        A2.1.1 requires any such case to be listed explicitly so a reader
+        can see the concentration, not just the case count."""
+        return self.row_count > 1
+
+
+def _group_into_cases(rows: list[GoldRow]) -> list[GoldCase]:
+    """Group admissible rows into cases by `(company_number, award_date)`.
+
+    Grouping order follows first appearance in the (already row-order-
+    preserving) admissible list, so the result is deterministic for a given
+    manifest.
+    """
+    grouped: dict[tuple[str, date], list[GoldRow]] = defaultdict(list)
+    for row in rows:
+        grouped[(row.company_number, row.award_date)].append(row)
+    return [
+        GoldCase(company_number=key[0], award_date=key[1], rows=tuple(members))
+        for key, members in grouped.items()
+    ]
+
+
 @dataclass
 class ManifestLoadResult:
     admissible: list[GoldRow] = field(default_factory=list)
     inadmissible: list[InadmissibleRow] = field(default_factory=list)
+    cases: list[GoldCase] = field(default_factory=list)
 
 
 def _parse_iso_date(value: str | None) -> date | None:
@@ -204,6 +265,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
             )
         )
 
+    result.cases = _group_into_cases(result.admissible)
     return result
 
 
@@ -216,16 +278,32 @@ def main() -> None:
     args = parser.parse_args()
 
     result = load_gold_manifest(args.manifest)
+    concentrated = [c for c in result.cases if c.is_concentrated]
 
     print(f"=== GOLD MANIFEST: {args.manifest} ===")
-    print(f"admissible  : {len(result.admissible)}")
-    print(f"inadmissible: {len(result.inadmissible)}")
+    print(f"admissible rows : {len(result.admissible)}")
+    print(f"distinct cases  : {len(result.cases)}  (unit of analysis -- spec A2.1.1)")
+    print(f"inadmissible    : {len(result.inadmissible)}")
     for row in result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
+    if concentrated:
+        print("\nconcentrated cases (>1 row, spec A2.1.1 requires these listed explicitly):")
+        for case in concentrated:
+            print(f"  {case.case_key}: {case.row_count} rows -- {[r.case_id for r in case.rows]}")
 
     if args.out:
         payload = {
-            "admissible": [r.case_id for r in result.admissible],
+            "admissible_rows": [r.case_id for r in result.admissible],
+            "cases": [
+                {
+                    "case_key": c.case_key,
+                    "company_number": c.company_number,
+                    "award_date": c.award_date.isoformat(),
+                    "row_count": c.row_count,
+                    "row_case_ids": [r.case_id for r in c.rows],
+                }
+                for c in result.cases
+            ],
             "inadmissible": [
                 {"case_id": r.case_id, "reasons": list(r.reasons)} for r in result.inadmissible
             ],

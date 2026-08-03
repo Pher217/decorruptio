@@ -1,0 +1,5 @@
+case_id,person_name,person_registry_id,company_name,company_number,relationship_type,established_by,label_source_url,award_date,relationship_start,excluded_from_retrieval
+SYNTH-001,Jane Testperson,,Example Holdings Ltd,1234567,directorship,journalism,https://example.invalid/synthetic-source-1,2021-06-01,2018-01-15,Example Gazette investigation
+SYNTH-004,Sam Otherperson,,Example Holdings Ltd,1234567,shareholding,inquiry,https://example.invalid/synthetic-source-4,2021-06-01,2019-02-20,
+SYNTH-002,John Placeholder,,Sample Supplies PLC,SC000999,shareholding,judgment,https://example.invalid/synthetic-source-2,2020-03-01,unknown,
+SYNTH-003,Ann Fixture,,Demo Traders Ltd,7654321,employment,inquiry,https://example.invalid/synthetic-source-3,2019-01-01,2020-05-01,

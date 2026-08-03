@@ -15,17 +15,23 @@ placeholder names) -- never a real person, company, or case.
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
 import pytest
-from scripts.load_gold_manifest import GoldRow, load_gold_manifest
+from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest
 from scripts.phase_c_paths import build_adjacency, surname
 from scripts.run_gold_benchmark import (
+    TemporalGate,
     check_source_separation,
     classify_outcome,
     compute_precision,
+    country_switch_triggered,
+    evaluate_case,
     evaluate_row,
+    load_temporal_gate,
+    wilson_upper_bound,
 )
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
@@ -166,62 +172,201 @@ class TestLoadGoldManifest:
         assert len(result.admissible) == 1
         assert any("duplicate case_id" in r for r in result.inadmissible[0].reasons)
 
+    def test_rows_sharing_company_and_award_collapse_into_one_case(self, tmp_path):
+        """GIVEN two admissible rows naming different people but the same
+        company_number and award_date (e.g. Greensill: five people, one
+        company, one award)
+        WHEN the manifest is loaded
+        THEN they collapse into exactly ONE case, not two -- spec A2.1.1's
+        unit of analysis is (company_number, award_date), not the row."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-010,Person One,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,",
+                "SYNTH-011,Person Two,,Example Holdings Ltd,1234567,shareholding,"
+                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,",
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 2
+        assert len(result.cases) == 1
+        assert result.cases[0].row_count == 2
+        assert result.cases[0].is_concentrated is True
+
+    def test_distinct_company_or_award_date_are_separate_cases(self, tmp_path):
+        """GIVEN two admissible rows with different company numbers
+        WHEN the manifest is loaded
+        THEN they form two distinct, non-concentrated cases."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-012,Person One,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,",
+                "SYNTH-013,Person Two,,Other Traders Ltd,7654321,directorship,"
+                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,",
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.cases) == 2
+        assert all(not c.is_concentrated for c in result.cases)
+
 
 class TestClassifyOutcome:
-    """Spec SS6 LOCKED acceptance thresholds."""
+    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, case-level."""
 
-    def test_invalid_fires_below_nine_of_ten_controls(self):
-        """GIVEN controls recovered only 8 out of 10
+    PASSING_GATE = TemporalGate(passed=True, overall_recovered=28, overall_total=30)
+    FAILING_GATE = TemporalGate(passed=False, overall_recovered=13, overall_total=30)
+
+    def test_invalid_fires_below_nine_of_ten_retrieval_controls(self):
+        """GIVEN retrieval controls recovered only 8 out of 10
         WHEN the outcome is classified
-        THEN it is INVALID regardless of how many positives were recovered --
-        spec SS6: the positives result 'must not be reported'."""
+        THEN it is INVALID regardless of cases recovered or the temporal
+        gate -- spec: the positives result 'must not be reported'."""
         outcome = classify_outcome(
-            positives_recovered=20, precision=1.0, controls_recovered=8, controls_total=10
+            cases_recovered=20,
+            precision=1.0,
+            retrieval_controls_recovered=8,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
         )
         assert outcome == "INVALID"
 
-    def test_confirmed_fires_at_locked_thresholds(self):
-        """GIVEN >=4/20 positives recovered, >=80% precision, and controls passing
+    def test_instrument_limited_fires_when_temporal_gate_fails(self):
+        """GIVEN retrieval controls pass but the temporal control gate fails
+        WHEN the outcome is classified
+        THEN it is INSTRUMENT-LIMITED, never REFUTED (spec A2.3)."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            precision=0.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.FAILING_GATE,
+        )
+        assert outcome == "INSTRUMENT-LIMITED"
+
+    def test_instrument_limited_fires_when_temporal_gate_not_measured(self):
+        """GIVEN no temporal control gate has been measured yet (None)
+        WHEN the outcome is classified
+        THEN it is INSTRUMENT-LIMITED -- an unmeasured gate is never an
+        implicit pass, so REFUTED can never be emitted without one."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            precision=0.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=None,
+        )
+        assert outcome == "INSTRUMENT-LIMITED"
+
+    def test_confirmed_fires_at_locked_thresholds_with_temporal_gate_passing(self):
+        """GIVEN >=4/20 cases recovered, >=80% precision, retrieval controls
+        passing, AND the temporal gate passing
         WHEN the outcome is classified
         THEN it is CONFIRMED."""
         outcome = classify_outcome(
-            positives_recovered=4, precision=0.80, controls_recovered=9, controls_total=10
+            cases_recovered=4,
+            precision=0.80,
+            retrieval_controls_recovered=9,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
         )
         assert outcome == "CONFIRMED"
 
-    def test_refuted_fires_at_zero_recovered_with_controls_passing(self):
-        """GIVEN 0/20 positives recovered while controls pass
+    def test_confirmed_is_blocked_by_a_failing_temporal_gate_even_at_full_thresholds(self):
+        """GIVEN cases recovered and precision both clear the CONFIRMED bar
+        but the temporal gate fails
+        WHEN the outcome is classified
+        THEN it is INSTRUMENT-LIMITED, not CONFIRMED -- the temporal gate is
+        a hard requirement, not merely advisory."""
+        outcome = classify_outcome(
+            cases_recovered=10,
+            precision=1.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.FAILING_GATE,
+        )
+        assert outcome == "INSTRUMENT-LIMITED"
+
+    def test_refuted_fires_at_zero_cases_with_both_gates_passing(self):
+        """GIVEN 0/20 cases recovered while retrieval controls AND the
+        temporal gate both pass
         WHEN the outcome is classified
         THEN it is REFUTED."""
         outcome = classify_outcome(
-            positives_recovered=0, precision=0.0, controls_recovered=10, controls_total=10
+            cases_recovered=0,
+            precision=0.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
         )
         assert outcome == "REFUTED"
 
-    def test_country_switch_fires_for_a_short_but_nonzero_recovery(self):
-        """GIVEN controls pass but positives recovered is short of the
+    def test_partial_fires_for_one_to_three_cases_with_both_gates_passing(self):
+        """GIVEN both gates pass but cases recovered is short of the
         CONFIRMED threshold without being exactly zero
         WHEN the outcome is classified
-        THEN it is COUNTRY_SWITCH -- REFUTED is reserved for the stronger
-        0/20 statistical bound."""
+        THEN it is PARTIAL -- real traces below the pre-registered
+        confirmation bar, never rendered as a confirmation."""
         outcome = classify_outcome(
-            positives_recovered=2, precision=1.0, controls_recovered=10, controls_total=10
+            cases_recovered=2,
+            precision=1.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
         )
-        assert outcome == "COUNTRY_SWITCH"
+        assert outcome == "PARTIAL"
+
+
+class TestCountrySwitchTriggered:
+    """Spec A2.1.2: COUNTRY_SWITCH is an action, not a verdict."""
+
+    @pytest.mark.parametrize("outcome", ["PARTIAL", "REFUTED", "INSTRUMENT-LIMITED"])
+    def test_action_triggered_by_non_confirming_verdicts(self, outcome):
+        """GIVEN a verdict of PARTIAL, REFUTED, or INSTRUMENT-LIMITED
+        WHEN checking whether the country-switch action fires
+        THEN it is triggered."""
+        assert country_switch_triggered(outcome) is True
+
+    @pytest.mark.parametrize("outcome", ["CONFIRMED", "INVALID"])
+    def test_action_not_triggered_by_confirmed_or_invalid(self, outcome):
+        """GIVEN a verdict of CONFIRMED or INVALID
+        WHEN checking whether the country-switch action fires
+        THEN it is not triggered."""
+        assert country_switch_triggered(outcome) is False
 
 
 class TestComputePrecision:
     def test_precision_is_zero_over_zero_when_nothing_recovered(self):
-        """GIVEN zero positives and zero negatives recovered
+        """GIVEN zero cases and zero negatives recovered
         WHEN precision is computed
         THEN it is 0.0, not a division error."""
         assert compute_precision(0, 0) == 0.0
 
     def test_precision_penalised_by_spurious_negative_hits(self):
-        """GIVEN 4 true positives recovered and 1 spurious negative hit
+        """GIVEN 4 true cases recovered and 1 spurious negative hit
         WHEN precision is computed
         THEN it is 4/5."""
         assert compute_precision(4, 1) == pytest.approx(0.8)
+
+
+class TestWilsonUpperBound:
+    """Spec A2.5: '0/200 is not a zero false-positive rate' -- must always
+    carry an upper bound, never a bare zero."""
+
+    def test_zero_successes_has_a_small_positive_upper_bound(self):
+        """GIVEN zero spurious hits out of 200 trials
+        WHEN the Wilson upper bound is computed
+        THEN it is a small positive number, not zero -- spec A2.5's whole
+        point is that 0/200 does not mean a 0% rate."""
+        bound = wilson_upper_bound(0, 200)
+        assert 0.0 < bound < 0.05
+
+    def test_zero_trials_returns_zero(self):
+        """GIVEN zero trials
+        WHEN the Wilson upper bound is computed
+        THEN it is 0.0, not a division error."""
+        assert wilson_upper_bound(0, 0) == 0.0
 
 
 def _gold_row(**overrides) -> GoldRow:
@@ -319,6 +464,131 @@ class TestEvaluateRow:
         result = evaluate_row(_gold_row(), adj, people_by_surname, {}, max_hops=2)
 
         assert result.status == "not_recovered"
+
+
+@pytest.mark.django_db
+class TestEvaluateCase:
+    """Spec A2.1.1: a case rolls up ALL its rows into ONE status -- multiple
+    people on one company+award raise confidence within the case, they never
+    multiply the case count."""
+
+    def test_case_recovers_if_any_row_recovers_even_if_others_are_untestable(self):
+        """GIVEN a case with two rows -- one whose person/company resolve and
+        recover a pre-award path, one whose person never resolves
+        WHEN the case is evaluated
+        THEN the case status is recovered -- one working row is enough for
+        the whole case, exactly the Greensill-style scenario (five people,
+        one company, one award) spec A2.1.1 describes."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=person,
+            target_entity=company,
+            valid_from=date(2018, 1, 15),
+        )
+        adj = build_adjacency()
+        people_by_surname = {surname(person.name): [person]}
+
+        recovering_row = _gold_row(case_id="SYNTH-200")
+        unresolvable_row = _gold_row(
+            case_id="SYNTH-201", person_name="Nobody Resolvable", person_registry_id=None
+        )
+        case = GoldCase(
+            company_number="01234567",
+            award_date=date(2021, 6, 1),
+            rows=(recovering_row, unresolvable_row),
+        )
+
+        result = evaluate_case(case, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "recovered"
+
+    def test_case_status_is_the_strongest_among_its_rows(self):
+        """GIVEN a case with one row that is undated_only and one that is
+        not_recovered
+        WHEN the case is evaluated
+        THEN the case status is undated_only -- the stronger of the two,
+        never downgraded to the weaker row's result."""
+        person_a = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        person_b = Entity.objects.create(entity_type="person", name="Sam Otherperson")
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="declared_interest",
+            source_entity=person_a,
+            target_entity=company,
+            valid_from=None,
+        )
+        adj = build_adjacency()
+        people_by_surname = {
+            surname(person_a.name): [person_a],
+            surname(person_b.name): [person_b],
+        }
+
+        undated_row = _gold_row(case_id="SYNTH-202", person_name="Jane Testperson")
+        no_path_row = _gold_row(case_id="SYNTH-203", person_name="Sam Otherperson")
+        case = GoldCase(
+            company_number="01234567", award_date=date(2021, 6, 1), rows=(undated_row, no_path_row)
+        )
+
+        result = evaluate_case(case, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "undated_only"
+
+    def test_case_is_untestable_only_if_every_row_is_untestable(self):
+        """GIVEN a case whose only row's person and company never resolve
+        WHEN the case is evaluated
+        THEN the case status is untestable."""
+        adj = build_adjacency()
+        case = GoldCase(company_number="01234567", award_date=date(2021, 6, 1), rows=(_gold_row(),))
+
+        result = evaluate_case(case, adj, {}, {}, max_hops=2)
+
+        assert result.status == "untestable"
+
+
+class TestLoadTemporalGate:
+    """Spec A2.3: the temporal control gate is measured by a separate
+    classifier; this loader only consumes its result."""
+
+    def test_missing_report_returns_none(self, tmp_path):
+        """GIVEN no temporal gate report file exists at the given path
+        WHEN it is loaded
+        THEN None is returned -- treated by classify_outcome as a failing
+        gate, never an implicit pass."""
+        assert load_temporal_gate(tmp_path / "does_not_exist.json") is None
+
+    def test_present_report_is_parsed(self, tmp_path):
+        """GIVEN a temporal gate report file written by the (separate)
+        temporal-lift classifier
+        WHEN it is loaded
+        THEN its passed/recovered/total/failing_strata fields are parsed
+        into a TemporalGate."""
+        path = tmp_path / "temporal_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "passed": False,
+                    "overall_recovered": 13,
+                    "overall_total": 30,
+                    "failing_strata": ["declared_interest/Lords"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        gate = load_temporal_gate(path)
+
+        assert gate == TemporalGate(
+            passed=False,
+            overall_recovered=13,
+            overall_total=30,
+            failing_strata=("declared_interest/Lords",),
+        )
 
 
 @pytest.mark.django_db

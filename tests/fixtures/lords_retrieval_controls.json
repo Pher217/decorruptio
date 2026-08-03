@@ -1,0 +1,175 @@
+{
+  "control_set": "UK House of Lords Register of Interests — retrieval controls",
+  "purpose": "Register-visible ground truth for testing whether the pipeline recovers a known Lords-registered relationship from a frozen source snapshot. NOT a temporal (pre-award) control set — see scope_limits.",
+  "source": {
+    "name": "UK House of Lords Register of Interests",
+    "source_url": "https://members.parliament.uk/members/lords/interests/register-of-lords-interests",
+    "capture_dir": "lords-snapshot-full/ (page_01.html .. page_40.html + provenance.json)",
+    "retrieval_method": "Playwright real-browser navigation (Chromium), document.documentElement.outerHTML captured post-render, one page per ?page=N query param, paced several seconds apart",
+    "retrieved_at": "2026-08-03T21:51:30+00:00",
+    "combined_content_hash_sha256": "034f802ba7f75604e93db5f11524980cecb95038f95259e41232a9de41196dff",
+    "page_count": 40,
+    "total_register_entries": 789,
+    "parser_used": "src/uncorrupt/graph/lords_interests.py (_parse_lords_page, _extract_counterparty) — unmodified"
+  },
+  "controls": [
+    {
+      "id": 1,
+      "page": 1,
+      "member_id": "3453",
+      "peer_name": "Lord Addington",
+      "party": "Liberal Democrat",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Chairman, Microlink PC (UK) Ltd (computing and software)",
+      "declared_company": "Microlink PC (UK) Ltd",
+      "ceased_date": null
+    },
+    {
+      "id": 2,
+      "page": 1,
+      "member_id": "4304",
+      "peer_name": "Lord Allen of Kensington",
+      "party": "Labour",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Chair, British Horseracing Authority (interest ceased 3 March 2026)",
+      "declared_company": "British Horseracing Authority",
+      "ceased_date": "2026-03-03",
+      "note": "Ceased-interest wording control — verifies _CEASED_RE / Edge.valid_to parsing. Independently reproduced verbatim by a separate Playwright capture 22 minutes earlier (page_01 in lords-controls/controls.md), corroborating source stability."
+    },
+    {
+      "id": 3,
+      "page": 4,
+      "member_id": "3809",
+      "peer_name": "Lord Bilimoria",
+      "party": null,
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Bilimoria & Bilimoria LLP (consultancy services to beverages sector; and advice and talks on entrepreneurship)",
+      "declared_company": "Bilimoria & Bilimoria LLP",
+      "ceased_date": null
+    },
+    {
+      "id": 4,
+      "page": 8,
+      "member_id": "4330",
+      "peer_name": "Baroness Chisholm of Owlpen",
+      "party": "Non-affiliated",
+      "category": "Category 2: Shareholdings etc. (b)",
+      "register_wording": "Jupiter Fund Management plc (fund manager)",
+      "declared_company": "Jupiter Fund Management plc",
+      "ceased_date": null
+    },
+    {
+      "id": 5,
+      "page": 11,
+      "member_id": "5421",
+      "peer_name": "Lord Duvall",
+      "party": "Labour",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Adviser, The Terrapin Group (advice on how clients in the development industry can communicate with local authorities and communities)",
+      "declared_company": "The Terrapin Group",
+      "ceased_date": null
+    },
+    {
+      "id": 6,
+      "page": 14,
+      "member_id": "4240",
+      "peer_name": "Lord Glasman",
+      "party": "Labour",
+      "category": "Category 2: Shareholdings etc. (a)",
+      "register_wording": "Kronstadt Films Limited",
+      "declared_company": "Kronstadt Films Limited",
+      "ceased_date": null
+    },
+    {
+      "id": 7,
+      "page": 18,
+      "member_id": "4693",
+      "peer_name": "Lord Hogan-Howe",
+      "party": "Crossbench",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Director, BDMN Ltd (provides advice, consultancy, investigation and speeches)",
+      "declared_company": "BDMN Ltd",
+      "ceased_date": null
+    },
+    {
+      "id": 8,
+      "page": 21,
+      "member_id": "2495",
+      "peer_name": "Lord Kirkham",
+      "party": "Conservative",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Director, Bilder and Lord Enterprises Limited (restaurants)",
+      "declared_company": "Bilder and Lord Enterprises Limited",
+      "ceased_date": null
+    },
+    {
+      "id": 9,
+      "page": 24,
+      "member_id": "4948",
+      "peer_name": "Lord Markham",
+      "party": "Conservative",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Director, R2B H Ltd (management consultancy services)",
+      "declared_company": "R2B H Ltd",
+      "ceased_date": null
+    },
+    {
+      "id": 10,
+      "page": 28,
+      "member_id": "4545",
+      "peer_name": "Lord O'Shaughnessy",
+      "party": "Conservative",
+      "category": "Category 1: Remunerated employment etc.",
+      "register_wording": "Director, Oracle Topco Limited (holding company for Newmarket Strategy)",
+      "declared_company": "Oracle Topco Limited",
+      "ceased_date": null
+    },
+    {
+      "id": 11,
+      "page": 31,
+      "member_id": "3751",
+      "peer_name": "Lord Rees of Ludlow",
+      "party": "Crossbench",
+      "category": "Category 2: Shareholdings etc. (b)",
+      "register_wording": "Royal Dutch Shell plc (oil and gas)",
+      "declared_company": "Royal Dutch Shell plc",
+      "ceased_date": null
+    },
+    {
+      "id": 12,
+      "page": 35,
+      "member_id": "5413",
+      "peer_name": "Lord Stockwood",
+      "party": "Labour",
+      "category": "Category 2: Shareholdings etc. (a)",
+      "register_wording": "The Grimsby Town Football Club Limited",
+      "declared_company": "The Grimsby Town Football Club Limited",
+      "ceased_date": null
+    }
+  ],
+  "parse_verification_summary": {
+    "pages_parsed": 40,
+    "total_members_parsed": 789,
+    "total_interests_parsed": 5174,
+    "nil_returns": 97,
+    "parse_failures": 0,
+    "ingest_matched": 2545,
+    "ingest_unmatched_counterparty": 0,
+    "ingest_skipped_private_individual": 3,
+    "ingest_skipped_no_counterparty": 2559,
+    "ingest_skipped_implausible_name": 67,
+    "ingest_ambiguous_company_number": 0,
+    "entities_created_uk_parliament_member": 789
+  },
+  "parser_finding": {
+    "severity": "non-blocking, silent field loss (not a crash)",
+    "description": "The live page's DOM has drifted from the assumption baked into _parse_member_info (and the SAMPLE_HTML test fixture): peer_type ('Life peer' / 'Excepted Hereditary' / etc.) is no longer a second 'secondary-info' div next to party. It is now rendered as '.indicator.indicator-label' inside '.info .info-inner .indicators-left', a sibling block outside 'content'. _parse_member_info only reads card.find_all(class_='secondary-info')[1], which no longer exists, so peer_type resolves to '' for all 789/789 captured members. Confirmed by direct count: 0 of 789 cards have a second secondary-info div; all 789 have an indicator-label element carrying the real peer type. member_id, name, party, category, interest description text, ceased-date parsing, and counterparty extraction are all unaffected and verified correct against this capture.",
+    "impact": "Entity.properties['peer_type'] is stored as an empty string instead of the real value for every Lords Entity created from a live (non-archival) capture. Does not affect edge/attestation creation, company matching, or the retrieval controls above (none of which depend on peer_type).",
+    "recommendation": "Not fixed here per task scope (capture + control set only, no parser edits). If peer_type is needed downstream, _parse_member_info needs an additional selector for '.indicator-label' as a fallback/replacement for the second secondary-info div."
+  },
+  "scope_limits": {
+    "closes": "The Lords-stratum RETRIEVAL control gap: the pipeline can now be tested against a frozen, hashed, byte-verified snapshot of the live Lords register — 789/789 members and 5174/5174 interest entries parse without failure, and the 12 controls above are independently checkable register-visible ground truth (peer, member ID, declared company, exact wording, page).",
+    "does_not_close": "The Lords-stratum TEMPORAL gap. The Lords register publishes NO per-entry registration/start dates (Edge.valid_from is always null by design — see lords_interests.py module docstring). The earliest Wayback Machine capture of this page is 2020-06-17, which postdates most of the 24 award cases in scope, so level-2 'pre-award observed' evidence remains unavailable for 20 of 24 cases.",
+    "conclusion": "Lords supports the ATEMPORAL secondary endpoint with validated retrieval (this control set). The strict temporal endpoint stays instrument-limited for the Lords stratum — this capture does not change that."
+  }
+}

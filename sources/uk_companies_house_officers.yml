@@ -1,0 +1,36 @@
+source_id: uk_companies_house_officers
+name: UK Companies House — company officers and officer appointments
+jurisdictions: [GB]
+data_class: A2   # names company directors/officers — natural persons — even though
+                  # the register's whole purpose is public disclosure of who controls a company
+tier: a
+license: "Crown copyright — Companies Act 2006 public register (no reuse restriction stated for officer/appointment data beyond the standard accurate, non-misleading-reproduction condition)"
+redistribution: open
+legal_basis: >-
+  Companies Act 2006 s.1087+ — statutory public register of company officers;
+  Companies House states it imposes no rules on how public-register data is used,
+  beyond ordinary data-protection/copyright law applying to the reuser
+access_method: bulk-api
+robots_tos_reviewed: 2026-08-03
+freshness_sla_days: 7
+dpia_cleared: false   # A2, gated by the global DPIA — not yet formally cleared
+connector_kind: graph
+locale: gb
+registry_schemes: [GB-COH, GB-COH-OFFICER, GB-COH-OFFICER-UNRESOLVED]
+identifier_field: >-
+  company: company_number (joined against staging.Company); officer: CH officer ID
+  parsed from links.officer.appointments when present, else scoped to the company it
+  was found at (GB-COH-OFFICER-UNRESOLVED, never merged across companies by name alone)
+rate_limit: "600 requests / 5 minutes (Companies House-documented); self-throttled at ~0.55s/request"
+notes: >-
+  ONE register entry shared by two connector modules that hit the same Companies
+  House API under the same licence/rate-limit: src/uncorrupt/graph/ch_officers.py
+  (`/company/{company_number}/officers`) and src/uncorrupt/graph/ch_appointments.py
+  (`/officers/{officer_id}/appointments`, the second directorship hop). Both are
+  scoped to the officer field allowlist documented in ch_officers.py (name,
+  officer_role, appointed_on, resigned_on, links — no date of birth, address,
+  nationality, occupation). NOT YET WIRED to this entry — out of scope for the
+  connector-contract pass that added this file (both modules were being edited
+  live by other sessions at the time). Wiring is a load_source(SOURCE_ID) call at
+  the top of each public entry point, exactly as done for gleif.py, ec_donations.py
+  and lords_interests.py — see sources/README.md.

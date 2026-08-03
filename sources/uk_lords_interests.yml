@@ -1,0 +1,37 @@
+source_id: uk_lords_interests
+name: UK House of Lords Register of Interests
+jurisdictions: [GB]
+data_class: A2   # names members of the House of Lords — natural persons — even
+                  # though they are recorded in their public-function capacity
+tier: a
+license: "Open Parliament Licence v3.0 (inferred — see notes)"
+redistribution: open
+legal_basis: >-
+  House of Lords Code of Conduct — statutory-adjacent public register of members'
+  interests, published for parliamentary accountability
+access_method: scrape
+robots_tos_reviewed: 2026-08-03
+freshness_sla_days: 7
+dpia_cleared: false   # A2, gated by the global DPIA — not yet formally cleared
+connector_kind: graph
+locale: gb
+registry_schemes: [UK-PARLIAMENT-MEMBER, GB-COH, UK-LORDS-UNRESOLVED]
+identifier_field: >-
+  member: Parliament member ID (from the card href); counterparty: company_number
+  when present (rare in Lords entries), else a unique exact normalised-name match to
+  staging.Company, else scoped to the interest (UK-LORDS-UNRESOLVED, never a shared
+  bare-name node)
+rate_limit: >-
+  No published rate limit or API (HTML page, no api.parliament.uk endpoint covers the
+  Lords register — see the module docstring's Coverage note). Self-throttled at 2s
+  between page fetches; a 404 past page 1 (live or Wayback) is treated as end-of-register.
+notes: >-
+  Graph connector: src/uncorrupt/graph/lords_interests.py (fetch_lords_register +
+  ingest_lords_register), wired to this entry via load_source (refuses to run
+  without it). Licence inferred from Parliament's general Open Parliament Licence
+  (used by the Interests API — see sources/uk_parliament_interests.yml) rather than
+  a licence statement on the register page itself, which we did not find explicitly —
+  verify before treating this as authoritative. freshness_sla_days is an engineering
+  estimate; the register is a current-state document with no publish-cadence SLA
+  (see the module docstring's Dates section — there is no per-entry registration date,
+  only the Wayback/live snapshot date).

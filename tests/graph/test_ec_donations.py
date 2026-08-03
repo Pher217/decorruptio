@@ -6,14 +6,20 @@ Verifies the core invariants:
 - amount_cents is parsed as an integer, never a float
 - Donation date (ReceivedDate) maps to Edge.valid_from
 - Individual donors are never turned into Entities (ADR-004 D1)
+- fetch_ec_donations_csv/ingest_ec_donations_csv refuse to run without a
+  sources/uk_ec_donations.yml register entry
 """
 
 import csv
+from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 
-from uncorrupt.graph.ec_donations import ingest_ec_donations_csv
+import uncorrupt.graph.ec_donations as ec_donations_module
+from uncorrupt.core.errors import RegisterError
+from uncorrupt.graph.ec_donations import fetch_ec_donations_csv, ingest_ec_donations_csv
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.models import Company
 
@@ -449,3 +455,29 @@ class TestEcDonationsIngest:
         assert summary["skipped_individual"] == 1
         assert Attestation.objects.filter(source_reference="C0501005").count() == 0
         assert not Entity.objects.filter(name="Anthony P Clarke").exists()
+
+
+class TestEcDonationsRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_ec_donations.yml cannot be resolved (its source_id is absent
+        from the register) WHEN ingest_ec_donations_csv is called THEN it raises
+        RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(ec_donations_module, "SOURCE_ID", "does_not_exist_xyz")
+        csv_path = _write_csv(tmp_path, [])
+
+        with pytest.raises(RegisterError):
+            ingest_ec_donations_csv(csv_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_ec_donations.yml cannot be resolved WHEN
+        fetch_ec_donations_csv is called THEN it raises RegisterError before making
+        any HTTP request."""
+        monkeypatch.setattr(ec_donations_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_ec_donations_csv must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(RegisterError):
+            fetch_ec_donations_csv(date(2020, 1, 1), date(2020, 12, 31), tmp_path, client=client)

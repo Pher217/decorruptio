@@ -44,8 +44,14 @@ MANIFEST_HEADER = (
     "case_id,person_name,person_registry_id,company_name,company_number,"
     "relationship_type,established_by,label_source_url,award_date,"
     "relationship_start,excluded_from_retrieval,intermediary_company_number,"
-    "awardee_confirmed\n"
+    "awardee_confirmed,held_office_at_award,office_holding_start_date\n"
 )
+
+# Appended to every existing test row that doesn't specifically exercise the
+# office-holding criterion (spec SS2.5/A2.2.2): office held well before any
+# award_date used elsewhere in this file, so it never trips an unrelated
+# test's admissibility.
+_OFFICE_OK_SUFFIX = ",yes,2010-01-01"
 
 
 def _write_manifest(tmp_path: Path, rows: list[str]) -> Path:
@@ -66,7 +72,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-001,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -81,7 +87,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-002,Jane Testperson,,Example Holdings Ltd,,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -96,7 +102,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-003,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,,2018-01-15,,,yes"
+                "journalism,https://example.invalid/a,,2018-01-15,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -111,7 +117,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-004,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2019-01-01,2020-05-01,,,yes"
+                "journalism,https://example.invalid/a,2019-01-01,2020-05-01,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -126,7 +132,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-005,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,unknown,,,yes"
+                "journalism,https://example.invalid/a,2021-06-01,unknown,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -141,7 +147,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-006,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,,2021-06-01,2018-01-15,,,yes"
+                "journalism,,2021-06-01,2018-01-15,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -168,9 +174,9 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-007,A,,Example Ltd,1234567,directorship,journalism,"
-                "https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
+                "https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,2010-01-01",
                 "SYNTH-007,B,,Other Ltd,7654321,directorship,journalism,"
-                "https://example.invalid/b,2021-06-01,2018-01-15,,,yes",
+                "https://example.invalid/b,2021-06-01,2018-01-15,,,yes,yes,2010-01-01",
             ],
         )
         result = load_gold_manifest(path)
@@ -187,7 +193,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-008,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,no"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,no,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -203,7 +209,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-009,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -221,7 +227,8 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-014,Robin Donorlinked,,Confirmed Awardee Ltd,4445556,donation,"
-                "journalism,https://example.invalid/a,2021-09-01,2019-11-01,,999888,yes"
+                "journalism,https://example.invalid/a,2021-09-01,2019-11-01,,999888,yes,"
+                "yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -239,7 +246,7 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-015,Kim Sample,,Placeholder Services Ltd,9999999,shareholding,"
-                "PSC,https://example.invalid/a,2021-01-10,2019-03-01,,,yes"
+                "PSC,https://example.invalid/a,2021-01-10,2019-03-01,,,yes,yes,2010-01-01"
             ],
         )
         result = load_gold_manifest(path)
@@ -258,9 +265,11 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-010,Person One,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,"
+                "yes,2010-01-01",
                 "SYNTH-011,Person Two,,Example Holdings Ltd,1234567,shareholding,"
-                "inquiry,https://example.invalid/b,2021-08-15,2019-02-20,,,yes",
+                "inquiry,https://example.invalid/b,2021-08-15,2019-02-20,,,yes,"
+                "yes,2010-01-01",
             ],
         )
         result = load_gold_manifest(path)
@@ -278,14 +287,115 @@ class TestLoadGoldManifest:
             tmp_path,
             [
                 "SYNTH-012,Person One,,Example Holdings Ltd,1234567,directorship,"
-                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes",
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,"
+                "yes,2010-01-01",
                 "SYNTH-013,Person Two,,Other Traders Ltd,7654321,directorship,"
-                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,,,yes",
+                "inquiry,https://example.invalid/b,2021-06-01,2019-02-20,,,yes,"
+                "yes,2010-01-01",
             ],
         )
         result = load_gold_manifest(path)
         assert len(result.cases) == 2
         assert all(not c.is_concentrated for c in result.cases)
+
+    def test_held_office_at_award_no_is_out_of_scope_not_inadmissible(self, tmp_path):
+        """GIVEN a row where held_office_at_award is explicitly 'no' (the
+        motivating example: a 1997 directorship, a 2000 grant, election not
+        until 2016)
+        WHEN the manifest is loaded
+        THEN the row is neither admissible nor inadmissible -- it is
+        OUT OF SCOPE (spec A2.2.2): there was no public function to
+        influence at the time of the award."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-016,Sam Notyetelected,,Grant Recipient Ltd,5556667,directorship,"
+                "inquiry,https://example.invalid/a,2000-01-01,1997-01-01,,,yes,no,2016-05-01"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert len(result.inadmissible) == 0
+        assert len(result.out_of_scope) == 1
+        assert result.out_of_scope[0].case_id == "SYNTH-016"
+
+    def test_office_holding_start_date_after_award_is_out_of_scope_even_if_held_office_says_yes(
+        self, tmp_path
+    ):
+        """GIVEN held_office_at_award is 'yes' but office_holding_start_date
+        itself is strictly AFTER award_date (a curation inconsistency)
+        WHEN the manifest is loaded
+        THEN the row is OUT OF SCOPE, not admissible -- the date is not
+        overridden by an inconsistent 'yes' claim, and this is still not a
+        data defect worth rejecting outright: the underlying fact (no
+        office at the time) is what governs."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-017,Sam Notyetelected,,Grant Recipient Ltd,5556667,directorship,"
+                "inquiry,https://example.invalid/a,2000-01-01,1997-01-01,,,yes,yes,2016-05-01"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert len(result.out_of_scope) == 1
+        assert "post-dates" in result.out_of_scope[0].reason
+
+    def test_office_held_before_award_is_admissible(self, tmp_path):
+        """GIVEN held_office_at_award is 'yes' and office_holding_start_date
+        is before the award_date
+        WHEN the manifest is loaded
+        THEN the row is admissible -- spec SS2.5 is satisfied, not merely
+        SS2.1-SS2.4."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-018,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,"
+                "yes,2010-01-01"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].office_holding_start_date == date(2010, 1, 1)
+
+    def test_blank_held_office_at_award_is_inadmissible(self, tmp_path):
+        """GIVEN held_office_at_award is left blank
+        WHEN the manifest is loaded
+        THEN the row is INADMISSIBLE (a data defect -- we don't know either
+        way), never treated as an implicit 'no' routed to out-of-scope."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-019,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,"
+                ",2010-01-01"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert len(result.out_of_scope) == 0
+        assert any(
+            "held_office_at_award must be explicitly" in r for r in result.inadmissible[0].reasons
+        )
+
+    def test_missing_office_holding_start_date_is_inadmissible(self, tmp_path):
+        """GIVEN office_holding_start_date is left blank
+        WHEN the manifest is loaded
+        THEN the row is INADMISSIBLE with a reason citing the missing date."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-020,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any(
+            "missing or unparseable office_holding_start_date" in r
+            for r in result.inadmissible[0].reasons
+        )
 
 
 def _gold_row(**overrides) -> GoldRow:
@@ -302,6 +412,7 @@ def _gold_row(**overrides) -> GoldRow:
         relationship_start=date(2018, 1, 15),
         excluded_from_retrieval=(),
         intermediary_company_number=None,
+        office_holding_start_date=date(2015, 1, 1),
     )
     defaults.update(overrides)
     return GoldRow(**defaults)

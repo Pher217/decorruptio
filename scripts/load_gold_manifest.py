@@ -2,8 +2,9 @@
 
 Spec (LOCKED, do not deviate): vault
 `02 Projects/Ideas/Decorruptio/05 Specs/phase-c-gold-manifest-preregistration.md`,
-including amendments v2.1 (unit of analysis) and v2.3 (manifest schema
-semantics + the case key). Sections 2 and 4, and both amendments, are binding.
+including amendments v2.1 (unit of analysis), v2.2 (office-holding criterion)
+and v2.3 (manifest schema semantics + the case key). Sections 2 and 4, and
+all three amendments, are binding.
 
 A manifest row is admissible only if it satisfies every spec SS2 criterion this
 loader can decide mechanically from the manifest's own columns:
@@ -32,6 +33,21 @@ reason(s) -- never silently dropped, never coerced to a best guess.
 Company numbers are normalised with the project's canonical Companies House
 normaliser (`uncorrupt.staging.companies_house.normalise_company_number`)
 rather than re-implementing the zero-padding rule a second time.
+
+OFFICE-HOLDING CRITERION (spec amendment v2.2, SS2.5/A2.2.2): every row must
+carry an explicit `held_office_at_award` ('yes'/'no' -- a curator assertion,
+never blank) AND a parseable `office_holding_start_date`. Missing/unparseable
+values on either are INADMISSIBLE, same treatment as any other missing
+field. But `held_office_at_award: no` (or a 'yes' the date itself
+contradicts -- `office_holding_start_date` STRICTLY AFTER `award_date`) is
+NOT a data defect -- it is OUT OF SCOPE (`ManifestLoadResult.out_of_scope`):
+the person held no public office to influence at the time of the award (the
+motivating example: a 1997 directorship, a 2000 grant, election not until
+2016), so the row cannot test H1 at all regardless of how solid its sourcing
+is. Out of scope is a THIRD bucket, distinct from admissible and
+inadmissible -- not a data defect, not a refutation, not untestable, simply
+never entering any denominator, retained only for transparency about what
+was considered and excluded.
 
 AWARDEE VS INTERMEDIARY (spec amendment v2.3, A2.3.1): parallel sourcing
 produced two incompatible readings of `company_number` -- most families
@@ -90,7 +106,8 @@ from uncorrupt.staging.companies_house import normalise_company_number  # noqa: 
 # wrong column names; failing loudly on a header mismatch is the "head -1"
 # check SS7.3 requires, done in code instead of by hand.
 # `intermediary_company_number` and `awardee_confirmed` added by spec
-# amendment v2.3 (A2.3.1).
+# amendment v2.3 (A2.3.1). `held_office_at_award` and
+# `office_holding_start_date` added by spec amendment v2.2 (A2.2.2).
 REQUIRED_COLUMNS = (
     "case_id",
     "person_name",
@@ -105,14 +122,28 @@ REQUIRED_COLUMNS = (
     "excluded_from_retrieval",
     "intermediary_company_number",
     "awardee_confirmed",
+    "held_office_at_award",
+    "office_holding_start_date",
 )
 
 # spec A2.3.3: the established_by value flagging a row whose relationship
 # rests only on Persons-with-Significant-Control data.
 PSC_LABEL_SOURCE = "PSC"
 
-_AWARDEE_CONFIRMED_TRUTHY = {"yes", "true", "y", "1"}
-_AWARDEE_CONFIRMED_FALSY = {"no", "false", "n", "0"}
+# Shared truthy/falsy vocabulary for the two explicit-assertion columns
+# (`awardee_confirmed`, `held_office_at_award`) -- both follow the same rule:
+# never inferred, must be an explicit 'yes'.
+_TRUTHY_VALUES = {"yes", "true", "y", "1"}
+_FALSY_VALUES = {"no", "false", "n", "0"}
+
+
+def _parse_tri_state_bool(value: str | None) -> bool | None:
+    v = (value or "").strip().lower()
+    if v in _TRUTHY_VALUES:
+        return True
+    if v in _FALSY_VALUES:
+        return False
+    return None
 
 
 @dataclass(frozen=True)
@@ -131,6 +162,7 @@ class GoldRow:
     relationship_start: date
     excluded_from_retrieval: tuple[str, ...]
     intermediary_company_number: str | None
+    office_holding_start_date: date
 
     @property
     def is_psc_sourced(self) -> bool:
@@ -149,6 +181,25 @@ class InadmissibleRow:
 
     case_id: str
     reasons: tuple[str, ...]
+    raw: dict[str, str]
+
+
+@dataclass(frozen=True)
+class OutOfScopeRow:
+    """A well-formed row excluded from H1 testing by spec A2.2.2, NOT because
+    anything about it is wrong.
+
+    The person's asserted office-holding start date post-dates the award, so
+    there was no public function to influence at the time -- the row cannot
+    test H1 regardless of how solid its sourcing is. This is deliberately a
+    THIRD bucket alongside admissible/inadmissible: not a data defect (so not
+    `InadmissibleRow`), not a refutation, not untestable (a benchmark-time
+    concept) -- simply out of scope, retained here only so what was
+    considered and excluded stays visible.
+    """
+
+    case_id: str
+    reason: str
     raw: dict[str, str]
 
 
@@ -228,6 +279,7 @@ def _group_into_cases(rows: list[GoldRow]) -> list[GoldCase]:
 class ManifestLoadResult:
     admissible: list[GoldRow] = field(default_factory=list)
     inadmissible: list[InadmissibleRow] = field(default_factory=list)
+    out_of_scope: list[OutOfScopeRow] = field(default_factory=list)
     cases: list[GoldCase] = field(default_factory=list)
 
 
@@ -246,7 +298,7 @@ def _split_sources(value: str | None) -> tuple[str, ...]:
 
 
 def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
-    """Validate every row of a manifest CSV against spec SS2 admissibility.
+    """Validate every row of a manifest CSV against spec SS2/SS2.5 admissibility.
 
     Raises ValueError before reading a single row if the header is missing a
     spec SS4 column, so a malformed manifest cannot silently produce zero
@@ -281,13 +333,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
         if not company_number:
             reasons.append("missing company_number (spec SS2.2)")
 
-        awardee_confirmed_raw = (raw.get("awardee_confirmed") or "").strip().lower()
-        if awardee_confirmed_raw in _AWARDEE_CONFIRMED_TRUTHY:
-            awardee_confirmed = True
-        elif awardee_confirmed_raw in _AWARDEE_CONFIRMED_FALSY:
-            awardee_confirmed = False
-        else:
-            awardee_confirmed = None
+        awardee_confirmed = _parse_tri_state_bool(raw.get("awardee_confirmed"))
         if awardee_confirmed is not True:
             reasons.append(
                 "company_number not confirmed as the awardee (spec A2.3.1) -- "
@@ -327,6 +373,26 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                     f"award_date {award_date} (spec SS2.4)"
                 )
 
+        # `held_office_at_award` is the curator's DIRECT assertion (spec
+        # SS2.5), not a re-derivable duplicate of `awardee_confirmed`'s
+        # pattern: an explicit 'no' means the sourcing agent has determined
+        # the office post-dates the award -- that is not a data defect, it
+        # is exactly the out-of-scope condition A2.2.2 describes. Only a
+        # missing/unparseable value (we don't know either way) is a data
+        # defect worth rejecting outright.
+        held_office_at_award = _parse_tri_state_bool(raw.get("held_office_at_award"))
+        if held_office_at_award is None:
+            reasons.append(
+                "held_office_at_award must be explicitly 'yes' or 'no', never blank "
+                "(spec SS2.5) -- whether the office was held at/before the award must "
+                "be an affirmative answer either way"
+            )
+
+        office_holding_start_date_raw = (raw.get("office_holding_start_date") or "").strip()
+        office_holding_start_date = _parse_iso_date(office_holding_start_date_raw)
+        if office_holding_start_date is None:
+            reasons.append("missing or unparseable office_holding_start_date (spec SS2.5/A2.2.2)")
+
         if reasons:
             result.inadmissible.append(
                 InadmissibleRow(case_id=case_id or "<blank>", reasons=tuple(reasons), raw=raw)
@@ -335,6 +401,34 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
 
         assert award_date is not None
         assert relationship_start is not None
+        assert office_holding_start_date is not None
+        assert held_office_at_award is not None
+
+        # Spec A2.2.2: office post-dates the award -- out of scope, NOT
+        # inadmissible (nothing about the row's own sourcing is wrong), NOT
+        # a refutation, NOT untestable. Never enters the denominator. This
+        # fires on EITHER signal: the curator's direct 'no', or (even if the
+        # curator said 'yes') the date itself proving otherwise -- an
+        # inconsistent 'yes' does not get to override the date.
+        if not held_office_at_award or office_holding_start_date > award_date:
+            reason = (
+                f"office_holding_start_date {office_holding_start_date} post-dates "
+                f"award_date {award_date}"
+                if held_office_at_award
+                else "held_office_at_award is 'no'"
+            )
+            result.out_of_scope.append(
+                OutOfScopeRow(
+                    case_id=case_id,
+                    reason=(
+                        f"{reason} -- no public function to influence at the time "
+                        f"(spec A2.2.2); out of scope, not a refutation"
+                    ),
+                    raw=raw,
+                )
+            )
+            continue
+
         result.admissible.append(
             GoldRow(
                 case_id=case_id,
@@ -349,6 +443,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
                 relationship_start=relationship_start,
                 excluded_from_retrieval=_split_sources(raw.get("excluded_from_retrieval")),
                 intermediary_company_number=intermediary_company_number,
+                office_holding_start_date=office_holding_start_date,
             )
         )
 
@@ -374,8 +469,11 @@ def main() -> None:
         f"distinct cases  : {len(result.cases)}  (unit of analysis -- awardee company, spec A2.3.2)"
     )
     print(f"inadmissible    : {len(result.inadmissible)}")
+    print(f"out of scope    : {len(result.out_of_scope)}  (office post-dates award, spec A2.2.2)")
     for row in result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
+    for row in result.out_of_scope:
+        print(f"  OUT OF SCOPE {row.case_id}: {row.reason}")
     if concentrated:
         print("\nconcentrated cases (>1 row, spec A2.1.1/A2.3.2 requires these listed explicitly):")
         for case in concentrated:
@@ -393,6 +491,9 @@ def main() -> None:
         payload = {
             "admissible_rows": [r.case_id for r in result.admissible],
             "psc_sourced_rows": [r.case_id for r in psc_rows],
+            "out_of_scope": [
+                {"case_id": r.case_id, "reason": r.reason} for r in result.out_of_scope
+            ],
             "cases": [
                 {
                     "case_key": c.case_key,

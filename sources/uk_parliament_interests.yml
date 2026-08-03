@@ -1,0 +1,33 @@
+source_id: uk_parliament_interests
+name: UK Parliament Register of Members' Financial Interests (House of Commons)
+jurisdictions: [GB]
+data_class: A2   # names sitting MPs — natural persons — in their public-function capacity
+tier: a
+license: "Open Parliament Licence v3.0"
+redistribution: open
+legal_basis: >-
+  House of Commons Code of Conduct — statutory-adjacent public register of members'
+  financial interests, published for parliamentary accountability
+access_method: bulk-api
+robots_tos_reviewed: 2026-08-03
+freshness_sla_days: 7
+dpia_cleared: false   # A2, gated by the global DPIA — not yet formally cleared
+connector_kind: graph
+locale: gb
+registry_schemes: [UK-PARLIAMENT-MEMBER, GB-COH, UK-PARLIAMENT-UNRESOLVED]
+identifier_field: >-
+  member: Parliament member ID; counterparty: company_number when present, else a
+  unique exact normalised-name match to staging.Company, else scoped to the interest
+  (UK-PARLIAMENT-UNRESOLVED, never a shared bare-name node)
+rate_limit: >-
+  No published rate limit on interests-api.parliament.uk. Self-throttled at 1s
+  between page requests, exponential backoff on failure (see
+  fetch_parliament_interests's polite_delay_seconds/max_retries).
+notes: >-
+  Graph connector: src/uncorrupt/graph/parliament_interests.py (Commons only — the
+  API covers no House=Lords data; see sources/uk_lords_interests.yml for that
+  register). NOT YET WIRED to this entry (out of scope for the connector-contract
+  pass that added this file — parliament_interests.py was being edited live by
+  another session at the time). Wiring it is a load_source(SOURCE_ID) call at the
+  top of fetch_parliament_interests/ingest_parliament_interests, exactly as done for
+  gleif.py, ec_donations.py and lords_interests.py — see sources/README.md.

@@ -10,6 +10,17 @@ access_method: open-data-dump
 robots_tos_reviewed: 2026-07-21
 freshness_sla_days: 7
 dpia_cleared: false
+connector_kind: graph
+# jurisdictions is [GLOBAL], so no single `locale` applies (LEI records span every
+# jurisdiction GLEIF's registration authorities cover) — see the model validator.
+registry_schemes: [GLEIF-LEI]
+identifier_field: lei
+rate_limit: >-
+  No published hard limit on api.gleif.org; page[size] capped at 200 (HTTP 400
+  above it). Self-throttled at 0.2s between pages with exponential backoff on
+  429/5xx (see fetch_gleif's polite_delay_seconds/max_retries).
 notes: >-
   Enrichment overlay only. ~2.5-3M LEIs, mostly financial entities; most SMEs
   have no LEI, so the primary company key is (jurisdiction, registry_number).
+  Graph connector: src/uncorrupt/graph/gleif.py (fetch_gleif + ingest_gleif),
+  wired to this entry via load_source (refuses to run without it).

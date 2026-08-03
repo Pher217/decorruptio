@@ -42,6 +42,7 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
@@ -49,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 EC_API_BASE = "https://search.electoralcommission.org.uk/api/csv/Donations"
 SOURCE_NAME = "Electoral Commission"
+# sources/uk_ec_donations.yml — connector refuses to run without it (ADR-001 D5)
+SOURCE_ID = "uk_ec_donations"
 
 # Donor statuses that identify an organisation we can resolve to a company.
 # "Individual" and similar person-level statuses are excluded by design
@@ -105,6 +108,7 @@ def fetch_ec_donations_csv(
     expected to point `output_dir` at a gitignored path (e.g. `experiments/`)
     — this function does not commit anything.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "ec_donations.csv"
@@ -258,6 +262,7 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
 
     Returns summary stats: {matched, unmatched_donor, skipped_individual, total}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     csv_path = Path(csv_path)
     matched = 0
     unmatched_donor = 0

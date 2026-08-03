@@ -8,16 +8,22 @@ Verifies the core invariants:
 - observed_at is set from the Wayback snapshot provenance
 - Attestation carries the source citation, not Edge
 - Nil returns (no registrable interests) are counted, not errored
+- fetch_lords_register/ingest_lords_register refuse to run without a
+  sources/uk_lords_interests.yml register entry
 """
 
 from pathlib import Path
 
+import httpx
 import pytest
 
+import uncorrupt.graph.lords_interests as lords_interests_module
+from uncorrupt.core.errors import RegisterError
 from uncorrupt.graph.lords_interests import (
     _extract_counterparty,
     _parse_ceased_date,
     _parse_lords_page,
+    fetch_lords_register,
     ingest_lords_register,
 )
 from uncorrupt.graph.models import Attestation, Edge, Entity
@@ -495,3 +501,29 @@ class TestLordsInterestsIngest:
         assert summary["ambiguous_company_number"] == 2
         assert summary["matched"] == 0
         assert summary["total_members"] == 2
+
+class TestLordsInterestsRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_lords_interests.yml cannot be resolved (its source_id is
+        absent from the register) WHEN ingest_lords_register is called THEN it raises
+        RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(lords_interests_module, "SOURCE_ID", "does_not_exist_xyz")
+        _write_page(tmp_path, 1, SAMPLE_HTML)
+        _write_provenance(tmp_path)
+
+        with pytest.raises(RegisterError):
+            ingest_lords_register(tmp_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_lords_interests.yml cannot be resolved WHEN
+        fetch_lords_register is called THEN it raises RegisterError before making any
+        HTTP request."""
+        monkeypatch.setattr(lords_interests_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_lords_register must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(RegisterError):
+            fetch_lords_register(tmp_path, client=client)

@@ -1,0 +1,33 @@
+source_id: uk_ec_donations
+name: UK Electoral Commission — donations to parties and regulated entities
+jurisdictions: [GB]
+data_class: A1   # only company/political-entity nodes are ever created; individual
+                  # donors are filtered out before they can become an Entity (ADR-004 D1)
+tier: a
+license: "Open Government Licence v3.0, with Electoral Commission amendments"
+redistribution: open
+legal_basis: >-
+  Political Parties, Elections and Referendums Act 2000 (PPERA) — statutory public
+  register of donations and loans; public-sector open data
+access_method: bulk-api
+robots_tos_reviewed: 2026-08-03
+freshness_sla_days: 7
+dpia_cleared: false   # not needed: A1 as ingested — see data_class note above
+connector_kind: graph
+locale: gb
+registry_schemes: [GB-COH, EC-REGULATED-ENTITY]
+identifier_field: >-
+  donor: CompanyRegistrationNumber (fallback: unique exact normalised-name match to
+  staging.Company); recipient: RegulatedEntityId (fallback: RegulatedEntityName, never
+  a bare unnamed node)
+rate_limit: >-
+  No published rate limit. The /api/csv/Donations export ignores `start` and returns
+  the full result set for the requested date range in one response (verified
+  2026-07-27 — see fetch_ec_donations_csv's module comment for the regression this
+  caused). Self-throttled at 1s between retries, exponential backoff on 429/5xx.
+notes: >-
+  Graph connector: src/uncorrupt/graph/ec_donations.py (fetch_ec_donations_csv +
+  ingest_ec_donations_csv), wired to this entry via load_source (refuses to run
+  without it). freshness_sla_days is an engineering estimate (weekly), not a
+  published EC SLA — the search portal itself updates continuously as donations
+  are processed by the Commission; revisit if a real cadence is published.

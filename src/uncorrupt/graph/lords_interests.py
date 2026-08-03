@@ -53,6 +53,7 @@ from bs4 import BeautifulSoup, Tag
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
@@ -63,6 +64,8 @@ LORDS_REGISTER_URL = (
 )
 WAYBACK_PREFIX = "https://web.archive.org/web/"
 SOURCE_NAME = "UK House of Lords Register of Interests"
+# sources/uk_lords_interests.yml — connector refuses to run without it (ADR-001 D5)
+SOURCE_ID = "uk_lords_interests"
 
 # Longest plausible organisation name. Anything beyond this is a parse
 # artefact from free-text register entries, not a real counterparty.
@@ -415,6 +418,7 @@ def fetch_lords_register(
 
     Stores each page as ``page_NN.html`` and a provenance JSON sidecar.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -546,6 +550,7 @@ def ingest_lords_register(
     skipped_private_individual, skipped_no_counterparty, nil_returns,
     total_interests, total_members}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
     html_dir = Path(html_dir)
     provenance_path = html_dir / "provenance.json"
 

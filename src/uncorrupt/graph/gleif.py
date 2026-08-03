@@ -46,6 +46,7 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import normalise_company_number
 from uncorrupt.staging.models import Company
 
@@ -54,6 +55,7 @@ logger = logging.getLogger(__name__)
 GLEIF_API_BASE = "https://api.gleif.org/api/v1/lei-records"
 SOURCE_NAME = "GLEIF"
 REGISTRY_SCHEME = "GLEIF-LEI"
+SOURCE_ID = "gleif"  # sources/gleif.yml — connector refuses to run without it (ADR-001 D5)
 
 # GLEIF's API caps page[size] at 200; larger values return HTTP 400.
 MAX_PAGE_SIZE = 200
@@ -111,6 +113,7 @@ def fetch_gleif(
     (e.g. `experiments/`) — this function never commits anything, and never
     writes person-level data because GLEIF records contain none.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/gleif.yml (ADR-001 D5)
     if page_size > MAX_PAGE_SIZE:
         raise ValueError(f"GLEIF API rejects page[size] > {MAX_PAGE_SIZE}")
 
@@ -228,6 +231,7 @@ def ingest_gleif(jsonl_path: str | Path) -> dict[str, Any]:
     GB records with a registration number from a different GB authority
     (correctly left unlinked, but still recorded in `properties`).
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/gleif.yml (ADR-001 D5)
     jsonl_path = Path(jsonl_path)
     created = 0
     updated = 0

@@ -1,0 +1,45 @@
+code: br
+name_normalization_profile: passthrough   # Phase 1 (all locales): passthrough until a
+  # per-locale golden set exists. Brazil additionally needs its own profile before this
+  # is safe to rely on for entity matching — see the TODO in notes below.
+currency: BRL
+procedure_metadata:
+  # Direct-award-equivalent thresholds ("dispensa de licitação", Lei 14.133/2021 art. 75),
+  # in BRL cents. Values in effect for 2026 per Decreto no 12.807/2025 (IPCA-E-adjusted
+  # annually — reverify against the current decree before an indicator run relies on this).
+  direct_award_threshold_works_cents: 13098420   # R$130,984.20 — obras/serviços de engenharia (art. 75 I)
+  direct_award_threshold_other_cents: 6549211    # R$65,492.11 — outros serviços e compras (art. 75 II)
+  # min_bid_days_open / min_bid_days_restricted are deliberately ABSENT, not null:
+  # no citable figure yet (varies by modality — concorrência vs. pregão eletrônico —
+  # under Lei 14.133/2021, and this agent did not verify one). i002_short_bid_window
+  # reads procedure_metadata.get("min_bid_days_open", default) — dict.get() only
+  # falls back to the indicator's own default when the KEY IS ABSENT, not when its
+  # value is null, so a guessed or null placeholder here would silently break that
+  # fallback. Leave the key out until a real, cited number is added.
+notes: >-
+  Brazil profile — the next country after the UK pilot (this repo's country-
+  replicability contract; see sources/README.md). This locale file exists AHEAD of
+  any Brazil connector or sources/br_*.yml entry — no Brazilian procurement or
+  registry connector has been written yet, so this file is config only.
+
+
+  Registry scheme convention for the next country's connectors: BR-CNPJ, for
+  Receita Federal do Brasil's Cadastro Nacional da Pessoa Jurídica (the Brazilian
+  national registry of legal entities — the CNPJ is Brazil's analogue of GB-COH /
+  a UK Companies House number). Historically a 14-digit number in the format
+  XX.XXX.XXX/0001-AA (8-digit root + 4-digit branch/subsidiary sequence + 2 check
+  digits); Receita Federal began issuing alphanumeric CNPJs from 2026-07-31, so a
+  Brazil connector's identifier normaliser must accept both the legacy all-numeric
+  and the new alphanumeric format — do not assume digits-only, and do not reuse
+  uncorrupt.staging.companies_house's UK-specific normaliser unmodified.
+
+
+  TODO before Brazil ingestion starts (deliberately left for that work, not guessed
+  here): (1) a Brazilian procurement connector (e.g. for ComprasNet / PNCP — the
+  Portal Nacional de Contratações Públicas) plus its sources/br_*.yml entry — none
+  exists yet; (2) real min_bid_days_open/min_bid_days_restricted figures per
+  modality, with a citation; (3) a CNPJ-aware name_normalization_profile that folds
+  Brazilian corporate-form suffixes (LTDA, S.A., EIRELI, ME, EPP, MEI) the way
+  staging.companies_house already folds "Ltd"/"plc"/"LLP" for the UK; (4) a
+  sources/br_*.yml entry (or entries) for whichever registry/procurement APIs are
+  chosen, following sources/README.md's onboarding order.

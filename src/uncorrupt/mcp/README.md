@@ -35,13 +35,24 @@ see `tests/mcp/test_privacy.py`).
 always returns a list of candidates. It never picks one for you, even when
 there is exactly one strong match by name — ties are surfaced, not merged.
 
+**Caller-supplied bounds are clamped server-side, silently but visibly.**
+Against a ~288k-row `Entity` table and a 400k+-edge graph, `resolve_entity`'s
+`limit` and `find_paths`'s `max_hops` are both requests, not grants: each is
+clamped to a hard ceiling (`limit` to 200, `max_hops` to 4 — the locked Phase
+C benchmark only ever needs 2) and enforced in the ORM query itself
+(`qs[:effective_limit]`), never by materializing the full match set and
+slicing afterwards. The clamp is silent-proof, not silent: both tools return
+the *effective* value they used (`resolve_entity`'s `limit` key,
+`find_paths`'s `max_hops` key), so a caller that asked for more can see it
+was capped.
+
 ## Tools
 
 | Tool | Signature | Returns |
 |---|---|---|
-| `resolve_entity` | `(name=None, company_number=None, registry_scheme=None, registry_id=None, entity_type=None, limit=20)` | List of candidate entities (never a single guess) |
+| `resolve_entity` | `(name=None, company_number=None, registry_scheme=None, registry_id=None, entity_type=None, limit=20)` | `{"limit": <effective value, ≤200>, "candidates": [...]}` — candidates, never a single guess |
 | `get_entity` | `(entity_id)` | The entity plus its edge counts by type |
-| `find_paths` | `(source_id, target_id, max_hops=2)` | Paths ≤ `max_hops`, each edge's type/`valid_from`/attesting sources |
+| `find_paths` | `(source_id, target_id, max_hops=2)` | Paths ≤ effective `max_hops` (clamped to ≤4), each edge's type/`valid_from`/attesting sources |
 | `get_attestations` | `(edge_id)` | Every attestation on that edge: source name, URL, `observed_at`, `snapshot_ref` |
 | `coverage_report` | `(universe="all")` | Officer-roster coverage tiers (`"all"` or `"procurement_supplier"`) |
 | `list_sources` | `()` | Every `sources/*.yml` entry: locale, registry schemes, data class, `dpia_cleared`, licence |
@@ -96,16 +107,19 @@ real Companies House registrations.
 resolve_entity(name="Example Supplies")
 ```
 ```json
-[
-  {
-    "entity_id": 3,
-    "entity_type": "company",
-    "name": "Example Supplies Ltd",
-    "registry_scheme": "GB-COH",
-    "registry_id": "09999002",
-    "company_number": "09999002"
-  }
-]
+{
+  "limit": 20,
+  "candidates": [
+    {
+      "entity_id": 3,
+      "entity_type": "company",
+      "name": "Example Supplies Ltd",
+      "registry_scheme": "GB-COH",
+      "registry_id": "09999002",
+      "company_number": "09999002"
+    }
+  ]
+}
 ```
 
 **2. Resolve the official by name** (note: only `registry identifier`,
@@ -115,16 +129,19 @@ resolve_entity(name="Example Supplies")
 resolve_entity(name="Jane Example")
 ```
 ```json
-[
-  {
-    "entity_id": 1,
-    "entity_type": "person",
-    "name": "Jane Example MP",
-    "registry_scheme": null,
-    "registry_id": null,
-    "role_description": "MP for Example South"
-  }
-]
+{
+  "limit": 20,
+  "candidates": [
+    {
+      "entity_id": 1,
+      "entity_type": "person",
+      "name": "Jane Example MP",
+      "registry_scheme": null,
+      "registry_id": null,
+      "role_description": "MP for Example South"
+    }
+  ]
+}
 ```
 
 **3. Find paths between them** — there is no direct edge, but both are

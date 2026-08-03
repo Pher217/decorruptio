@@ -2,10 +2,17 @@
 boundary (no LLM in the measurement path) depends on this holding, not just
 today but as the module evolves.
 
-Two independent guarantees, deliberately redundant:
+Three independent guarantees, deliberately redundant:
 
 1. Static: `tools.py`'s source contains no call to any ORM write method.
-2. Dynamic: calling every tool leaves row counts on every graph table
+2. Static: `tools.py`'s source contains no `try`/`except` -- a
+   caller-facing tool must raise on a real failure, never swallow it into
+   an empty result indistinguishable from "no data" (the anti-pattern a
+   sibling review of another project's MCP server flagged; this project's
+   `Entity.DoesNotExist`/`Edge.DoesNotExist`/`ValueError` raises are the
+   confirmed-correct alternative -- see the `*_raises_does_not_exist`/
+   `*_raises_value_error` tests in `test_tools.py`).
+3. Dynamic: calling every tool leaves row counts on every graph table
    unchanged.
 """
 
@@ -22,6 +29,7 @@ from uncorrupt.mcp import tools
 _MUTATING_CALL_PATTERN = re.compile(
     r"\.(save|create|update|delete|bulk_create|bulk_update|get_or_create|update_or_create)\s*\("
 )
+_TRY_EXCEPT_PATTERN = re.compile(r"^\s*(try\s*:|except\b)", re.MULTILINE)
 
 
 class TestNoStaticMutationCalls:
@@ -43,6 +51,20 @@ class TestNoStaticMutationCalls:
         source = inspect.getsource(privacy)
         match = _MUTATING_CALL_PATTERN.search(source)
         assert match is None, f"found a mutating ORM call pattern: {match}"
+
+
+class TestNoExceptionSwallowing:
+    """Raise-don't-swallow: a failed query must never look like an empty
+    result to the caller."""
+
+    def test_tools_source_contains_no_try_except_block(self):
+        """GIVEN the tools.py source WHEN scanned for `try`/`except` THEN
+        none is found -- every failure (a missing id, a malformed register
+        entry, an invalid parameter) propagates as a real exception rather
+        than being caught and turned into `[]` or `None`."""
+        source = inspect.getsource(tools)
+        match = _TRY_EXCEPT_PATTERN.search(source)
+        assert match is None, f"found a try/except block: {match}"
 
 
 @pytest.mark.django_db

@@ -37,6 +37,15 @@ from uncorrupt.register.loader import all_sources
 
 _README_PATH = Path(__file__).resolve().parents[3] / "sources" / "README.md"
 
+# Server-side ceilings -- a caller-supplied bound is a request, not a grant.
+# Against a ~288k-row Entity table, an unclamped `limit` or an unclamped
+# `find_paths` hop count both turn a single tool call into a full-table or
+# combinatorial scan. Both ceilings are enforced in the ORM query itself
+# (`qs[:effective_limit]`), not by materializing everything and slicing
+# after -- so the database itself never returns more than the cap.
+_MAX_RESOLVE_LIMIT = 200
+_MAX_FIND_PATHS_HOPS = 4
+
 
 def resolve_entity(
     name: str | None = None,
@@ -45,7 +54,7 @@ def resolve_entity(
     registry_id: str | None = None,
     entity_type: str | None = None,
     limit: int = 20,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Resolve-or-refuse entity lookup. Returns CANDIDATES, never a single guessed match.
 
     At least one of `name`, `company_number`, or `registry_id` is required;
@@ -64,11 +73,19 @@ def resolve_entity(
     `Alias.name` (trading names, former names). Ties are always returned as
     separate candidates, never collapsed to one guess (the project's
     "duplicate over merge" principle, ADR-006) -- the caller disambiguates.
+
+    `limit` is clamped server-side to `[1, _MAX_RESOLVE_LIMIT]` and pushed
+    into each contributing queryset's own slice (`qs[:effective_limit]`) --
+    never materialized in full and sliced afterwards. The clamp is
+    silent-proof: the response's `limit` key is the EFFECTIVE value actually
+    used, so a caller that asked for more can see it was capped rather than
+    believing it got what it asked for.
     """
     if not any([name, company_number, registry_id]):
         raise ValueError(
             "resolve_entity requires at least one of: name, company_number, or registry_id"
         )
+    effective_limit = max(1, min(limit, _MAX_RESOLVE_LIMIT))
 
     base = Entity.objects.all()
     if entity_type:
@@ -79,22 +96,25 @@ def resolve_entity(
     matches: dict[int, Entity] = {}
 
     if registry_id:
-        for e in base.filter(registry_id=registry_id):
+        for e in base.filter(registry_id=registry_id)[:effective_limit]:
             matches[e.id] = e
     if company_number:
-        for e in base.filter(company_number=company_number):
+        for e in base.filter(company_number=company_number)[:effective_limit]:
             matches[e.id] = e
     if name:
-        for e in base.filter(name__icontains=name):
+        for e in base.filter(name__icontains=name)[:effective_limit]:
             matches[e.id] = e
         alias_entity_ids = list(
-            Alias.objects.filter(name__icontains=name).values_list("entity_id", flat=True)
+            Alias.objects.filter(name__icontains=name).values_list("entity_id", flat=True)[
+                :effective_limit
+            ]
         )
         if alias_entity_ids:
-            for e in base.filter(id__in=alias_entity_ids):
+            for e in base.filter(id__in=alias_entity_ids)[:effective_limit]:
                 matches[e.id] = e
 
-    return [entity_summary(e) for e in list(matches.values())[:limit]]
+    candidates = [entity_summary(e) for e in list(matches.values())[:effective_limit]]
+    return {"limit": effective_limit, "candidates": candidates}
 
 
 def get_entity(entity_id: int) -> dict[str, Any]:
@@ -141,21 +161,30 @@ def find_paths(source_id: int, target_id: int, max_hops: int = 2) -> dict[str, A
     `valid_from`, and the names of the sources that attest it (see
     `get_attestations` for the full evidence record behind any one edge).
 
+    `max_hops` is clamped server-side to `[1, _MAX_FIND_PATHS_HOPS]` before
+    the walk runs -- the locked Phase C benchmark only ever needs 2, so even
+    the ceiling is generous, and an unbounded hop count on a 400k+-edge graph
+    is a denial-of-service against this project's own database. The clamp is
+    silent-proof: the response's `max_hops` key is the EFFECTIVE value the
+    walk actually used, not the raw input, so a caller that asked for more
+    can see it was capped.
+
     Raises `Entity.DoesNotExist` if either id does not resolve to a row.
     """
     if not Entity.objects.filter(pk=source_id).exists():
         raise Entity.DoesNotExist(f"source entity {source_id} not found")
     if not Entity.objects.filter(pk=target_id).exists():
         raise Entity.DoesNotExist(f"target entity {target_id} not found")
+    effective_max_hops = max(1, min(max_hops, _MAX_FIND_PATHS_HOPS))
 
     adjacency = build_adjacency()
     dated, undated = _phase_c_find_paths(
-        {source_id}, target_id, adjacency, max_hops, cutoff=date.max
+        {source_id}, target_id, adjacency, effective_max_hops, cutoff=date.max
     )
     return {
         "source_id": source_id,
         "target_id": target_id,
-        "max_hops": max_hops,
+        "max_hops": effective_max_hops,
         "paths": [
             {"hops": len(path), "edges": [_serialize_edge(e) for e in path]}
             for path in [*dated, *undated]
@@ -165,6 +194,13 @@ def find_paths(source_id: int, target_id: int, max_hops: int = 2) -> dict[str, A
 
 def get_attestations(edge_id: int) -> dict[str, Any]:
     """Evidence for one claim: every `Attestation` recorded against an edge.
+
+    Audited for an unbounded caller-supplied query alongside `resolve_entity`
+    /`find_paths`: there is none to clamp. `edge_id` is a single primary-key
+    lookup (`Edge.objects.get(pk=...)`, O(1) via the primary-key index, not
+    proportional to table size), and `edge.attestations.all()` is bounded by
+    how many independent sources this project ingests today (a handful) --
+    not by any value the caller passes in.
 
     Raises `Edge.DoesNotExist` if `edge_id` does not resolve to a row.
     """
@@ -203,6 +239,13 @@ def coverage_report(universe: str = "all") -> dict[str, Any]:
     -> `ch_officers.procurement_universe_coverage_report()`, scoped to the
     benchmark-independent procurement-supplier universe. No coverage
     computation is reimplemented here.
+
+    Audited alongside `resolve_entity`/`find_paths` for an unbounded
+    caller-supplied query: `universe` is the only input, it is a closed set
+    of two literal strings already exhaustively validated below (anything
+    else raises `ValueError`), not a numeric bound -- there is nothing here
+    to clamp. The underlying aggregate scans in `ch_officers` are pre-existing
+    code this server only calls, out of this pass's edit scope.
     """
     if universe == "all":
         return ch_officers.coverage_report()

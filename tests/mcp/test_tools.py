@@ -60,8 +60,8 @@ class TestResolveEntity:
             registry_id="06582618",
             company_number="06582618",
         )
-        results = tools.resolve_entity(name="CLOSE BROTHERS")
-        assert len(results) == 2
+        result = tools.resolve_entity(name="CLOSE BROTHERS")
+        assert len(result["candidates"]) == 2
 
     def test_registry_id_and_scheme_resolves_the_unique_entity(self):
         """GIVEN a registry_scheme+registry_id pair WHEN resolve_entity is
@@ -80,9 +80,9 @@ class TestResolveEntity:
             registry_id="99999999",
             company_number="99999999",
         )
-        results = tools.resolve_entity(registry_scheme="GB-COH", registry_id="12410514")
-        assert len(results) == 1
-        assert results[0]["registry_id"] == "12410514"
+        result = tools.resolve_entity(registry_scheme="GB-COH", registry_id="12410514")
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["registry_id"] == "12410514"
 
     def test_company_number_resolves_the_matching_entity(self):
         """GIVEN a company_number WHEN resolve_entity is called THEN the
@@ -94,15 +94,15 @@ class TestResolveEntity:
             registry_id="04458411",
             company_number="04458411",
         )
-        results = tools.resolve_entity(company_number="04458411")
-        assert len(results) == 1
-        assert results[0]["company_number"] == "04458411"
+        result = tools.resolve_entity(company_number="04458411")
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["company_number"] == "04458411"
 
-    def test_no_match_returns_empty_list(self):
+    def test_no_match_returns_empty_candidates_list(self):
         """GIVEN a name that matches nothing WHEN resolve_entity is called
-        THEN it returns an empty list, not an error."""
-        results = tools.resolve_entity(name="Nonexistent Company XYZ")
-        assert results == []
+        THEN candidates is an empty list, not an error."""
+        result = tools.resolve_entity(name="Nonexistent Company XYZ")
+        assert result["candidates"] == []
 
     def test_name_matches_via_alias(self):
         """GIVEN an entity known only by a trading-name Alias WHEN
@@ -120,9 +120,9 @@ class TestResolveEntity:
             alias_type="trading_as",
             source_name="Companies House",
         )
-        results = tools.resolve_entity(name="PestFix")
-        assert len(results) == 1
-        assert results[0]["entity_id"] == entity.id
+        result = tools.resolve_entity(name="PestFix")
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["entity_id"] == entity.id
 
     def test_entity_type_narrows_results(self):
         """GIVEN a name shared by a company and a person WHEN
@@ -130,17 +130,49 @@ class TestResolveEntity:
         the company is returned."""
         Entity.objects.create(entity_type="company", name="Example")
         Entity.objects.create(entity_type="person", name="Example")
-        results = tools.resolve_entity(name="Example", entity_type="company")
-        assert len(results) == 1
-        assert results[0]["entity_type"] == "company"
+        result = tools.resolve_entity(name="Example", entity_type="company")
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["entity_type"] == "company"
 
     def test_limit_caps_the_number_of_candidates(self):
         """GIVEN more matches than `limit` WHEN resolve_entity is called
         THEN no more than `limit` candidates are returned."""
         for i in range(5):
             Entity.objects.create(entity_type="company", name=f"Widget Co {i}")
-        results = tools.resolve_entity(name="Widget Co", limit=2)
-        assert len(results) == 2
+        result = tools.resolve_entity(name="Widget Co", limit=2)
+        assert len(result["candidates"]) == 2
+
+    def test_limit_is_echoed_as_the_effective_value_used(self):
+        """GIVEN an ordinary within-range limit WHEN resolve_entity is
+        called THEN the response's limit key equals what was requested."""
+        Entity.objects.create(entity_type="company", name="Widget Co")
+        result = tools.resolve_entity(name="Widget Co", limit=5)
+        assert result["limit"] == 5
+
+    def test_oversized_limit_is_clamped_to_the_server_side_ceiling(self):
+        """GIVEN a caller-supplied limit far beyond the server-side ceiling
+        WHEN resolve_entity is called THEN the response's limit key reports
+        the CLAMPED effective value, not the raw requested value -- the
+        clamp is silent-proof, not silent."""
+        Entity.objects.create(entity_type="company", name="Widget Co")
+        result = tools.resolve_entity(name="Widget Co", limit=100_000)
+        assert result["limit"] == tools._MAX_RESOLVE_LIMIT
+
+    def test_oversized_limit_never_returns_more_than_the_ceiling_of_candidates(self):
+        """GIVEN more matching entities than the server-side ceiling WHEN
+        resolve_entity is called with an oversized limit THEN no more than
+        the ceiling's worth of candidates come back."""
+        for i in range(tools._MAX_RESOLVE_LIMIT + 10):
+            Entity.objects.create(entity_type="company", name=f"Bulk Co {i}")
+        result = tools.resolve_entity(name="Bulk Co", limit=100_000)
+        assert len(result["candidates"]) == tools._MAX_RESOLVE_LIMIT
+
+    def test_zero_or_negative_limit_is_clamped_up_to_one(self):
+        """GIVEN a caller-supplied limit of zero WHEN resolve_entity is
+        called THEN the effective limit is clamped up to 1, not 0."""
+        Entity.objects.create(entity_type="company", name="Widget Co")
+        result = tools.resolve_entity(name="Widget Co", limit=0)
+        assert result["limit"] == 1
 
 
 @pytest.mark.django_db
@@ -251,6 +283,49 @@ class TestFindPaths:
         source = Entity.objects.create(entity_type="person", name="Source MP")
         with pytest.raises(Entity.DoesNotExist):
             tools.find_paths(source.id, 999999)
+
+    def test_max_hops_within_range_is_echoed_as_the_effective_value(self):
+        """GIVEN a max_hops within the allowed range WHEN find_paths is
+        called THEN the response's max_hops key equals what was requested."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="company", name="B")
+        result = tools.find_paths(a.id, b.id, max_hops=2)
+        assert result["max_hops"] == 2
+
+    def test_oversized_max_hops_is_clamped_to_the_server_side_ceiling(self):
+        """GIVEN a caller-supplied max_hops far beyond the server-side
+        ceiling WHEN find_paths is called THEN the response's max_hops key
+        reports the CLAMPED effective value, not the raw requested value --
+        the clamp is silent-proof, not silent."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="company", name="B")
+        result = tools.find_paths(a.id, b.id, max_hops=1_000_000)
+        assert result["max_hops"] == tools._MAX_FIND_PATHS_HOPS
+
+    def test_oversized_max_hops_walk_actually_uses_the_clamped_value(self, monkeypatch):
+        """GIVEN a caller-supplied max_hops beyond the ceiling WHEN
+        find_paths is called THEN the underlying traversal is invoked with
+        the CLAMPED value, not the raw one -- proves the clamp is enforced
+        before the walk runs, not just echoed in the response."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="company", name="B")
+        captured = {}
+
+        def spy(start_ids, goal_id, adj, max_hops, cutoff):
+            captured["max_hops"] = max_hops
+            return [], []
+
+        monkeypatch.setattr(tools, "_phase_c_find_paths", spy)
+        tools.find_paths(a.id, b.id, max_hops=1_000_000)
+        assert captured["max_hops"] == tools._MAX_FIND_PATHS_HOPS
+
+    def test_zero_or_negative_max_hops_is_clamped_up_to_one(self):
+        """GIVEN a caller-supplied max_hops of zero WHEN find_paths is
+        called THEN the effective max_hops is clamped up to 1, not 0."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="company", name="B")
+        result = tools.find_paths(a.id, b.id, max_hops=0)
+        assert result["max_hops"] == 1
 
 
 @pytest.mark.django_db

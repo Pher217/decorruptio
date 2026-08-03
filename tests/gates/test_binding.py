@@ -1,0 +1,109 @@
+"""Tests for the attestation-inclusive freeze-state binding.
+
+Covers the delegation packet's binding requirement: an attestation-only
+ingest (zero new edges) must not silently keep binding to a gate measured
+before it, even though `run_gold_benchmark.compute_graph_hash` (edge tuples
+only, out of scope, unedited here) cannot see it.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from uncorrupt.gates.binding import GateFreezeState, compute_attestation_inclusive_hash
+from uncorrupt.graph.models import Attestation, Edge, Entity
+
+
+@pytest.mark.django_db
+class TestAttestationInclusiveHashClosesTheGraphHashGap:
+    def test_hash_changes_when_an_attestation_only_ingest_adds_no_new_edge(self):
+        """GIVEN a graph with one edge and no attestations, hashed
+        WHEN an attestation is added to that SAME edge (no new edge created --
+        mirrors the Lords Wayback snapshot ingest, spec v2.9: ~6,000 attestations,
+        zero new edges)
+        THEN compute_attestation_inclusive_hash() changes, even though
+        run_gold_benchmark.compute_graph_hash() (edge tuples only) would not."""
+        from scripts.run_gold_benchmark import compute_graph_hash
+
+        person = Entity.objects.create(entity_type="person", name="Someone")
+        company = Entity.objects.create(entity_type="company", name="Somewhere Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+
+        graph_hash_before = compute_graph_hash()
+        attestation_hash_before = compute_attestation_inclusive_hash()
+
+        Attestation.objects.create(edge=edge, source_name="Some Register", source_reference="r1")
+
+        graph_hash_after = compute_graph_hash()
+        attestation_hash_after = compute_attestation_inclusive_hash()
+
+        assert graph_hash_after == graph_hash_before, (
+            "documents the known gap: compute_graph_hash is blind to attestation-only ingests"
+        )
+        assert attestation_hash_after != attestation_hash_before
+
+    def test_hash_is_order_independent(self):
+        """GIVEN the same two attestations created in different orders across two
+        equivalent graphs
+        WHEN each is hashed
+        THEN both hashes are identical -- insertion order must never change the
+        hash (mirrors compute_graph_hash's own discipline)."""
+        person = Entity.objects.create(entity_type="person", name="Someone")
+        company = Entity.objects.create(entity_type="company", name="Somewhere Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        Attestation.objects.create(edge=edge, source_name="Register A", source_reference="a")
+        Attestation.objects.create(edge=edge, source_name="Register B", source_reference="b")
+
+        first = compute_attestation_inclusive_hash()
+        second = compute_attestation_inclusive_hash()
+
+        assert first == second
+
+
+class TestGateFreezeStateMatchesRecorded:
+    def _state(self, **overrides) -> GateFreezeState:
+        defaults = dict(
+            code_commit="abc123",
+            graph_hash="graphhash",
+            attestation_inclusive_hash="attesthash",
+            manifest_hash="manifesthash",
+            measured_at="2026-08-03T00:00:00+00:00",
+        )
+        defaults.update(overrides)
+        return GateFreezeState(**defaults)
+
+    def test_matches_when_all_four_fields_agree(self):
+        """GIVEN a freeze state and a recorded dict with identical
+        code_commit/graph_hash/attestation_inclusive_hash/manifest_hash
+        WHEN matches_recorded is checked
+        THEN it is True."""
+        state = self._state()
+        recorded = state.to_binding_dict()
+
+        assert state.matches_recorded(recorded) is True
+
+    def test_does_not_match_when_attestation_inclusive_hash_differs(self):
+        """GIVEN a recorded dict whose attestation_inclusive_hash differs from the
+        current state (an attestation-only ingest happened since it was recorded)
+        WHEN matches_recorded is checked
+        THEN it is False -- this is the extra check run_gold_benchmark.GateBinding
+        cannot perform."""
+        state = self._state()
+        recorded = state.to_binding_dict()
+        recorded["attestation_inclusive_hash"] = "a-different-hash"
+
+        assert state.matches_recorded(recorded) is False
+
+    def test_does_not_match_when_graph_hash_differs(self):
+        """GIVEN a recorded dict whose graph_hash differs
+        WHEN matches_recorded is checked
+        THEN it is False."""
+        state = self._state()
+        recorded = state.to_binding_dict()
+        recorded["graph_hash"] = "a-different-hash"
+
+        assert state.matches_recorded(recorded) is False

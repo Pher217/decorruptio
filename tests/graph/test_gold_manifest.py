@@ -17,33 +17,40 @@ placeholder names) -- never a real person, company, or case.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 from pathlib import Path
 
 import pytest
-from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest
+from scripts.load_gold_manifest import GoldCase, GoldRow, ManifestLoadResult, load_gold_manifest
 from scripts.phase_c_paths import build_adjacency, surname
 from scripts.run_gold_benchmark import (
+    LOCKED_MAX_HOPS,
     MATERIAL_STRATA,
+    SEALED_COHORT_V2_COMPANY_NUMBERS,
     STRATUM_CH_OFFICER,
     STRATUM_COMMONS,
     STRATUM_LORDS,
     CaseEvaluation,
     CoverageGate,
+    GateBinding,
+    PathEvidence,
     StratumGate,
     check_source_separation,
     classify_edge_stratum,
     classify_outcome,
+    classify_recovered_cases,
+    compute_manifest_hash,
     compute_precision,
     country_switch_triggered,
     evaluate_case,
     evaluate_row,
-    filter_by_passing_stratum,
     load_coverage_gate,
     load_stratum_gates,
+    negatives_recovered_from,
     path_strata,
-    split_recovered_by_source_separation,
+    validate_locked_protocol,
     wilson_upper_bound,
 )
 
@@ -53,7 +60,8 @@ MANIFEST_HEADER = (
     "case_id,person_name,person_registry_id,company_name,company_number,"
     "relationship_type,established_by,label_source_url,award_date,"
     "relationship_start,excluded_from_retrieval,intermediary_company_number,"
-    "awardee_confirmed,held_office_at_award,office_holding_start_date\n"
+    "awardee_confirmed,held_office_at_award,office_holding_start_date,"
+    "office_holding_end_date,retrieval_stratum,stratum_confidence\n"
 )
 
 # Appended to every existing test row that doesn't specifically exercise the
@@ -407,6 +415,216 @@ class TestLoadGoldManifest:
         )
 
 
+class TestManifestSchemaV25ToV28:
+    """Severity 3 finding 11: the loader schema stops at v2.3 -- these
+    exercise the v2.5-v2.8 additions (controlled relationship vocabulary,
+    office end date, precommitted retrieval_stratum, stratum_confidence)."""
+
+    def test_uncontrolled_relationship_type_is_rejected(self, tmp_path):
+        """GIVEN relationship_type is uncontrolled prose ('advisory') instead
+        of a value from the spec A2.5.3 controlled vocabulary
+        WHEN the manifest is loaded
+        THEN the row is inadmissible, citing the controlled vocabulary."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-040,Jane Testperson,,Example Holdings Ltd,1234567,advisory,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("not in the controlled vocabulary" in r for r in result.inadmissible[0].reasons)
+
+    def test_consultancy_relationship_type_is_admissible(self, tmp_path):
+        """GIVEN relationship_type is 'consultancy' -- the one addition
+        amendment v2.5 names beyond the base §4 list
+        WHEN the manifest is loaded
+        THEN the row is admissible."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-041,Jane Testperson,,Example Holdings Ltd,1234567,consultancy,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+
+    def test_invalid_retrieval_stratum_token_is_rejected(self, tmp_path):
+        """GIVEN retrieval_stratum names a register outside the spec A2.7.2
+        controlled vocabulary
+        WHEN the manifest is loaded
+        THEN the row is inadmissible, citing the controlled vocabulary."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-042,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,not_a_real_register,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("retrieval_stratum token" in r for r in result.inadmissible[0].reasons)
+
+    def test_multi_token_retrieval_stratum_is_admissible_and_preserved(self, tmp_path):
+        """GIVEN retrieval_stratum combines two valid tokens with ' + '
+        (mirroring the pre-registration's own table notation for
+        multi-source cases, e.g. a donor->awardee bridge)
+        WHEN the manifest is loaded
+        THEN the row is admissible and `retrieval_stratum` is preserved
+        verbatim on the GoldRow."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-043,Jane Testperson,,Example Holdings Ltd,1234567,donation,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house + electoral_commission,"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].retrieval_stratum == "companies_house + electoral_commission"
+
+    def test_blank_retrieval_stratum_and_stratum_confidence_are_permitted(self, tmp_path):
+        """GIVEN retrieval_stratum and stratum_confidence are both left blank
+        WHEN the manifest is loaded
+        THEN the row is still admissible, with both fields None -- the
+        loader validates the CONTROLLED VOCABULARY of a supplied value, it
+        does not mechanically demand one (spec A2.7.2's precommitment
+        discipline is a curation-time guarantee this loader cannot verify
+        from the CSV alone)."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-044,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,,"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].retrieval_stratum is None
+        assert result.admissible[0].stratum_confidence is None
+
+    def test_invalid_stratum_confidence_is_rejected(self, tmp_path):
+        """GIVEN stratum_confidence is 'medium' -- not in {"high", "low"}
+        (spec A2.8.4)
+        WHEN the manifest is loaded
+        THEN the row is inadmissible."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-045,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house,medium"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("stratum_confidence" in r for r in result.inadmissible[0].reasons)
+
+    def test_low_stratum_confidence_is_admissible(self, tmp_path):
+        """GIVEN stratum_confidence is 'low' (spec A2.8.4's kinship-gap flag)
+        WHEN the manifest is loaded
+        THEN the row is admissible and the flag is preserved."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-046,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house,low"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].stratum_confidence == "low"
+
+    def test_office_ended_before_the_award_is_out_of_scope(self, tmp_path):
+        """ADVERSARIAL TEST -- spec amendment v2.6 A2.6.1: "at or before the
+        award date" was ambiguous. The motivating case: a trustee resigned
+        2015-07-31, one month before an 2015-08-31 award -- held office
+        BEFORE the award (so the original v2.2 start-date check alone is
+        satisfied) but had no public function to influence at the time
+        because the office had ALREADY ENDED.
+
+        GIVEN held_office_at_award='yes', office_holding_start_date well
+        before the award (passes the original check), but
+        office_holding_end_date is BEFORE the award
+        WHEN the manifest is loaded
+        THEN the row is OUT OF SCOPE, not admissible -- office_holding_end_date
+        is an equally valid out-of-scope trigger alongside the start-date
+        check, per A2.6.1."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-047,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,2020-01-01,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert len(result.out_of_scope) == 1
+        assert "office_holding_end_date" in result.out_of_scope[0].reason
+        assert "pre-dates award_date" in result.out_of_scope[0].reason
+
+    def test_office_ended_after_the_award_is_admissible(self, tmp_path):
+        """GIVEN office_holding_end_date is AFTER the award_date (office was
+        still held at the time of the award)
+        WHEN the manifest is loaded
+        THEN the row is admissible -- a future end date adds no
+        constraint."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-048,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,2025-01-01,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].office_holding_end_date == date(2025, 1, 1)
+
+    def test_unparseable_office_holding_end_date_is_inadmissible(self, tmp_path):
+        """GIVEN office_holding_end_date is a non-blank, non-ISO string
+        WHEN the manifest is loaded
+        THEN the row is inadmissible, citing the unparseable date."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-049,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,not-a-date,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 0
+        assert any("office_holding_end_date" in r for r in result.inadmissible[0].reasons)
+
+    def test_blank_office_holding_end_date_adds_no_constraint(self, tmp_path):
+        """GIVEN office_holding_end_date is blank (no known end / still
+        serving)
+        WHEN the manifest is loaded
+        THEN the row is admissible with `office_holding_end_date is None` --
+        blank must never be misread as "ended immediately"."""
+        path = _write_manifest(
+            tmp_path,
+            [
+                "SYNTH-050,Jane Testperson,,Example Holdings Ltd,1234567,directorship,"
+                "journalism,https://example.invalid/a,2021-06-01,2018-01-15,,,yes,yes,"
+                "2010-01-01,,companies_house,high"
+            ],
+        )
+        result = load_gold_manifest(path)
+        assert len(result.admissible) == 1
+        assert result.admissible[0].office_holding_end_date is None
+
+
 def _gold_row(**overrides) -> GoldRow:
     defaults = dict(
         case_id="SYNTH-100",
@@ -496,7 +714,6 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=1.0,
             coverage_gate=CoverageGate(),  # all-False default
             stratum_gates=_all_passing_stratum_gates(),
         )
@@ -513,7 +730,6 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=0.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates={name: StratumGate() for name in MATERIAL_STRATA},
         )
@@ -540,7 +756,6 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=0.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=gates,
         )
@@ -559,7 +774,6 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=0.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
@@ -567,8 +781,8 @@ class TestClassifyOutcome:
 
     def test_confirmed_reachable_via_passing_strata_even_with_lords_unvalidated(self):
         """GIVEN >=4 qualifying cases recovered (already filtered by the
-        caller to touch only PASSING strata) and >=80% precision, while
-        Commons + CH-officer pass but Lords remains unavailable
+        caller to touch only PASSING strata), while Commons + CH-officer
+        pass but Lords remains unavailable
         WHEN the outcome is classified
         THEN it is CONFIRMED -- spec A2.4.4: 'an unvalidated Lords gate must
         not erase a genuine, independently verified Commons recovery'.
@@ -582,11 +796,33 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=0.80,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=gates,
         )
 
+        assert outcome == "CONFIRMED"
+
+    def test_confirmed_does_not_require_precision_severity_2_finding_7(self):
+        """ADVERSARIAL TEST -- Severity 2 finding 7: `classify_outcome` used
+        to gate CONFIRMED on a `precision` argument built from the retired,
+        NON-GATING 200-pair negative-control diagnostic (spec A2.4.1),
+        contradicting the amendment that retired it.
+
+        GIVEN >=4 qualifying cases recovered and every other gate passing
+        WHEN the outcome is classified
+        THEN it is CONFIRMED regardless of what benchmark precision would
+        have been -- `classify_outcome` takes no precision argument at all,
+        so a low-precision diagnostic can no longer suppress a genuine
+        case-level recovery, and a NON-gating diagnostic can no longer gate
+        the primary verdict either way."""
+        outcome = classify_outcome(
+            cases_recovered=4,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
+        )
         assert outcome == "CONFIRMED"
 
     def test_partial_fires_for_one_to_three_qualifying_cases(self):
@@ -600,11 +836,40 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=1.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "PARTIAL"
+
+    def test_undefined_outcome_for_input_outside_the_verdict_partition(self):
+        """ADVERSARIAL TEST -- Severity 2 finding 6: the scorer must not
+        invent an interpretation for input the pre-registration does not
+        cover, and must say so explicitly rather than silently defaulting to
+        PARTIAL.
+
+        GIVEN a negative `cases_recovered` (a caller defect -- e.g. a
+        miscomputed qualifying-case count) with every gate otherwise passing
+        WHEN the outcome is classified
+        THEN it is UNDEFINED-OUTCOME, not PARTIAL -- branches 3/4/5 only
+        cover cases_recovered in {0} u {1..3} u {4, 5, ...}, so a negative
+        count falls outside every one of them and must be refused, not
+        silently classified."""
+        outcome = classify_outcome(
+            cases_recovered=-1,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
+        )
+        assert outcome == "UNDEFINED-OUTCOME"
+
+    def test_undefined_outcome_does_not_trigger_country_switch(self):
+        """GIVEN the UNDEFINED-OUTCOME verdict
+        WHEN checking whether the country-switch action fires
+        THEN it does not -- an unclassifiable result licenses no automatic
+        action, exactly like INVALID and INSUFFICIENT-COHORT."""
+        assert country_switch_triggered("UNDEFINED-OUTCOME") is False
 
     def test_insufficient_cohort_blocks_a_false_refuted_when_every_case_is_untestable(self):
         """ADVERSARIAL TEST -- sneak past REFUTED via an all-untestable cohort.
@@ -623,7 +888,6 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=20,
             cases_no_trace_by_design=0,
-            precision=0.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
@@ -633,17 +897,15 @@ class TestClassifyOutcome:
         """ADVERSARIAL TEST -- sneak past CONFIRMED via a too-small manifest.
 
         GIVEN only 10 total cases in the manifest (half the pre-registered
-        20) with 8 recovered and full precision/coverage/stratum-gate pass
+        20) with 8 recovered and coverage/stratum gates passing
         WHEN the outcome is classified
-        THEN it is INSUFFICIENT-COHORT, never CONFIRMED -- the locked
-        '>=4/20' bar is calibrated to a 20-case cohort; applying it to a
-        smaller, unrepresentative one overstates the evidence."""
+        THEN it is INSUFFICIENT-COHORT, never CONFIRMED -- the manifest does
+        not have the sealed 20 cases, so the '>=4/20' bar cannot apply."""
         outcome = classify_outcome(
             cases_recovered=8,
             cases_total=10,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=1.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
@@ -654,15 +916,15 @@ class TestClassifyOutcome:
         (spec A2.3.3) and the remaining 5 are all not_recovered, so
         cases_recovered == 0
         WHEN the outcome is classified
-        THEN it is INSUFFICIENT-COHORT, never REFUTED -- PSC rows are
-        expected non-results by design and must never pad out a refutation's
-        denominator, exactly like untestable rows."""
+        THEN it is INSUFFICIENT-COHORT, never REFUTED -- 15 no_trace_by_design
+        cases is far more than the 3 the sealed cohort declares untestable by
+        construction (v2.8/SEALED COHORT v2), so the testable denominator (5)
+        is too degenerate to support "0 recovered" as a refutation."""
         outcome = classify_outcome(
             cases_recovered=0,
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=15,
-            precision=0.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
@@ -679,18 +941,69 @@ class TestClassifyOutcome:
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=0.80,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome == "CONFIRMED"
 
+    def test_sealed20_three_declared_untestable_is_not_insufficient_cohort(self):
+        """ADVERSARIAL TEST -- Severity 2 finding 5: the cohort-size guard
+        must not contradict amendment v2.8/SEALED COHORT v2, which
+        preserves N_total = 20 with EXACTLY 3 cases declared untestable BY
+        CONSTRUCTION (no ingested register could ever carry their evidence),
+        precommitted before any retrieval result was viewed.
 
-class TestSplitRecoveredBySourceSeparation:
-    """ADVERSARIAL FIX: a case recovered ONLY via a proven source-separation
-    violation must never count as recovered (spec SS3)."""
+        GIVEN the sealed 20-case cohort (cases_total == 20) with exactly 3
+        declared untestable and 1 qualifying case recovered among the
+        remaining 17
+        WHEN the outcome is classified
+        THEN it is PARTIAL, not INSUFFICIENT-COHORT -- the guard must
+        validate cohort MEMBERSHIP (are these the sealed 20), never demand
+        that all 20 come back independently recoverable."""
+        outcome = classify_outcome(
+            cases_recovered=1,
+            cases_total=20,
+            cases_untestable=3,
+            cases_no_trace_by_design=0,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
+        )
+        assert outcome == "PARTIAL"
 
-    def _case(self, status: str, source_separation: str, key: str = "01234567") -> CaseEvaluation:
+    def test_sealed20_three_declared_untestable_still_reaches_refuted(self):
+        """GIVEN the sealed 20-case cohort with exactly 3 declared untestable
+        by construction, 0 cases recovered among the remaining 17, and every
+        material stratum passing
+        WHEN the outcome is classified
+        THEN it is REFUTED -- the pre-declared 3 do not block a genuine
+        refutation any more than they block PARTIAL/CONFIRMED (v2.8
+        §A2.8.5)."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            cases_total=20,
+            cases_untestable=3,
+            cases_no_trace_by_design=0,
+            coverage_gate=_passing_coverage_gate(),
+            stratum_gates=_all_passing_stratum_gates(),
+        )
+        assert outcome == "REFUTED"
+
+
+class TestClassifyRecoveredCases:
+    """ADVERSARIAL FIX (spec SS3, A2.4.4): replaces the retired
+    `split_recovered_by_source_separation` / `filter_by_passing_stratum`
+    pair, which each unioned taint/strata across every path found for a
+    case. `classify_recovered_cases` decides qualification PER PATH via
+    `CaseEvaluation.path_evidences` -- a case recovered ONLY via a proven
+    source-separation violation, or ONLY via unproven/unattested provenance,
+    must never count as recovered (Severity 1 findings 2 and 3)."""
+
+    def _case(
+        self,
+        status: str,
+        path_evidences: tuple[PathEvidence, ...] = (),
+        key: str = "01234567",
+    ) -> CaseEvaluation:
         return CaseEvaluation(
             case_key=key,
             company_number=key,
@@ -699,100 +1012,137 @@ class TestSplitRecoveredBySourceSeparation:
             earliest_award_date="2021-06-01",
             row_case_ids=["SYNTH-1"],
             status=status,
-            source_separation=source_separation,
+            source_separation="not_applicable",  # display-only; qualification reads path_evidences
             row_evaluations=[],
+            path_evidences=path_evidences,
         )
 
-    def test_circular_recovered_case_is_excluded_from_clean(self):
-        """GIVEN a recovered case whose source_separation is 'violation'
-        (every path found is attested solely by an excluded source)
-        WHEN recovered cases are split
-        THEN it appears in `circular`, not `clean`."""
-        case = self._case("recovered", "violation")
-        clean, circular = split_recovered_by_source_separation([case])
-        assert clean == []
-        assert circular == [case]
+    def test_circular_recovered_case_is_excluded_and_bucketed_circular(self):
+        """GIVEN a recovered case whose only path is PROVEN tainted (every
+        edge attested solely by an excluded source) on a stratum that
+        otherwise passes
+        WHEN recovered cases are classified
+        THEN it is excluded from `qualifying` and lands in `circular` --
+        SS3's circularity guard, never rescued by an otherwise-passing
+        stratum."""
+        case = self._case(
+            "recovered", (PathEvidence(taint="tainted", strata=frozenset({STRATUM_COMMONS})),)
+        )
+        split = classify_recovered_cases([case], _all_passing_stratum_gates())
+        assert split.qualifying == []
+        assert split.circular == [case]
+        assert split.unverifiable == []
+        assert split.instrument_limited == []
 
-    def test_ok_recovered_case_is_clean(self):
-        """GIVEN a recovered case whose source_separation is 'ok' (an
-        independent, permitted path exists)
-        WHEN recovered cases are split
-        THEN it appears in `clean`, not `circular`."""
-        case = self._case("recovered", "ok")
-        clean, circular = split_recovered_by_source_separation([case])
-        assert clean == [case]
-        assert circular == []
+    def test_ok_recovered_case_on_a_passing_stratum_qualifies(self):
+        """GIVEN a recovered case whose only path is positively verified
+        clean on a passing stratum
+        WHEN recovered cases are classified
+        THEN it is `qualifying`."""
+        case = self._case(
+            "recovered", (PathEvidence(taint="clean", strata=frozenset({STRATUM_COMMONS})),)
+        )
+        split = classify_recovered_cases([case], _all_passing_stratum_gates())
+        assert split.qualifying == [case]
+        assert split.circular == []
+        assert split.unverifiable == []
+        assert split.instrument_limited == []
 
-    def test_cannot_verify_recovered_case_is_clean_not_circular(self):
-        """GIVEN a recovered case whose source_separation is 'cannot_verify'
-        (an unattested edge -- nothing PROVES circularity)
-        WHEN recovered cases are split
-        THEN it appears in `clean`, not `circular` -- only a PROVEN
-        violation is excluded, not an unresolved unknown."""
-        case = self._case("recovered", "cannot_verify")
-        clean, circular = split_recovered_by_source_separation([case])
-        assert clean == [case]
-        assert circular == []
+    def test_cannot_verify_recovered_case_is_excluded_and_bucketed_unverifiable(self):
+        """ADVERSARIAL TEST -- Severity 1 finding 2: publication-grade
+        evidence must fail CLOSED, not open. An unattested path used to
+        count toward `clean`/qualifying merely because nothing PROVED it
+        circular.
+
+        GIVEN a recovered case whose only path is 'unverifiable' (an
+        unattested edge -- nothing proves it circular, but nothing
+        positively verifies it either) on an otherwise-passing stratum
+        WHEN recovered cases are classified
+        THEN it is EXCLUDED from `qualifying` and lands in `unverifiable`,
+        never `circular` (not proven tainted) and never `qualifying` (not
+        positively verified) -- four such cases can never manufacture
+        CONFIRMED."""
+        case = self._case(
+            "recovered", (PathEvidence(taint="unverifiable", strata=frozenset({STRATUM_COMMONS})),)
+        )
+        split = classify_recovered_cases([case], _all_passing_stratum_gates())
+        assert split.qualifying == []
+        assert split.circular == []
+        assert split.unverifiable == [case]
+        assert split.instrument_limited == []
 
     def test_non_recovered_cases_are_ignored(self):
         """GIVEN cases that are undated_only, not_recovered, or untestable
-        WHEN recovered cases are split
-        THEN none of them appear in either clean or circular -- only
-        status == 'recovered' cases are considered at all."""
+        WHEN recovered cases are classified
+        THEN none of them appear in any bucket -- only status == 'recovered'
+        cases are considered at all."""
         cases = [
-            self._case("undated_only", "violation", key="1"),
-            self._case("not_recovered", "not_applicable", key="2"),
-            self._case("untestable", "not_applicable", key="3"),
+            self._case(
+                "undated_only",
+                (PathEvidence(taint="tainted", strata=frozenset({STRATUM_COMMONS})),),
+                key="1",
+            ),
+            self._case("not_recovered", (), key="2"),
+            self._case("untestable", (), key="3"),
         ]
-        clean, circular = split_recovered_by_source_separation(cases)
-        assert clean == []
-        assert circular == []
+        split = classify_recovered_cases(cases, _all_passing_stratum_gates())
+        assert split.qualifying == []
+        assert split.circular == []
+        assert split.unverifiable == []
+        assert split.instrument_limited == []
 
     def test_a_false_confirmed_via_circularity_is_impossible(self):
         """ADVERSARIAL TEST, end-to-end -- sneak past CONFIRMED via the
         project's own journalism ingest.
 
-        GIVEN 4 cases all showing status='recovered' but source_separation
-        == 'violation' on every one (check_source_separation has PROVEN the
-        only path found for each is attested solely by that row's own
-        excluded_from_retrieval source), with everything else passing
-        (precision, retrieval controls, temporal gate, cohort size)
-        WHEN the recovered cases are split and the clean count is fed into
-        classify_outcome
+        GIVEN 4 cases all status='recovered' with every path PROVEN tainted
+        (attested solely by that row's own excluded_from_retrieval source),
+        with everything else passing (retrieval controls, temporal gate,
+        cohort size)
+        WHEN the recovered cases are classified and the qualifying count is
+        fed into classify_outcome
         THEN the outcome is NOT CONFIRMED -- a case recoverable only through
         the project's own excluded/circular ingest must never produce an
         affirmative claim about a named person or company."""
-        circular_cases = [self._case("recovered", "violation", key=str(i)) for i in range(4)]
-        clean, circular = split_recovered_by_source_separation(circular_cases)
-        assert len(circular) == 4
-        assert len(clean) == 0
+        circular_cases = [
+            self._case(
+                "recovered",
+                (PathEvidence(taint="tainted", strata=frozenset({STRATUM_COMMONS})),),
+                key=str(i),
+            )
+            for i in range(4)
+        ]
+        split = classify_recovered_cases(circular_cases, _all_passing_stratum_gates())
+        assert len(split.circular) == 4
+        assert len(split.qualifying) == 0
 
         outcome = classify_outcome(
-            cases_recovered=len(clean),
+            cases_recovered=len(split.qualifying),
             cases_total=20,
             cases_untestable=0,
             cases_no_trace_by_design=0,
-            precision=1.0,
             coverage_gate=_passing_coverage_gate(),
             stratum_gates=_all_passing_stratum_gates(),
         )
         assert outcome != "CONFIRMED"
 
-    def test_case_with_both_a_clean_and_a_tainted_path_is_clean_not_circular(self):
-        """GIVEN evaluate_case's own roll-up logic (spec SS3): a case with
-        one row landing 'ok' and another landing 'violation', both
-        contributing to the winning 'recovered' status
-        WHEN the case rollup's resulting source_separation is fed through the
-        split
-        THEN it is 'ok' (the clean path carries the case), so it lands in
-        `clean` -- the distinction survives the case rollup, not just the
-        per-row check."""
-        # This mirrors evaluate_case's own aggregation rule directly:
-        # "ok" in seps wins over "violation" being present too.
-        case = self._case("recovered", "ok")
-        clean, circular = split_recovered_by_source_separation([case])
-        assert case in clean
-        assert case not in circular
+    def test_case_with_both_a_clean_and_a_tainted_path_qualifies_via_the_clean_one(self):
+        """GIVEN a case with TWO paths: one tainted (proven circular) and one
+        independently clean, both on a passing stratum
+        WHEN recovered cases are classified
+        THEN it is `qualifying` -- the clean path carries the case on its
+        own, exactly like the retired case-level rollup intended, but now
+        decided per path rather than by unioning taint across paths."""
+        case = self._case(
+            "recovered",
+            (
+                PathEvidence(taint="tainted", strata=frozenset({STRATUM_COMMONS})),
+                PathEvidence(taint="clean", strata=frozenset({STRATUM_COMMONS})),
+            ),
+        )
+        split = classify_recovered_cases([case], _all_passing_stratum_gates())
+        assert case in split.qualifying
+        assert case not in split.circular
 
 
 class TestCountrySwitchTriggered:
@@ -826,6 +1176,32 @@ class TestComputePrecision:
         WHEN precision is computed
         THEN it is 4/5."""
         assert compute_precision(4, 1) == pytest.approx(0.8)
+
+
+class TestNegativesRecoveredFrom:
+    """ADVERSARIAL TEST -- Severity 1 finding 4: `cases_recovered` (the
+    numerator benchmark_precision is built from) is the STRICT pre-award
+    endpoint. Reading `with_path` (ANY path, dated or not) for the
+    denominator's negative count would measure it at a LOOSER endpoint than
+    the numerator, making the ratio meaningless."""
+
+    def test_reads_the_strict_preaward_field_not_any_path(self):
+        """GIVEN a negative_controls report where `with_path` (any path) and
+        `with_preaward` (strict) genuinely differ
+        WHEN the negatives-recovered count is extracted
+        THEN it is the `with_preaward` figure, not `with_path`."""
+        negative_controls = {"n": 200, "with_path": 37, "with_preaward": 4}
+        assert negatives_recovered_from(negative_controls) == 4
+
+    def test_does_not_read_with_path_even_when_present(self):
+        """GIVEN the same report
+        WHEN the negatives-recovered count is extracted
+        THEN it is NOT the `with_path` figure -- this is the exact defect
+        finding 4 describes: `with_path` counts undated paths too, a looser
+        endpoint than the strict pre-award positives it would otherwise be
+        compared against."""
+        negative_controls = {"n": 200, "with_path": 37, "with_preaward": 4}
+        assert negatives_recovered_from(negative_controls) != negative_controls["with_path"]
 
 
 class TestWilsonUpperBound:
@@ -926,6 +1302,110 @@ class TestEvaluateRow:
         result = evaluate_row(_gold_row(), adj, people_by_surname, {}, max_hops=2)
 
         assert result.status == "not_recovered"
+
+
+@pytest.mark.django_db
+class TestRegistryIdResolutionFailsClosed:
+    """ADVERSARIAL TEST -- Severity 1 finding 1: a row that asserts a specific
+    `person_registry_id` must never fall back to crude surname matching when
+    that ID fails to resolve. Falling back lets an unrelated NAMESAKE's real
+    path stand in for the named subject's "recovery" -- a false accusation
+    against a real person, since surname matching is a deliberate, documented
+    over-match (`phase_c_paths.surname`: "a hit found this way is a
+    candidate ... not a claim about any individual")."""
+
+    def test_unresolvable_registry_id_never_falls_back_to_a_namesakes_path(self):
+        """GIVEN a row asserting `person_registry_id='MP-DOES-NOT-EXIST'` for
+        "Jane Testperson", where that ID resolves to NO entity, but a
+        DIFFERENT person ("John Testperson", same surname, a namesake) DOES
+        exist in the graph and has a genuine pre-award officer_of path to the
+        row's company
+        WHEN the row is evaluated
+        THEN its status is untestable -- NEVER recovered through the
+        namesake's path. A registry-ID assertion that fails to resolve must
+        make the row untestable, not silently downgrade to surname matching."""
+        namesake = Entity.objects.create(
+            entity_type="person",
+            name="John Testperson",
+            registry_scheme="UK-PARLIAMENT-MEMBER",
+            registry_id="MP-99999-NAMESAKE",
+        )
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=namesake,
+            target_entity=company,
+            valid_from=date(2018, 1, 15),
+        )
+        adj = build_adjacency()
+        # Built exactly as production code builds it: every person indexed by
+        # surname, not filtered to "people relevant to this row".
+        people_by_surname = {surname(namesake.name): [namesake]}
+
+        row = _gold_row(
+            person_name="Jane Testperson",
+            person_registry_id="MP-DOES-NOT-EXIST",
+        )
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "untestable"
+
+    def test_no_registry_id_still_uses_surname_matching(self):
+        """GIVEN a row with NO `person_registry_id` asserted at all (blank)
+        and a person matching by surname who has a genuine pre-award path
+        WHEN the row is evaluated
+        THEN its status is recovered -- surname matching remains the correct
+        fallback when the row never asserted a specific identity to begin
+        with; only an ASSERTED-but-unresolvable registry ID must fail
+        closed."""
+        person = Entity.objects.create(entity_type="person", name="Jane Testperson")
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=person,
+            target_entity=company,
+            valid_from=date(2018, 1, 15),
+        )
+        adj = build_adjacency()
+        people_by_surname = {surname(person.name): [person]}
+
+        row = _gold_row(person_name="Jane Testperson", person_registry_id=None)
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "recovered"
+
+    def test_matching_registry_id_resolves_and_recovers(self):
+        """GIVEN a row asserting a `person_registry_id` that DOES match the
+        real subject's entity, with a genuine pre-award path
+        WHEN the row is evaluated
+        THEN its status is recovered -- a correctly-resolving registry ID is
+        never penalised by the fail-closed fix."""
+        person = Entity.objects.create(
+            entity_type="person",
+            name="Jane Testperson",
+            registry_scheme="UK-PARLIAMENT-MEMBER",
+            registry_id="MP-12345-REAL",
+        )
+        company = Entity.objects.create(
+            entity_type="company", name="Example Holdings Ltd", company_number="01234567"
+        )
+        Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=person,
+            target_entity=company,
+            valid_from=date(2018, 1, 15),
+        )
+        adj = build_adjacency()
+        people_by_surname: dict[str, list[Entity]] = {}
+
+        row = _gold_row(person_name="Jane Testperson", person_registry_id="MP-12345-REAL")
+        result = evaluate_row(row, adj, people_by_surname, {}, max_hops=2)
+
+        assert result.status == "recovered"
 
 
 @pytest.mark.django_db
@@ -1165,6 +1645,92 @@ class TestLoadCoverageGate:
         gate = load_coverage_gate(path)
         assert gate.passed is False
 
+    def test_covered_greater_than_total_never_passes(self, tmp_path):
+        """ADVERSARIAL TEST -- Severity 3 finding 8: a malformed report
+        claiming MORE covered than total (e.g. 2/1) must not compute a
+        ratio above 1.0 and pass by accident.
+
+        GIVEN supplier_universe_covered=2, supplier_universe_total=1 (and a
+        passing Commons universe)
+        WHEN it is loaded
+        THEN `passed` is False -- `0 <= covered <= total` is enforced before
+        the ratio is ever computed."""
+        path = tmp_path / "coverage_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "supplier_universe_covered": 2,
+                    "supplier_universe_total": 1,
+                    "commons_universe_covered": 4057,
+                    "commons_universe_total": 4057,
+                }
+            ),
+            encoding="utf-8",
+        )
+        gate = load_coverage_gate(path)
+        assert gate.supplier_universe_passed is False
+        assert gate.passed is False
+
+    def test_binding_mismatch_fails_closed_to_the_default(self, tmp_path):
+        """ADVERSARIAL TEST -- Severity 3 finding 10: a gate measured against
+        a DIFFERENT graph/code/manifest state must never silently authorize
+        the current run (spec A2.4.5).
+
+        GIVEN a coverage gate report recording one `graph_hash` and a
+        `GateBinding` for the CURRENT run recording a different one, even
+        though the report's own counts would otherwise pass
+        WHEN it is loaded with that binding
+        THEN the result is the all-False default, exactly as if the file
+        were missing."""
+        path = tmp_path / "coverage_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "supplier_universe_covered": 100,
+                    "supplier_universe_total": 100,
+                    "commons_universe_covered": 4057,
+                    "commons_universe_total": 4057,
+                    "code_commit": "abc123",
+                    "graph_hash": "old-graph-hash",
+                    "manifest_hash": "old-manifest-hash",
+                }
+            ),
+            encoding="utf-8",
+        )
+        current_binding = GateBinding(
+            code_commit="abc123", graph_hash="new-graph-hash", manifest_hash="old-manifest-hash"
+        )
+        gate = load_coverage_gate(path, binding=current_binding)
+        assert gate.passed is False
+
+    def test_binding_match_passes_through_the_recorded_counts(self, tmp_path):
+        """GIVEN a coverage gate report whose recorded code_commit/graph_hash/
+        manifest_hash all match the CURRENT run's binding
+        WHEN it is loaded with that binding
+        THEN the recorded counts are used and `passed` reflects them
+        normally -- binding verification does not suppress a genuinely
+        matching gate."""
+        path = tmp_path / "coverage_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "supplier_universe_covered": 100,
+                    "supplier_universe_total": 100,
+                    "commons_universe_covered": 4057,
+                    "commons_universe_total": 4057,
+                    "code_commit": "abc123",
+                    "graph_hash": "graph-hash",
+                    "manifest_hash": "manifest-hash",
+                }
+            ),
+            encoding="utf-8",
+        )
+        current_binding = GateBinding(
+            code_commit="abc123", graph_hash="graph-hash", manifest_hash="manifest-hash"
+        )
+        gate = load_coverage_gate(path, binding=current_binding)
+        assert gate.passed is True
+
 
 class TestLoadStratumGates:
     """Spec A2.4.3: per-material-stratum gates are measured by a separate
@@ -1265,6 +1831,218 @@ class TestLoadStratumGates:
         assert gates[STRATUM_CH_OFFICER].retrieval_passed is True
         assert gates[STRATUM_CH_OFFICER].temporal_passed is False
         assert gates[STRATUM_CH_OFFICER].passed is False
+
+    def test_recovered_greater_than_total_never_passes(self, tmp_path):
+        """ADVERSARIAL TEST -- Severity 3 finding 8: a malformed report
+        claiming 2/1 retrieval must not pass via a >1.0 ratio.
+
+        GIVEN retrieval_recovered=2, retrieval_total=1 (temporal fully
+        passing)
+        WHEN it is loaded
+        THEN `retrieval_passed` and `passed` are both False."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_COMMONS: {
+                        "available": True,
+                        "retrieval_recovered": 2,
+                        "retrieval_total": 1,
+                        "temporal_recovered": 10,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_COMMONS].retrieval_passed is False
+        assert gates[STRATUM_COMMONS].passed is False
+
+    def test_quoted_string_false_is_not_truthy(self, tmp_path):
+        """ADVERSARIAL TEST -- Severity 3 finding 8: a malformed report that
+        writes `"available": "false"` (a quoted STRING) instead of the JSON
+        literal `false` must not become truthy via bare `bool(...)` -- any
+        non-empty Python string is truthy, so `bool("false")` is `True`.
+
+        GIVEN a stratum entry with `"available": "false"` (string, not JSON
+        boolean) and otherwise-passing counts
+        WHEN it is loaded
+        THEN `available` is False and `passed` is False -- the malformed
+        report must not silently authorize the stratum."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_COMMONS: {
+                        "available": "false",
+                        "retrieval_recovered": 10,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 10,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_COMMONS].available is False
+        assert gates[STRATUM_COMMONS].passed is False
+
+    def test_quoted_string_true_is_still_recognised(self, tmp_path):
+        """GIVEN a stratum entry with `"available": "true"` (string) and
+        otherwise-passing counts
+        WHEN it is loaded
+        THEN `available` is True -- the fix rejects the FALSE case, not
+        strings in general."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    STRATUM_COMMONS: {
+                        "available": "true",
+                        "retrieval_recovered": 10,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 10,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        gates = load_stratum_gates(path)
+        assert gates[STRATUM_COMMONS].available is True
+        assert gates[STRATUM_COMMONS].passed is True
+
+    def test_binding_mismatch_fails_every_stratum_closed(self, tmp_path):
+        """ADVERSARIAL TEST -- Severity 3 finding 10: a stratum-gates report
+        measured against a DIFFERENT manifest must not authorize the
+        CURRENT run.
+
+        GIVEN a report with passing counts but a `manifest_hash` that does
+        not match the current binding
+        WHEN it is loaded with that binding
+        THEN every stratum defaults to unavailable, exactly as if the file
+        were missing."""
+        path = tmp_path / "stratum_gates.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "code_commit": "abc123",
+                    "graph_hash": "graph-hash",
+                    "manifest_hash": "old-manifest-hash",
+                    STRATUM_COMMONS: {
+                        "available": True,
+                        "retrieval_recovered": 10,
+                        "retrieval_total": 10,
+                        "temporal_recovered": 10,
+                        "temporal_total": 10,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        current_binding = GateBinding(
+            code_commit="abc123", graph_hash="graph-hash", manifest_hash="new-manifest-hash"
+        )
+        gates = load_stratum_gates(path, binding=current_binding)
+        assert all(not g.passed for g in gates.values())
+        assert gates[STRATUM_COMMONS].available is False
+
+
+def _sealed_cohort_manifest_result() -> ManifestLoadResult:
+    """A `ManifestLoadResult` whose cases are EXACTLY the sealed 20 (spec
+    A2.7.1) -- rows are empty since `validate_locked_protocol` never reads
+    them, only `company_number`."""
+    cases = [GoldCase(company_number=cn, rows=()) for cn in SEALED_COHORT_V2_COMPANY_NUMBERS]
+    return ManifestLoadResult(cases=cases)
+
+
+class TestValidateLockedProtocol:
+    """Spec A2.4.5 freeze protocol (Severity 3 finding 9): the runner must
+    refuse to silently score a manifest that is not the sealed cohort, or a
+    hop budget that is not the locked two-hop setting."""
+
+    def test_sealed_cohort_at_locked_hops_has_no_violations(self):
+        """GIVEN the exact sealed 20-case cohort and the locked hop budget
+        WHEN the locked protocol is validated
+        THEN there are no violations."""
+        violations = validate_locked_protocol(
+            _sealed_cohort_manifest_result(), max_hops=LOCKED_MAX_HOPS
+        )
+        assert violations == []
+
+    def test_non_locked_max_hops_is_a_violation(self):
+        """ADVERSARIAL TEST -- the sealed cohort case set is correct, but the
+        hop budget has been widened past the frozen setting.
+
+        GIVEN the sealed cohort and a hop budget one past the locked value
+        WHEN the locked protocol is validated
+        THEN a violation is reported naming the hop-budget mismatch."""
+        violations = validate_locked_protocol(
+            _sealed_cohort_manifest_result(), max_hops=LOCKED_MAX_HOPS + 1
+        )
+        assert len(violations) == 1
+        assert "max-hops" in violations[0]
+
+    def test_a_different_case_set_is_a_violation(self):
+        """ADVERSARIAL TEST -- the runner is pointed at the 24-case POOL (or
+        any other subset) instead of the sealed 20.
+
+        GIVEN a manifest whose cases are the 24-case pool (the sealed 20
+        plus the 4-case reserve list) and max_hops == 2
+        WHEN the locked protocol is validated
+        THEN a violation is reported naming the cohort mismatch -- the
+        runner must never silently score the pool as if it were the sealed
+        cohort."""
+        pool = set(SEALED_COHORT_V2_COMPANY_NUMBERS) | {"SC485060", "06852145", "01093827"}
+        cases = [GoldCase(company_number=cn, rows=()) for cn in pool]
+        violations = validate_locked_protocol(ManifestLoadResult(cases=cases), max_hops=2)
+        assert len(violations) == 1
+        assert "SEALED COHORT" in violations[0]
+
+    def test_both_violations_are_reported_together(self):
+        """GIVEN a manifest with neither the sealed case set nor the locked
+        hop budget
+        WHEN the locked protocol is validated
+        THEN both violations are reported, not just the first one found."""
+        cases = [GoldCase(company_number="00000001", rows=())]
+        violations = validate_locked_protocol(ManifestLoadResult(cases=cases), max_hops=5)
+        assert len(violations) == 2
+
+
+class TestComputeManifestHash:
+    def test_same_content_produces_the_same_hash(self, tmp_path):
+        """GIVEN two files with identical byte content
+        WHEN each is hashed
+        THEN the hashes are equal -- the gate-binding check must be a pure
+        function of content, not of path or mtime."""
+        path_a = tmp_path / "a.csv"
+        path_b = tmp_path / "b.csv"
+        path_a.write_text("case_id,award_date\nSYNTH-1,2021-01-01\n", encoding="utf-8")
+        path_b.write_text("case_id,award_date\nSYNTH-1,2021-01-01\n", encoding="utf-8")
+        assert compute_manifest_hash(path_a) == compute_manifest_hash(path_b)
+
+    def test_different_content_produces_a_different_hash(self, tmp_path):
+        """GIVEN two files with different byte content
+        WHEN each is hashed
+        THEN the hashes differ -- otherwise a stale manifest could pass
+        binding verification against a changed one."""
+        path_a = tmp_path / "a.csv"
+        path_b = tmp_path / "b.csv"
+        path_a.write_text("case_id,award_date\nSYNTH-1,2021-01-01\n", encoding="utf-8")
+        path_b.write_text("case_id,award_date\nSYNTH-2,2022-02-02\n", encoding="utf-8")
+        assert compute_manifest_hash(path_a) != compute_manifest_hash(path_b)
+
+    def test_matches_a_plain_sha256_of_the_bytes(self, tmp_path):
+        """GIVEN a file's content
+        WHEN it is hashed
+        THEN the result is the plain sha256 hex digest of its bytes -- no
+        hidden normalisation that could mask a real content change."""
+        path = tmp_path / "a.csv"
+        content = b"case_id,award_date\nSYNTH-1,2021-01-01\n"
+        path.write_bytes(content)
+        assert compute_manifest_hash(path) == hashlib.sha256(content).hexdigest()
 
 
 @pytest.mark.django_db
@@ -1374,11 +2152,21 @@ class TestPathStrata:
         assert path_strata([edge_same_as, edge_officer]) == frozenset({STRATUM_CH_OFFICER})
 
 
-class TestFilterByPassingStratum:
-    """Spec A2.4.4: a recovered case must belong to at least one PASSING
-    stratum to count toward CONFIRMED/PARTIAL/REFUTED."""
+class TestPerPathStratumQualification:
+    """Spec A2.4.4, Severity 1 finding 3 (adversarial review): qualification
+    is decided PER PATH via `CaseEvaluation.path_evidences`, never by
+    unioning strata (or taint) across paths. Replaces the retired
+    `filter_by_passing_stratum`, which operated on a case-wide `strata`
+    union and could not tell a single dual-stratum path from two
+    independent single-stratum ones.
 
-    def _case(self, strata: frozenset[str], key: str = "01234567") -> CaseEvaluation:
+    The corrected line-1422 test below (`...quali_because_commons_passes`)
+    is the one the independent review flagged as endorsing the WRONG
+    behaviour -- it now asserts the OPPOSITE outcome."""
+
+    def _case(
+        self, path_evidences: tuple[PathEvidence, ...], key: str = "01234567"
+    ) -> CaseEvaluation:
         return CaseEvaluation(
             case_key=key,
             company_number=key,
@@ -1389,48 +2177,114 @@ class TestFilterByPassingStratum:
             status="recovered",
             source_separation="ok",
             row_evaluations=[],
-            strata=strata,
+            path_evidences=path_evidences,
         )
 
     def test_case_touching_a_passing_stratum_qualifies(self):
-        """GIVEN a case whose evidence touches the Commons stratum, which
-        passes
-        WHEN cases are filtered by passing stratum
+        """GIVEN a case whose single clean path touches only the Commons
+        stratum, which passes
+        WHEN recovered cases are classified
         THEN it is qualifying, not instrument-limited."""
-        case = self._case(frozenset({STRATUM_COMMONS}))
+        case = self._case((PathEvidence(taint="clean", strata=frozenset({STRATUM_COMMONS})),))
         gates = _all_passing_stratum_gates()
-        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
-        assert qualifying == [case]
-        assert instrument_limited == []
+        split = classify_recovered_cases([case], gates)
+        assert split.qualifying == [case]
+        assert split.instrument_limited == []
 
     def test_case_touching_only_an_unsupported_stratum_is_instrument_limited(self):
         """ADVERSARIAL TEST -- a case recovered ONLY through Lords evidence
         while Lords remains unavailable.
 
-        GIVEN a case whose ONLY evidence is the Lords stratum, and Lords is
-        unavailable
-        WHEN cases are filtered by passing stratum
+        GIVEN a case whose ONLY clean path touches the Lords stratum, and
+        Lords is unavailable
+        WHEN recovered cases are classified
         THEN it is instrument-limited, NOT qualifying -- it must never
         count toward CONFIRMED/PARTIAL/REFUTED (spec A2.4.4)."""
-        case = self._case(frozenset({STRATUM_LORDS}))
+        case = self._case((PathEvidence(taint="clean", strata=frozenset({STRATUM_LORDS})),))
         gates = _all_passing_stratum_gates()
         gates[STRATUM_LORDS] = StratumGate(available=False)
-        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
-        assert qualifying == []
-        assert instrument_limited == [case]
+        split = classify_recovered_cases([case], gates)
+        assert split.qualifying == []
+        assert split.instrument_limited == [case]
 
-    def test_case_touching_both_a_passing_and_unsupported_stratum_qualifies(self):
-        """GIVEN a case whose evidence touches BOTH Commons (passing) and
-        Lords (unavailable)
-        WHEN cases are filtered by passing stratum
-        THEN it qualifies -- spec A2.4.4: an unvalidated Lords gate must not
-        erase a genuine, independently verified Commons recovery."""
-        case = self._case(frozenset({STRATUM_COMMONS, STRATUM_LORDS}))
+    def test_a_single_path_spanning_a_passing_and_unsupported_stratum_does_not_qualify(self):
+        """ADVERSARIAL TEST, CORRECTED (Severity 1 finding 3a) -- this is the
+        test the independent review found asserting the WRONG behaviour at
+        the old `filter_by_passing_stratum`'s test module line 1422.
+
+        GIVEN a case whose recovery rests on exactly ONE clean path, and
+        that SAME single path touches BOTH Commons (passing) and Lords
+        (unavailable)
+        WHEN recovered cases are classified
+        THEN it does NOT qualify -- `passes_stratum_gates` requires EVERY
+        stratum the path touches to pass (a subset check, not an
+        intersection). A single path that also depends on an unvalidated
+        stratum must never qualify merely because it ALSO touches a
+        validated one; only an INDEPENDENT single-stratum path may qualify
+        on that stratum alone (see the two tests above)."""
+        case = self._case(
+            (PathEvidence(taint="clean", strata=frozenset({STRATUM_COMMONS, STRATUM_LORDS})),)
+        )
         gates = _all_passing_stratum_gates()
         gates[STRATUM_LORDS] = StratumGate(available=False)
-        qualifying, instrument_limited = filter_by_passing_stratum([case], gates)
-        assert qualifying == [case]
-        assert instrument_limited == []
+        split = classify_recovered_cases([case], gates)
+        assert split.qualifying == []
+        assert split.instrument_limited == [case]
+
+    def test_two_independent_single_stratum_clean_paths_both_qualify(self):
+        """GIVEN a case with TWO SEPARATE clean paths, one touching only
+        Commons (passing) and one touching only Lords (unavailable)
+        WHEN recovered cases are classified
+        THEN it qualifies via the independent Commons-only path -- spec
+        A2.4.4: 'an unvalidated Lords gate must not erase a genuine,
+        independently verified Commons recovery'. This is the ONLY way two
+        strata combine into a qualifying case: as two independent paths,
+        never as one path spanning both (contrast the test above)."""
+        case = self._case(
+            (
+                PathEvidence(taint="clean", strata=frozenset({STRATUM_COMMONS})),
+                PathEvidence(taint="clean", strata=frozenset({STRATUM_LORDS})),
+            )
+        )
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+        split = classify_recovered_cases([case], gates)
+        assert split.qualifying == [case]
+
+    def test_clean_unsupported_lords_path_cannot_be_rescued_by_a_tainted_passing_commons_path(
+        self,
+    ):
+        """ADVERSARIAL TEST, CORRECTED (Severity 1 finding 3b) -- the
+        "worse" defect the independent review described: a case combining a
+        clean-but-unsupported-stratum path with a circular-but-passing-
+        stratum path must never read as globally clean AND globally
+        passing-stratum-touching, because NO INDIVIDUAL path satisfies both.
+
+        GIVEN a case with two paths: one CLEAN but Lords-only (unavailable),
+        one TAINTED (proven circular, SS3) but Commons-only (passing)
+        WHEN recovered cases are classified
+        THEN it does NOT qualify -- the clean path's stratum never passes,
+        and the passing-stratum path is proven circular. Under the retired
+        case-level union (source_separation "ok" because SOME row was
+        clean, strata = {Commons, Lords} because BOTH paths' strata were
+        pooled), this case would have wrongly read as qualifying; per-path
+        evaluation refuses it."""
+        case = self._case(
+            (
+                PathEvidence(taint="clean", strata=frozenset({STRATUM_LORDS})),
+                PathEvidence(taint="tainted", strata=frozenset({STRATUM_COMMONS})),
+            )
+        )
+        gates = _all_passing_stratum_gates()
+        gates[STRATUM_LORDS] = StratumGate(available=False)
+        split = classify_recovered_cases([case], gates)
+        assert split.qualifying == []
+        # A clean (if unsupported) path exists, so this is reported as
+        # instrument_limited -- not proven circular (one path IS clean) and
+        # not merely unverifiable (one path IS positively verified).
+        assert split.instrument_limited == [case]
+        assert split.circular == []
+        assert split.unverifiable == []
 
 
 @pytest.mark.django_db

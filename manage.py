@@ -6,7 +6,12 @@ import sys
 
 
 def main() -> None:
-    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")
+    # Default to the real PostgreSQL target (config.settings.base), not the
+    # SQLite dev override. A bare `manage.py <cmd>` used to silently default
+    # to config.settings.dev (SQLite) and query an empty local file with no
+    # error — the same footgun scripts/*.py were fixed for previously. Opt
+    # into SQLite explicitly: `DJANGO_SETTINGS_MODULE=config.settings.dev`.
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
     try:
         from django.core.management import execute_from_command_line
     except ImportError as exc:

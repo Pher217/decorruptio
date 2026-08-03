@@ -467,6 +467,36 @@ def _extract_counterparty_name(
     return None, None, False, False
 
 
+def _canonical_company_entity(company: Company) -> Entity:
+    """The Companies House node for a company, creating it if absent.
+
+    Mirrors ch_appointments._canonical_company_entity. A plain
+    ``get_or_create(company_number=...)`` raises MultipleObjectsReturned here:
+    GLEIF can hold a distinct Entity for the same company under
+    registry_scheme="GLEIF-LEI" that also carries this company_number —
+    those are legitimately separate claims and must never be merged
+    (ADR-006, duplicate over merge). Resolving on registry_scheme="GB-COH" +
+    registry_id is unique by DB constraint, so this can never be ambiguous.
+    """
+    coh = Entity.objects.filter(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+    ).first()
+    if coh:
+        return coh
+    entity, _ = Entity.objects.get_or_create(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+        defaults={
+            "name": company.company_name,
+            "company_number": company.company_number,
+        },
+    )
+    return entity
+
+
 def _resolve_counterparty_entity(
     name: str, company_number: str | None, interest_id: int
 ) -> tuple[Entity, float, str, dict[str, Any]] | None:
@@ -485,15 +515,7 @@ def _resolve_counterparty_entity(
         normalised_number = normalise_company_number(company_number)
         company = Company.objects.filter(company_number=normalised_number).first()
         if company:
-            entity, _ = Entity.objects.get_or_create(
-                entity_type="company",
-                company_number=company.company_number,
-                defaults={
-                    "name": company.company_name,
-                    "registry_scheme": "GB-COH",
-                    "registry_id": company.company_number,
-                },
-            )
+            entity = _canonical_company_entity(company)
             return entity, 1.0, "identifier", {}
         entity, _ = Entity.objects.get_or_create(
             entity_type="regulated_entity",
@@ -510,15 +532,7 @@ def _resolve_counterparty_entity(
     match_count = matches.count()
     if match_count == 1:
         company = matches.get()
-        entity, _ = Entity.objects.get_or_create(
-            entity_type="company",
-            company_number=company.company_number,
-            defaults={
-                "name": company.company_name,
-                "registry_scheme": "GB-COH",
-                "registry_id": company.company_number,
-            },
-        )
+        entity = _canonical_company_entity(company)
         return entity, 0.9, "exact_name", {}
     if match_count >= 2:
         return None
@@ -570,89 +584,102 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
     skipped_private_individual = 0
     skipped_unclassified_counterparty = 0
     skipped_no_counterparty = 0
+    ambiguous_company_number = 0
     inverted_interval = 0
     total = 0
 
-    with transaction.atomic():
-        for item in items:
-            category_name = (item.get("category") or {}).get("name") or ""
-            member = item.get("member")
-            if _is_family_category(category_name):
-                # Family-member categories carry the relative's own details,
-                # not the member's public-function interest (ADR-004 D1).
-                total += 1
-                skipped_family += 1
+    for item in items:
+        category_name = (item.get("category") or {}).get("name") or ""
+        member = item.get("member")
+        if _is_family_category(category_name):
+            # Family-member categories carry the relative's own details,
+            # not the member's public-function interest (ADR-004 D1).
+            total += 1
+            skipped_family += 1
+            continue
+        if member is None:
+            total += 1
+            skipped_no_counterparty += 1
+            continue
+
+        member_entity = _get_or_create_member_entity(member)
+
+        for leaf in _leaf_interests(item):
+            total += 1
+            fields = leaf.get("fields") or []
+            values = _fields_by_name(fields)
+
+            name, company_number, is_private, is_unclassified = _extract_counterparty_name(values)
+            if is_private:
+                skipped_private_individual += 1
                 continue
-            if member is None:
-                total += 1
+            if is_unclassified:
+                skipped_unclassified_counterparty += 1
+                continue
+            if not name:
                 skipped_no_counterparty += 1
                 continue
 
-            member_entity = _get_or_create_member_entity(member)
+            interest_id = leaf["id"]
 
-            for leaf in _leaf_interests(item):
-                total += 1
-                fields = leaf.get("fields") or []
-                values = _fields_by_name(fields)
+            # Commit per interest, not the whole dump in one transaction: a
+            # giant transaction over every item/leaf holds locks for the
+            # entire ingest and loses everything already processed if one
+            # row (or the process) dies partway through.
+            try:
+                with transaction.atomic():
+                    resolved = _resolve_counterparty_entity(name, company_number, interest_id)
+                    if resolved is None:
+                        unmatched_counterparty += 1
+                        continue
+                    counterparty_entity, confidence, method, resolve_properties = resolved
 
-                name, company_number, is_private, is_unclassified = _extract_counterparty_name(
-                    values
-                )
-                if is_private:
-                    skipped_private_individual += 1
-                    continue
-                if is_unclassified:
-                    skipped_unclassified_counterparty += 1
-                    continue
-                if not name:
-                    skipped_no_counterparty += 1
-                    continue
+                    amount_cents, currency, money_properties = _extract_money(fields)
+                    valid_from = _parse_date(leaf.get("registrationDate"))
+                    valid_to = _parse_date(values.get("EndDate"))
 
-                interest_id = leaf["id"]
-                resolved = _resolve_counterparty_entity(name, company_number, interest_id)
-                if resolved is None:
-                    unmatched_counterparty += 1
-                    continue
-                counterparty_entity, confidence, method, resolve_properties = resolved
+                    properties = {**resolve_properties, **money_properties}
+                    if valid_to is not None and valid_from is not None and valid_to < valid_from:
+                        # An inverted interval is bad data, not a real claim —
+                        # never store it as if it were valid.
+                        inverted_interval += 1
+                        properties["end_date_before_registration_date"] = valid_to.isoformat()
+                        valid_to = None
 
-                amount_cents, currency, money_properties = _extract_money(fields)
-                valid_from = _parse_date(leaf.get("registrationDate"))
-                valid_to = _parse_date(values.get("EndDate"))
+                    # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                    edge, _ = Edge.objects.get_or_create(
+                        edge_type="declared_interest",
+                        source_entity=member_entity,
+                        target_entity=counterparty_entity,
+                        valid_from=valid_from,
+                        valid_to=valid_to,
+                        defaults={
+                            "amount_cents": amount_cents,
+                            "currency": currency,
+                            "properties": properties,
+                        },
+                    )
 
-                properties = {**resolve_properties, **money_properties}
-                if valid_to is not None and valid_from is not None and valid_to < valid_from:
-                    # An inverted interval is bad data, not a real claim —
-                    # never store it as if it were valid.
-                    inverted_interval += 1
-                    properties["end_date_before_registration_date"] = valid_to.isoformat()
-                    valid_to = None
+                    # Attestation = THE EVIDENCE
+                    Attestation.objects.get_or_create(
+                        edge=edge,
+                        source_name=SOURCE_NAME,
+                        source_reference=str(interest_id),
+                        defaults={
+                            "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
+                            "match_confidence": confidence,
+                            "match_method": method,
+                        },
+                    )
+            except Entity.MultipleObjectsReturned:
+                # A company_number can legitimately resolve to 2+ Entity rows
+                # under different registry schemes (GB-COH, GLEIF-LEI —
+                # ADR-006 duplicate-over-merge). Count and move on rather
+                # than losing the whole run to one row.
+                ambiguous_company_number += 1
+                continue
 
-                # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
-                edge, _ = Edge.objects.get_or_create(
-                    edge_type="declared_interest",
-                    source_entity=member_entity,
-                    target_entity=counterparty_entity,
-                    valid_from=valid_from,
-                    valid_to=valid_to,
-                    defaults={
-                        "amount_cents": amount_cents,
-                        "currency": currency,
-                        "properties": properties,
-                    },
-                )
-
-                # Attestation = THE EVIDENCE
-                Attestation.objects.get_or_create(
-                    edge=edge,
-                    source_name=SOURCE_NAME,
-                    source_reference=str(interest_id),
-                    defaults={
-                        "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    },
-                )
-                matched += 1
+            matched += 1
 
     return {
         "matched": matched,
@@ -661,6 +688,7 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
         "skipped_private_individual": skipped_private_individual,
         "skipped_unclassified_counterparty": skipped_unclassified_counterparty,
         "skipped_no_counterparty": skipped_no_counterparty,
+        "ambiguous_company_number": ambiguous_company_number,
         "inverted_interval": inverted_interval,
         "total": total,
     }

@@ -355,3 +355,143 @@ class TestLordsInterestsIngest:
         # Attestations are also not duplicated
         total_attestations = Attestation.objects.filter(edge__source_entity=lord).count()
         assert total_attestations == 2
+
+    def test_wayback_attestation_observed_at_is_capture_date_not_today(self, tmp_path):
+        """A Wayback-sourced attestation's observed_at is the capture date, not download time.
+
+        Regression test: observed_at was previously always set from
+        provenance['retrieved_at'] (today's download time), even for a
+        Wayback capture of a historical register edition — destroying the
+        very evidence pre-award snapshots exist to provide.
+        """
+        from datetime import UTC as dt_UTC
+        from datetime import datetime
+
+        from uncorrupt.staging.companies_house import _normalise_name
+
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        _write_page(tmp_path, 1, SAMPLE_HTML)
+        _write_provenance(tmp_path, wayback_timestamp="20201130")
+
+        ingest_lords_register(tmp_path)
+
+        lord = Entity.objects.get(registry_id="3898")
+        microlink = Entity.objects.get(name="Microlink PC (UK) Ltd")
+        edge = Edge.objects.get(source_entity=lord, target_entity=microlink)
+        att = edge.attestations.first()
+        assert att.observed_at == datetime(2020, 11, 30, tzinfo=dt_UTC)
+        assert att.observed_at.date() != datetime.now(dt_UTC).date()
+
+    def test_two_wayback_snapshots_of_same_interest_create_two_attestations(self, tmp_path):
+        """Two different Wayback snapshots of the same interest yield 2 Attestations, not 1.
+
+        Regression test: Attestation.source_reference was previously keyed
+        only on interest_key (no snapshot identity), so re-ingesting a
+        second historical snapshot of a still-registered interest collapsed
+        onto the first attestation instead of recording separate evidence.
+        """
+        from uncorrupt.staging.companies_house import _normalise_name
+
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+
+        snapshot_1 = tmp_path / "snap1"
+        snapshot_1.mkdir()
+        _write_page(snapshot_1, 1, SAMPLE_HTML)
+        _write_provenance(snapshot_1, content_hash="hash1", wayback_timestamp="20201130")
+        ingest_lords_register(snapshot_1)
+
+        snapshot_2 = tmp_path / "snap2"
+        snapshot_2.mkdir()
+        _write_page(snapshot_2, 1, SAMPLE_HTML)
+        _write_provenance(snapshot_2, content_hash="hash2", wayback_timestamp="20220615")
+        ingest_lords_register(snapshot_2)
+
+        lord = Entity.objects.get(registry_id="3898")
+        microlink = Entity.objects.get(name="Microlink PC (UK) Ltd")
+        # Same claim -> one Edge, not duplicated across snapshots
+        assert Edge.objects.filter(source_entity=lord, target_entity=microlink).count() == 1
+        edge = Edge.objects.get(source_entity=lord, target_entity=microlink)
+        assert edge.attestations.count() == 2
+        observed_dates = sorted(a.observed_at.date().isoformat() for a in edge.attestations.all())
+        assert observed_dates == ["2020-11-30", "2022-06-15"]
+
+    def test_company_number_with_gleif_and_coh_entities_resolves_to_coh(self, tmp_path):
+        """A company_number shared by GB-COH and GLEIF-LEI Entities resolves to GB-COH.
+
+        Regression test: Entity.objects.get_or_create(entity_type="company",
+        company_number=...) without registry_scheme raised
+        MultipleObjectsReturned whenever GLEIF held a separate Entity for
+        the same company (ADR-006: duplicate over merge, never collapsed).
+        """
+        from uncorrupt.staging.companies_house import _normalise_name
+
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GB-COH",
+            registry_id="01234567",
+            name="Microlink PC (UK) Ltd",
+            company_number="01234567",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GLEIF-LEI",
+            registry_id="529900ABCDEF1234567",
+            name="Microlink PC (UK) Ltd",
+            company_number="01234567",
+        )
+        _write_page(tmp_path, 1, SAMPLE_HTML)
+        _write_provenance(tmp_path)
+
+        summary = ingest_lords_register(tmp_path)
+
+        assert summary["ambiguous_company_number"] == 0
+        coh_entity = Entity.objects.get(registry_scheme="GB-COH", registry_id="01234567")
+        lord = Entity.objects.get(registry_id="3898")
+        assert Edge.objects.filter(source_entity=lord, target_entity=coh_entity).exists()
+        # The GLEIF entity must still exist untouched — never merged
+        assert Entity.objects.filter(
+            registry_scheme="GLEIF-LEI", registry_id="529900ABCDEF1234567"
+        ).exists()
+
+    def test_ambiguous_company_number_counter_increments_run_continues(self, tmp_path, monkeypatch):
+        """A MultipleObjectsReturned during resolution is counted, not fatal to the run.
+
+        Simulates the defensive catch around per-interest resolution: even
+        if resolution raises Entity.MultipleObjectsReturned, the ingest
+        counts it and keeps processing rather than losing the whole run to
+        one bad row (81 real hits killed one prior ingest entirely).
+        """
+        import uncorrupt.graph.lords_interests as lords_interests_module
+        from uncorrupt.staging.companies_house import _normalise_name
+
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        _write_page(tmp_path, 1, SAMPLE_HTML)
+        _write_provenance(tmp_path)
+
+        def _raise_ambiguous(*args, **kwargs):
+            raise Entity.MultipleObjectsReturned("simulated ambiguity")
+
+        monkeypatch.setattr(lords_interests_module, "_resolve_counterparty", _raise_ambiguous)
+
+        summary = ingest_lords_register(tmp_path)
+
+        assert summary["ambiguous_company_number"] == 2
+        assert summary["matched"] == 0
+        assert summary["total_members"] == 2

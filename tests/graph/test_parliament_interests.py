@@ -509,6 +509,101 @@ class TestParliamentInterestsIngest:
             edge.properties["value_band"] == "(i) Shareholdings: over 15% of issued share capital"
         )
 
+    def test_company_number_with_gleif_and_coh_entities_resolves_to_coh(self, tmp_path):
+        """A company_number shared by GB-COH and GLEIF-LEI Entities resolves to GB-COH.
+
+        Regression test: Entity.objects.get_or_create(entity_type="company",
+        company_number=...) without registry_scheme raised
+        MultipleObjectsReturned whenever GLEIF held a separate Entity for
+        the same company (ADR-006: duplicate over merge, never collapsed).
+        """
+        Company.objects.create(
+            company_number="12410514",
+            company_name="PPE Medpro Ltd",
+            normalised_name="PPE MEDPRO LTD",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GB-COH",
+            registry_id="12410514",
+            name="PPE Medpro Ltd",
+            company_number="12410514",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GLEIF-LEI",
+            registry_id="529900XYZ1234567890A",
+            name="PPE Medpro Ltd",
+            company_number="12410514",
+        )
+        items = [
+            _interest(
+                16217,
+                "Donations and other support (including loans) for activities as an MP",
+                [
+                    _field("DonorCompanyName", "PPE Medpro Ltd"),
+                    _field("DonorCompanyIdentifier", "12410514"),
+                    _field("DonorStatus", "Company"),
+                    _field("Value", "10000.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["ambiguous_company_number"] == 0
+        assert summary["matched"] == 1
+        coh_entity = Entity.objects.get(registry_scheme="GB-COH", registry_id="12410514")
+        edge = Attestation.objects.get(source_reference="16217").edge
+        assert edge.target_entity_id == coh_entity.id
+        # The GLEIF entity must still exist untouched — never merged
+        assert Entity.objects.filter(
+            registry_scheme="GLEIF-LEI", registry_id="529900XYZ1234567890A"
+        ).exists()
+
+    def test_ambiguous_company_number_counter_increments_run_continues(self, tmp_path, monkeypatch):
+        """A MultipleObjectsReturned during resolution is counted, not fatal to the run.
+
+        Simulates the defensive catch around per-interest resolution: even
+        if resolution raises Entity.MultipleObjectsReturned, the ingest
+        counts it and keeps processing rather than losing the whole run to
+        one bad row.
+        """
+        import uncorrupt.graph.parliament_interests as parliament_interests_module
+
+        Company.objects.create(
+            company_number="12410514",
+            company_name="PPE Medpro Ltd",
+            normalised_name="PPE MEDPRO LTD",
+        )
+        items = [
+            _interest(
+                16217,
+                "Donations and other support (including loans) for activities as an MP",
+                [
+                    _field("DonorCompanyName", "PPE Medpro Ltd"),
+                    _field("DonorCompanyIdentifier", "12410514"),
+                    _field("DonorStatus", "Company"),
+                    _field("Value", "10000.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        def _raise_ambiguous(*args, **kwargs):
+            raise Entity.MultipleObjectsReturned("simulated ambiguity")
+
+        monkeypatch.setattr(
+            parliament_interests_module, "_resolve_counterparty_entity", _raise_ambiguous
+        )
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["ambiguous_company_number"] == 1
+        assert summary["matched"] == 0
+        assert summary["total"] == 1
+
 
 class TestParliamentInterestsFetch:
     def test_fetch_uses_valid_sort_order(self, tmp_path, monkeypatch):

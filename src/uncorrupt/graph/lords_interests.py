@@ -110,6 +110,36 @@ def _clean_wayback_url(url: str) -> str:
     return re.sub(r"^https://web\.archive\.org/web/\d+/(?:im_|cs_)?(?:https?://)?", "", url)
 
 
+# Wayback timestamps are a date-time prefix of up to 14 digits
+# (YYYYMMDDhhmmss); callers may pass a shorter prefix (e.g. "20201130") and
+# let Wayback resolve to the nearest capture. Longest-first so a full
+# timestamp isn't mistaken for a shorter one.
+_WAYBACK_TS_FORMATS = (
+    (14, "%Y%m%d%H%M%S"),
+    (12, "%Y%m%d%H%M"),
+    (10, "%Y%m%d%H"),
+    (8, "%Y%m%d"),
+    (6, "%Y%m"),
+    (4, "%Y"),
+)
+
+
+def _parse_wayback_timestamp(wayback_timestamp: str) -> datetime | None:
+    """Parse a Wayback Machine timestamp into the capture's UTC instant.
+
+    Returns None if the string doesn't match any recognised Wayback
+    timestamp length/format — callers should fall back to another signal
+    rather than raise, since a malformed timestamp shouldn't crash a run.
+    """
+    for length, fmt in _WAYBACK_TS_FORMATS:
+        if len(wayback_timestamp) == length:
+            try:
+                return datetime.strptime(wayback_timestamp, fmt).replace(tzinfo=UTC)
+            except ValueError:
+                return None
+    return None
+
+
 def _parse_ceased_date(text: str) -> str | None:
     """Extract '(interest ceased DD Month YYYY)' from text, return ISO date."""
     m = _CEASED_RE.search(text)
@@ -282,6 +312,36 @@ def _scoped_registry_id(scope: str, name: str) -> str:
     return f"{scope[:64]}:{digest}"
 
 
+def _canonical_company_entity(company: Company) -> Entity:
+    """The Companies House node for a company, creating it if absent.
+
+    Mirrors ch_appointments._canonical_company_entity. A plain
+    ``get_or_create(company_number=...)`` raises MultipleObjectsReturned here:
+    GLEIF can hold a distinct Entity for the same company under
+    registry_scheme="GLEIF-LEI" that also carries this company_number —
+    those are legitimately separate claims and must never be merged
+    (ADR-006, duplicate over merge). Resolving on registry_scheme="GB-COH" +
+    registry_id is unique by DB constraint, so this can never be ambiguous.
+    """
+    coh = Entity.objects.filter(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+    ).first()
+    if coh:
+        return coh
+    entity, _ = Entity.objects.get_or_create(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+        defaults={
+            "name": company.company_name,
+            "company_number": company.company_number,
+        },
+    )
+    return entity
+
+
 def _resolve_counterparty(
     name: str, company_number: str | None, interest_key: str
 ) -> tuple[Entity, float, str, dict[str, Any]] | None:
@@ -294,15 +354,7 @@ def _resolve_counterparty(
         normalised_number = normalise_company_number(company_number)
         company = Company.objects.filter(company_number=normalised_number).first()
         if company:
-            entity, _ = Entity.objects.get_or_create(
-                entity_type="company",
-                company_number=company.company_number,
-                defaults={
-                    "name": company.company_name,
-                    "registry_scheme": "GB-COH",
-                    "registry_id": company.company_number,
-                },
-            )
+            entity = _canonical_company_entity(company)
             return entity, 1.0, "identifier", {}
         entity, _ = Entity.objects.get_or_create(
             entity_type="regulated_entity",
@@ -317,15 +369,7 @@ def _resolve_counterparty(
     match_count = matches.count()
     if match_count == 1:
         company = matches.get()
-        entity, _ = Entity.objects.get_or_create(
-            entity_type="company",
-            company_number=company.company_number,
-            defaults={
-                "name": company.company_name,
-                "registry_scheme": "GB-COH",
-                "registry_id": company.company_number,
-            },
-        )
+        entity = _canonical_company_entity(company)
         return entity, 0.9, "exact_name", {}
     if match_count >= 2:
         return None
@@ -506,20 +550,37 @@ def ingest_lords_register(
     provenance_path = html_dir / "provenance.json"
 
     # Parse observed_at from provenance
-    observed_at: datetime | None = None
+    retrieved_at: datetime | None = None
     snapshot_ref: str | None = None
     if provenance_path.exists():
         prov = json.loads(provenance_path.read_text())
-        observed_at = datetime.fromisoformat(prov["retrieved_at"])
+        retrieved_at = datetime.fromisoformat(prov["retrieved_at"])
         snapshot_ref = prov.get("content_hash")
         if wayback_timestamp is None:
             wayback_timestamp = prov.get("wayback_timestamp")
+
+    # observed_at is when the SOURCE published or was captured, never when we
+    # downloaded it. For a Wayback snapshot that is the capture timestamp, not
+    # today's retrieval time — using retrieved_at here silently destroyed the
+    # historical value of re-ingested snapshots (every snapshot of a
+    # still-registered interest collapsed onto one attestation stamped
+    # today). A live (non-Wayback) fetch has no capture date of its own, so it
+    # keeps falling back to retrieved_at.
+    observed_at = _parse_wayback_timestamp(wayback_timestamp) if wayback_timestamp else None
+    if observed_at is None:
+        if wayback_timestamp:
+            logger.warning(
+                "lords register: unparseable wayback_timestamp %r, falling back to retrieved_at",
+                wayback_timestamp,
+            )
+        observed_at = retrieved_at
 
     matched = 0
     unmatched_counterparty = 0
     skipped_private_individual = 0
     skipped_no_counterparty = 0
     skipped_implausible_name = 0
+    ambiguous_company_number = 0
     nil_returns = 0
     total_interests = 0
     total_members = 0
@@ -527,107 +588,131 @@ def ingest_lords_register(
     # Collect all HTML pages
     page_files = sorted(html_dir.glob("page_*.html"))
 
-    with transaction.atomic():
-        for page_file in page_files:
-            html_content = page_file.read_text(encoding="utf-8")
-            members = _parse_lords_page(html_content)
+    for page_file in page_files:
+        html_content = page_file.read_text(encoding="utf-8")
+        members = _parse_lords_page(html_content)
 
-            for member in members:
-                total_members += 1
-                member_entity = _get_or_create_lord_entity(
-                    member["member_id"],
-                    {
-                        "name": member["name"],
-                        "party": member["party"],
-                        "peer_type": member["peer_type"],
-                    },
-                )
+        for member in members:
+            total_members += 1
+            member_entity = _get_or_create_lord_entity(
+                member["member_id"],
+                {
+                    "name": member["name"],
+                    "party": member["party"],
+                    "peer_type": member["peer_type"],
+                },
+            )
 
-                if not member["interests"]:
-                    nil_returns += 1
+            if not member["interests"]:
+                nil_returns += 1
+                continue
+
+            for interest in member["interests"]:
+                total_interests += 1
+                description = interest["description"]
+                category = interest["category"]
+
+                name, company_number, is_private = _extract_counterparty(description)
+
+                # A counterparty "name" longer than this is an extraction
+                # failure, not an organisation — the Lords register is free
+                # text and the extractor sometimes captures a whole sentence.
+                # Creating an Entity from it would both overflow Entity.name
+                # (varchar 500) and pollute the graph with junk nodes, so
+                # skip and count instead. Conservative extraction: prefer
+                # missing a counterparty over inventing one.
+                if name and len(name) > _MAX_COUNTERPARTY_NAME:
+                    skipped_implausible_name += 1
+                    continue
+                if is_private:
+                    skipped_private_individual += 1
+                    continue
+                if not name:
+                    skipped_no_counterparty += 1
                     continue
 
-                for interest in member["interests"]:
-                    total_interests += 1
-                    description = interest["description"]
-                    category = interest["category"]
+                # Bounded at construction: category and counterparty name are free-form
+                # Lords register text. interest_key feeds BOTH registry_id and
+                # Attestation.source_reference (varchar 200), so hash the
+                # variable part rather than embedding it — deterministic, so
+                # re-ingest stays idempotent, and still unique per interest.
+                _key_body = hashlib.sha256(
+                    f"{category}:{_normalise_name(name)}".encode()
+                ).hexdigest()[:32]
+                interest_key = f"{member['member_id']}:{_key_body}"
 
-                    name, company_number, is_private = _extract_counterparty(description)
+                # Commit per interest, not the whole run in one transaction: a
+                # giant transaction over every member/interest holds locks for
+                # the entire ingest and loses everything already processed if
+                # one row (or the process) dies partway through.
+                try:
+                    with transaction.atomic():
+                        resolved = _resolve_counterparty(name, company_number, interest_key)
+                        if resolved is None:
+                            unmatched_counterparty += 1
+                            continue
+                        counterparty_entity, confidence, method, resolve_props = resolved
 
-                    # A counterparty "name" longer than this is an extraction
-                    # failure, not an organisation — the Lords register is free
-                    # text and the extractor sometimes captures a whole sentence.
-                    # Creating an Entity from it would both overflow Entity.name
-                    # (varchar 500) and pollute the graph with junk nodes, so
-                    # skip and count instead. Conservative extraction: prefer
-                    # missing a counterparty over inventing one.
-                    if name and len(name) > _MAX_COUNTERPARTY_NAME:
-                        skipped_implausible_name += 1
-                        continue
-                    if is_private:
-                        skipped_private_individual += 1
-                        continue
-                    if not name:
-                        skipped_no_counterparty += 1
-                        continue
+                        valid_to = interest.get("ceased_date")
 
-                    # Bounded at construction: category and counterparty name are free-form
-                    # Lords register text. interest_key feeds BOTH registry_id and
-                    # Attestation.source_reference (varchar 200), so hash the
-                    # variable part rather than embedding it — deterministic, so
-                    # re-ingest stays idempotent, and still unique per interest.
-                    _key_body = hashlib.sha256(
-                        f"{category}:{_normalise_name(name)}".encode()
-                    ).hexdigest()[:32]
-                    interest_key = f"{member['member_id']}:{_key_body}"
-                    resolved = _resolve_counterparty(name, company_number, interest_key)
-                    if resolved is None:
-                        unmatched_counterparty += 1
-                        continue
-                    counterparty_entity, confidence, method, resolve_props = resolved
-
-                    valid_to = interest.get("ceased_date")
-
-                    # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
-                    edge, _ = Edge.objects.get_or_create(
-                        edge_type="declared_interest",
-                        source_entity=member_entity,
-                        target_entity=counterparty_entity,
-                        valid_from=None,
-                        valid_to=valid_to,
-                        defaults={
-                            "properties": {
-                                "category": category,
-                                "description": description,
-                                **resolve_props,
+                        # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                        edge, _ = Edge.objects.get_or_create(
+                            edge_type="declared_interest",
+                            source_entity=member_entity,
+                            target_entity=counterparty_entity,
+                            valid_from=None,
+                            valid_to=valid_to,
+                            defaults={
+                                "properties": {
+                                    "category": category,
+                                    "description": description,
+                                    **resolve_props,
+                                },
                             },
-                        },
-                    )
+                        )
 
-                    # Attestation = THE EVIDENCE
-                    att_defaults: dict[str, Any] = {
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    }
-                    if observed_at:
-                        att_defaults["observed_at"] = observed_at
-                    if snapshot_ref:
-                        att_defaults["snapshot_ref"] = snapshot_ref
+                        # Attestation = THE EVIDENCE
+                        att_defaults: dict[str, Any] = {
+                            "match_confidence": confidence,
+                            "match_method": method,
+                        }
+                        if observed_at:
+                            att_defaults["observed_at"] = observed_at
+                        if snapshot_ref:
+                            att_defaults["snapshot_ref"] = snapshot_ref
 
-                    source_url = LORDS_REGISTER_URL
-                    if wayback_timestamp:
-                        source_url = f"{WAYBACK_PREFIX}{wayback_timestamp}/{LORDS_REGISTER_URL}"
+                        source_url = LORDS_REGISTER_URL
+                        if wayback_timestamp:
+                            source_url = f"{WAYBACK_PREFIX}{wayback_timestamp}/{LORDS_REGISTER_URL}"
 
-                    Attestation.objects.get_or_create(
-                        edge=edge,
-                        source_name=SOURCE_NAME,
-                        source_reference=interest_key,
-                        defaults={
-                            "source_url": source_url,
-                            **att_defaults,
-                        },
-                    )
-                    matched += 1
+                        # A snapshot identifier on the reference, not just the
+                        # interest: without it, re-ingesting several Wayback
+                        # snapshots of the same still-registered interest
+                        # collapses onto a single Attestation row (get_or_create
+                        # matches on source_reference), destroying the very
+                        # evidence of when each snapshot recorded the interest.
+                        attestation_reference = interest_key
+                        if wayback_timestamp:
+                            attestation_reference = f"{interest_key}:{wayback_timestamp}"
+
+                        Attestation.objects.get_or_create(
+                            edge=edge,
+                            source_name=SOURCE_NAME,
+                            source_reference=attestation_reference,
+                            defaults={
+                                "source_url": source_url,
+                                **att_defaults,
+                            },
+                        )
+                except Entity.MultipleObjectsReturned:
+                    # A company_number can legitimately resolve to 2+ Entity
+                    # rows under different registry schemes (GB-COH,
+                    # GLEIF-LEI — ADR-006 duplicate-over-merge). Count and
+                    # move on rather than losing the whole run to one row.
+                    ambiguous_company_number += 1
+                    continue
+
+                matched += 1
 
     return {
         "matched": matched,
@@ -635,6 +720,7 @@ def ingest_lords_register(
         "skipped_private_individual": skipped_private_individual,
         "skipped_no_counterparty": skipped_no_counterparty,
         "skipped_implausible_name": skipped_implausible_name,
+        "ambiguous_company_number": ambiguous_company_number,
         "nil_returns": nil_returns,
         "total_interests": total_interests,
         "total_members": total_members,

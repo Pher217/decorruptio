@@ -17,9 +17,9 @@ re-serves already-scraped text rather than re-fetching. `verify_citation`
 instead re-fetches the URL itself and tests the claim against that fetched
 text -- the same discipline as `officelabs-agent`'s `VerifierMiddleware`
 (checking real document state, not the generator's self-report) -- and the
-core VERBATIM/NEAR/ABSENT/UNFETCHABLE decision requires no LLM at all.
+core classification decision requires no LLM at all.
 
-Four outcomes, deliberately not collapsed into pass/fail:
+Five outcomes, deliberately not collapsed into pass/fail:
 
   * VERBATIM      -- the quote appears in the fetched text after normalising
                       whitespace, quote-mark style (curly vs straight) and
@@ -28,11 +28,28 @@ Four outcomes, deliberately not collapsed into pass/fail:
                       short run of sentences) exists. Returned together with
                       that best-matching text so a human can judge paraphrase
                       vs fabrication.
-  * ABSENT        -- the document fetched fine, but no sentence resembles the
-                      claimed quote. This is the defect the whole tool exists
-                      to catch (the "quote appears in quotation marks but
-                      isn't in the article" failure mode from the overnight
-                      run).
+  * ABSENT        -- the document fetched fine, real substantive text was
+                      extracted, and no sentence in it resembles the claimed
+                      quote. This is the defect the whole tool exists to
+                      catch (the "quote appears in quotation marks but isn't
+                      in the article" failure mode from the overnight run).
+  * EXTRACTION_UNRELIABLE -- the fetch succeeded (HTTP 200, no challenge
+                      page) but the extracted content is not plausibly the
+                      document's substance: a JavaScript-rendered results
+                      page whose real content never appears in the static
+                      HTML, a scanned/image-only PDF with no real text layer,
+                      or any other extraction failure wearing the costume of
+                      evidence. Same principle as ADR-008's document case
+                      ("an image-only PDF or failed text layer must become
+                      EXTRACTION_UNRELIABLE, not QUOTE_ABSENT") applied to
+                      every source type this tool fetches -- a fetch
+                      succeeding is not the same as the document's real
+                      content having been read. Detected on measurable
+                      signals (see `_extraction_is_unreliable`), never a
+                      guess, and only ever checked in place of what would
+                      otherwise be ABSENT -- it can never swallow a VERBATIM
+                      or NEAR result, and a genuinely absent quote in a
+                      properly-extracted document still reports ABSENT.
   * UNFETCHABLE   -- the document could not be retrieved as real content:
                       blocked domain, HTTP error, network failure, a PDF with
                       no `pdftotext` available, or a Cloudflare/JS challenge
@@ -41,12 +58,24 @@ Four outcomes, deliberately not collapsed into pass/fail:
                       fetcher was blocked, and conflating the two would erase
                       the exact distinction this tool exists to preserve.
 
+Keep EXTRACTION_UNRELIABLE and UNFETCHABLE straight: UNFETCHABLE means the
+request itself did not succeed (or was never attempted, e.g. a known-blocked
+domain, or was served a bot-challenge page instead of the document).
+EXTRACTION_UNRELIABLE means the request succeeded and no challenge page was
+served, but what came back does not plausibly contain the document's real
+content (a JS app shell, an image-only PDF). Both are conservative escape
+hatches from ABSENT: when a signal is ambiguous, this module always prefers
+the reading that does not impugn a real person's sourcing -- "when in doubt
+between ABSENT and EXTRACTION_UNRELIABLE, choose EXTRACTION_UNRELIABLE" (a
+false EXTRACTION_UNRELIABLE costs a human a look; a false ABSENT looks like
+proof a citation is fabricated when it might not be).
+
 An optional, off-by-default LLM adjudication step (`adjudicate_near_with_llm`)
 may relabel a NEAR match's *interpretation* (paraphrase vs likely fabrication)
 for a human reviewer -- see `verify_citation`'s docstring for the guarantee
 that it can only ever fire on a NEAR result and can never turn ABSENT (or
-UNFETCHABLE) into anything else. ADR-004 permits LLMs in research/extraction;
-this measurement path is not that -- the VERBATIM/NEAR/ABSENT/UNFETCHABLE
+EXTRACTION_UNRELIABLE, or UNFETCHABLE) into anything else. ADR-004 permits
+LLMs in research/extraction; this measurement path is not that -- the
 classification itself is always decided by the deterministic checks above.
 """
 
@@ -119,6 +148,70 @@ _CHALLENGE_MARKERS = (
     "please wait while we verify",
 )
 
+# -- EXTRACTION_UNRELIABLE thresholds (see module docstring / ADR-008) ------
+#
+# Below this many normalised characters, extracted "content" is too short to
+# plausibly be a real article/letter/report body -- a scanned/image-only PDF
+# with no text layer, or a page that is almost entirely chrome. This is the
+# universal backstop signal: it applies even when no raw markup is available
+# (e.g. a caller passing `fetched_text` directly, or a PDF, which has no
+# "markup" in the HTML sense). Deliberately low -- the real JS-shell case
+# that motivated this status (search.electoralcommission.org.uk) still had
+# ~1.3KB of nav/footer text, so it is caught by the ratio signal below, not
+# this one; this backstop exists for near-empty extractions (an image-only
+# PDF, a bare stub), so it must not fire on a genuinely short-but-real
+# article body.
+EXTRACTION_UNRELIABLE_MIN_TEXT_LENGTH = 200
+
+# Extracted-text-characters / raw-markup-characters. A JS-rendered results
+# page typically ships a large bundle of markup/script to render almost no
+# server-side body text -- confirmed against the real
+# search.electoralcommission.org.uk donations search (raw HTML 56KB,
+# extracted+normalised text 1.3KB, ratio ~0.023) that motivated this status.
+EXTRACTION_UNRELIABLE_MIN_TEXT_TO_MARKUP_RATIO = 0.05
+
+# If the best fuzzy-match candidate scores below this AND looks like
+# nav/footer boilerplate (see `_BOILERPLATE_MARKERS`), the "nearest" thing in
+# the document to the claimed quote is chrome, not prose -- a second,
+# independent signal that the real content was never retrieved.
+EXTRACTION_UNRELIABLE_BOILERPLATE_SIMILARITY_CEILING = 0.35
+
+# A looser text-length cap used only when a JS-app-root marker is present --
+# some minimal server-rendered chrome/nav text is normal even for a genuine
+# SPA shell, so this is intentionally more permissive than
+# EXTRACTION_UNRELIABLE_MIN_TEXT_LENGTH on its own.
+_JS_APP_ROOT_TEXT_LENGTH_CAP = 600
+
+_JS_APP_ROOT_MARKERS = (
+    'id="root"',
+    "id='root'",
+    'id="app"',
+    "id='app'",
+    "<app-root",
+    "ng-app",
+    "data-reactroot",
+    "you need to enable javascript to run this app",
+    "doesn't work properly without javascript enabled",
+    "please enable javascript",
+)
+
+_BOILERPLATE_MARKERS = (
+    "accessibility",
+    "site map",
+    "sitemap",
+    "privacy notice",
+    "privacy policy",
+    "cookie",
+    "follow us",
+    "all rights reserved",
+    "terms of use",
+    "terms & conditions",
+    "skip to main content",
+    "skip to content",
+    "back to top",
+    "no results were returned",
+)
+
 _QUOTE_CHARS: dict[str, str] = {
     "‘": "'",
     "’": "'",
@@ -150,11 +243,12 @@ _MAX_SENTENCES_CONSIDERED = 800
 
 
 class CitationStatus(StrEnum):
-    """The four outcomes of `verify_citation`. Never collapsed to pass/fail."""
+    """The five outcomes of `verify_citation`. Never collapsed to pass/fail."""
 
     VERBATIM = "VERBATIM"
     NEAR = "NEAR"
     ABSENT = "ABSENT"
+    EXTRACTION_UNRELIABLE = "EXTRACTION_UNRELIABLE"
     UNFETCHABLE = "UNFETCHABLE"
 
 
@@ -174,13 +268,21 @@ class CitationVerification:
 
 @dataclass(frozen=True)
 class _FetchOutcome:
-    """Internal: result of retrieving and extracting text from a URL."""
+    """Internal: result of retrieving and extracting text from a URL.
+
+    `raw_markup` is the undecoded/pre-extraction document (raw HTML) when
+    one exists, used only for the text-to-markup ratio signal in
+    `_extraction_is_unreliable`. It is None for PDFs (no markup concept --
+    the extracted-text-length backstop covers image-only PDFs instead) and
+    for plain text.
+    """
 
     ok: bool
     text: str | None = None
     content_type: str | None = None
     status_code: int | None = None
     reason: str | None = None
+    raw_markup: str | None = None
 
 
 def _normalize(text: str) -> str:
@@ -277,7 +379,11 @@ def _extract_outcome(
         return _FetchOutcome(ok=False, status_code=status_code, reason="challenge_page_detected")
 
     return _FetchOutcome(
-        ok=True, text=text, content_type=content_type or "text/plain", status_code=status_code
+        ok=True,
+        text=text,
+        content_type=content_type or "text/plain",
+        status_code=status_code,
+        raw_markup=decoded,
     )
 
 
@@ -419,6 +525,50 @@ def _best_fuzzy_match(normalized_quote: str, normalized_text: str) -> tuple[str 
     return best_sentence, best_score
 
 
+def _extraction_is_unreliable(
+    *,
+    normalized_text: str,
+    raw_markup: str | None,
+    best_sentence: str | None,
+    best_score: float,
+) -> str | None:
+    """Return a reason string if the extracted text is not plausibly the
+    document's real substance, else None.
+
+    Only ever consulted for what would otherwise be an ABSENT result (see
+    `verify_citation`) -- a VERBATIM or NEAR match already proves extraction
+    worked, so this function is never given the chance to touch those.
+    Conservative by construction: any one signal firing is enough to
+    escalate from ABSENT to EXTRACTION_UNRELIABLE, per ADR-008's principle
+    that a false "unreliable" costs a human a look while a false "absent"
+    impugns a real case.
+    """
+    text_length = len(normalized_text)
+
+    if best_score < EXTRACTION_UNRELIABLE_BOILERPLATE_SIMILARITY_CEILING and best_sentence:
+        best_lower = best_sentence.casefold()
+        if any(marker in best_lower for marker in _BOILERPLATE_MARKERS):
+            return "best_match_is_nav_or_footer_boilerplate"
+
+    if raw_markup:
+        markup_length = len(raw_markup)
+        ratio = text_length / markup_length if markup_length else 0.0
+        if ratio < EXTRACTION_UNRELIABLE_MIN_TEXT_TO_MARKUP_RATIO:
+            return f"low_text_to_markup_ratio:{ratio:.4f}"
+
+        raw_lower = raw_markup.casefold()
+        if (
+            any(marker in raw_lower for marker in _JS_APP_ROOT_MARKERS)
+            and text_length < _JS_APP_ROOT_TEXT_LENGTH_CAP
+        ):
+            return "js_app_root_detected_with_negligible_body_text"
+
+    if text_length < EXTRACTION_UNRELIABLE_MIN_TEXT_LENGTH:
+        return f"extracted_text_implausibly_short:{text_length}_chars"
+
+    return None
+
+
 def verify_citation(
     url: str,
     claimed_quote: str,
@@ -440,8 +590,16 @@ def verify_citation(
     `fetched_text` directly, e.g. for a test or an already-scraped pass),
     extracts text (HTML via BeautifulSoup; PDF via `pdftotext` if
     installed), normalises whitespace/quote-style/dash-style on both sides,
-    and classifies the result as VERBATIM, NEAR, ABSENT, or UNFETCHABLE (see
-    module docstring for the exact meaning of each).
+    and classifies the result as VERBATIM, NEAR, ABSENT, EXTRACTION_UNRELIABLE,
+    or UNFETCHABLE (see module docstring for the exact meaning of each).
+
+    EXTRACTION_UNRELIABLE is only ever considered in place of what would
+    otherwise be ABSENT (see `_extraction_is_unreliable`) -- it can never
+    override a VERBATIM or NEAR result, since either already proves real
+    document content was read. This tool never renders JavaScript; a page
+    whose real content only exists after JS execution reports
+    EXTRACTION_UNRELIABLE, not ABSENT -- that is the signal to fall back to
+    a browser-based capture path, not a claim about the citation itself.
 
     `adjudicate_near_with_llm` + `llm_adjudicator` is the one optional,
     off-by-default LLM hook (ADR-004 allows LLMs in research/extraction,
@@ -449,9 +607,10 @@ def verify_citation(
     best_match)` is called ONLY when the deterministic result is already NEAR,
     and its return value is stored in `result.llm_adjudication` for a human
     to read -- it can only annotate an existing NEAR result, never change
-    `result.status`. The adjudicator is never invoked on VERBATIM, ABSENT, or
-    UNFETCHABLE results, so there is no code path by which an LLM call can
-    promote an ABSENT (or UNFETCHABLE) citation into anything else.
+    `result.status`. The adjudicator is never invoked on VERBATIM, ABSENT,
+    EXTRACTION_UNRELIABLE, or UNFETCHABLE results, so there is no code path by
+    which an LLM call can promote an ABSENT (or EXTRACTION_UNRELIABLE, or
+    UNFETCHABLE) citation into anything else.
     """
     if fetched_text is not None:
         outcome = _FetchOutcome(
@@ -503,6 +662,23 @@ def verify_citation(
             adjudication = llm_adjudicator(claimed_quote, best_sentence or "")
             result = replace(result, llm_adjudication=adjudication)
         return result
+
+    unreliable_reason = _extraction_is_unreliable(
+        normalized_text=normalized_text,
+        raw_markup=outcome.raw_markup,
+        best_sentence=best_sentence,
+        best_score=best_score,
+    )
+    if unreliable_reason is not None:
+        return CitationVerification(
+            status=CitationStatus.EXTRACTION_UNRELIABLE,
+            url=url,
+            claimed_quote=claimed_quote,
+            similarity=best_score,
+            best_match=best_sentence,
+            detail=unreliable_reason,
+            fetched_content_length=len(fetched),
+        )
 
     return CitationVerification(
         status=CitationStatus.ABSENT,

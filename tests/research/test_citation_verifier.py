@@ -8,12 +8,17 @@ Verifies the core invariants the tool exists for (see
 - A quote differing only in curly-vs-straight quotes and whitespace is
   still VERBATIM
 - A paraphrase is NEAR, with the best-matching source sentence returned
-- A quote genuinely absent from a successfully-fetched document is ABSENT
-  -- the exact defect class the overnight benchmark run caught by hand
+- A quote genuinely absent from a successfully-fetched, properly-extracted
+  document is ABSENT -- the exact defect class the overnight benchmark run
+  caught by hand
 - A blocked/challenge/error response is UNFETCHABLE, and NEVER ABSENT --
   the tool must not conflate "couldn't check" with "checked and it's wrong"
+- A JavaScript-rendered page (real content never present in the static
+  fetch) is EXTRACTION_UNRELIABLE, and NEVER ABSENT -- an extraction failure
+  is not evidence about the claim either (ADR-008's principle, applied
+  beyond the PDF case it names)
 - No code path (including the optional LLM adjudication hook) can promote
-  an ABSENT result into a pass
+  an ABSENT (or EXTRACTION_UNRELIABLE, or UNFETCHABLE) result into a pass
 """
 
 import json
@@ -53,6 +58,52 @@ CHALLENGE_HTML = """
 <body>
 <div id="cf-challenge-stage">Checking your browser before accessing the site.</div>
 <div>This process is automatic. Your browser will redirect once the check is complete.</div>
+</body></html>
+"""
+
+# Mirrors the real defect that motivated EXTRACTION_UNRELIABLE: a donation
+# search page (search.electoralcommission.org.uk) whose results are
+# populated client-side, so a plain GET returns only nav/form/footer chrome
+# plus a large inline script bundle -- a real ~56KB page returned ~1.3KB of
+# extracted text (ratio ~0.023). The large `appBundle` filler stands in for
+# that bundle: it inflates raw markup size without adding any visible text,
+# since `_extract_html_text` strips <script> content before extraction.
+JS_SEARCH_SHELL_HTML = f"""
+<html><head><title>Search - Donations Register</title>
+<script>var appBundle = "{"x" * 8000}";</script>
+</head>
+<body>
+<nav><a href="/">Home</a> <a href="/contact">Contact us</a>
+<a href="/accessibility">Accessibility</a></nav>
+<div class="container">
+<p class="subheading">This page allows you to search the register of donations.</p>
+<form><input type="text" name="query"/><button>Search</button></form>
+<div class="results"><p>No results were returned by your query.</p></div>
+</div>
+<footer>Follow us on Twitter on LinkedIn read our blog. Accessibility FAQs.
+Site map. Privacy notice. (c) 2026 The Electoral Commission.</footer>
+</body></html>
+"""
+
+DONATION_RECORD_QUOTE = (
+    "Globus (Shetland) Limited | Company | Conservative and Unionist Party | "
+    "£50,000 | Accepted 2016-02-22 | Donation ID C0242167"
+)
+
+# A longer-form article, server-rendered with ordinary nav/footer chrome
+# (unlike JS_SEARCH_SHELL_HTML, no oversized script bundle), used to prove
+# the ratio/length signals do NOT misfire on genuinely long-form content
+# fetched over real HTTP -- a quote truly absent from this must still
+# report ABSENT, not EXTRACTION_UNRELIABLE.
+LONG_FORM_ARTICLE_HTML = f"""
+<html><head><title>Committee report</title></head>
+<body>
+<nav>Home News Politics</nav>
+<article><p>{ARTICLE_TEXT} The full report runs to several dozen pages and
+covers multiple witnesses, including officials from three separate
+government departments who gave evidence over the course of four sitting
+days in October.</p></article>
+<footer>Contact us | Privacy policy | (c) 2026 Example News</footer>
 </body></html>
 """
 
@@ -437,3 +488,98 @@ class TestCaching:
         )
 
         assert calls == 2
+
+
+class TestExtractionUnreliable:
+    """ADR-008's principle applied beyond its named PDF case: a successful
+    fetch that never retrieved the document's real content (a JS-rendered
+    page, an image-only PDF) must report EXTRACTION_UNRELIABLE, not ABSENT --
+    an extraction failure is not evidence about the claim."""
+
+    def test_js_rendered_search_shell_is_extraction_unreliable_not_absent(self):
+        """GIVEN a URL returns HTTP 200 with a JS-app search shell (the real
+        defect: search.electoralcommission.org.uk populates results client-side,
+        so the static fetch returns only nav/form/footer chrome and a large
+        script bundle, never the donation record) WHEN verified for a claimed
+        donation-record quote THEN the status is EXTRACTION_UNRELIABLE, never
+        ABSENT -- the fetch succeeded but never retrieved real content."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=JS_SEARCH_SHELL_HTML)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://search.electoralcommission.org.uk/Search/Donations?query=Globus",
+            DONATION_RECORD_QUOTE,
+            client=client,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+        assert result.status != CitationStatus.ABSENT
+
+    def test_long_form_article_over_http_with_absent_quote_still_classifies_absent(self):
+        """GIVEN a URL returns HTTP 200 with an ordinary long-form article (real
+        nav/footer chrome, no oversized script bundle, extracted text well past
+        the length/ratio thresholds) WHEN verified for a quote genuinely absent
+        from it THEN the status is still ABSENT -- adding EXTRACTION_UNRELIABLE
+        must not swallow a real ABSENT defect fetched over actual HTTP."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=LONG_FORM_ARTICLE_HTML)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://example.test/long-form-article",
+            ABSENT_QUOTE,
+            client=client,
+        )
+
+        assert result.status == CitationStatus.ABSENT
+
+    def test_short_boilerplate_fetched_text_is_extraction_unreliable(self):
+        """GIVEN fetched_text is a short nav/footer boilerplate snippet (well
+        under the plausible-body-text length, and matching boilerplate markers)
+        WHEN verified THEN the status is EXTRACTION_UNRELIABLE -- the backstop
+        signal fires even without raw markup available (e.g. an already-scraped
+        pass with no HTML to compute a ratio from)."""
+        boilerplate = (
+            "Follow us on Twitter on LinkedIn read our blog. Accessibility FAQs. "
+            "Site map. Privacy notice. (c) 2026 The Electoral Commission."
+        )
+
+        result = verify_citation(
+            "https://example.test/scraped-shell",
+            DONATION_RECORD_QUOTE,
+            fetched_text=boilerplate,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+
+    def test_extraction_unreliable_never_invokes_the_adjudicator(self):
+        """GIVEN an EXTRACTION_UNRELIABLE result WHEN verify_citation is called
+        with adjudicate_near_with_llm=True THEN the adjudicator is never called
+        -- the LLM hook only ever fires for NEAR, never for any of the three
+        non-NEAR outcomes."""
+        calls: list[tuple[str, str]] = []
+
+        def spy_adjudicator(quote: str, best_match: str) -> str:
+            calls.append((quote, best_match))
+            return "PARAPHRASE"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=JS_SEARCH_SHELL_HTML)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = verify_citation(
+            "https://search.electoralcommission.org.uk/Search/Donations?query=Globus",
+            DONATION_RECORD_QUOTE,
+            client=client,
+            adjudicate_near_with_llm=True,
+            llm_adjudicator=spy_adjudicator,
+        )
+
+        assert result.status == CitationStatus.EXTRACTION_UNRELIABLE
+        assert calls == []

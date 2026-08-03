@@ -75,35 +75,57 @@ never be what makes its path recoverable. `check_source_separation` is a
 BEST-EFFORT check against `Attestation.source_name` -- see its docstring for
 exactly what it can and cannot prove.
 
-VERDICT SET (amendment v2.1, A2.1.2 -- replaces the old SS6 table):
+VERDICT SET (amendment v2.1, A2.1.2 -- replaces the old SS6 table -- plus
+INSUFFICIENT-COHORT, added after an adversarial review found the original
+five had no floor on how many cases were actually tested):
 
-  INVALID            retrieval controls <9/10 -- pipeline broken, positives
-                      result must not be reported.
-  INSTRUMENT-LIMITED  retrieval controls pass but the temporal control gate
-                      (A2.3) fails -- the UK strict hypothesis is untestable
-                      with these sources.
-  CONFIRMED           >=4/20 cases recovered, >=80% benchmark precision,
-                      retrieval AND temporal gates both pass.
-  REFUTED             0/20 cases recovered, retrieval AND temporal gates
-                      both pass.
-  PARTIAL             1-3/20 cases recovered, retrieval AND temporal gates
-                      both pass. Real traces below the confirmation bar --
-                      never rendered as a confirmation.
+  INSUFFICIENT-COHORT  testable cases (total minus untestable minus
+                       no_trace_by_design) fall short of the pre-registered
+                       20-case cohort (`PREREGISTERED_COHORT_SIZE`) -- the
+                       "4/20"/"0/20" thresholds are not meaningful against a
+                       smaller or mostly-untestable denominator. Checked
+                       FIRST, before anything else.
+  INVALID              retrieval controls <9/10 -- pipeline broken, positives
+                       result must not be reported.
+  INSTRUMENT-LIMITED    retrieval controls pass but the temporal control gate
+                       (A2.3) fails -- the UK strict hypothesis is untestable
+                       with these sources.
+  CONFIRMED             >=4/20 cases recovered, >=80% benchmark precision,
+                       retrieval AND temporal gates both pass.
+  REFUTED               0/20 cases recovered, retrieval AND temporal gates
+                       both pass.
+  PARTIAL               1-3/20 cases recovered, retrieval AND temporal gates
+                       both pass. Real traces below the confirmation bar --
+                       never rendered as a confirmation.
 
-`classify_outcome` evaluates these in a strict priority order (INVALID, then
-INSTRUMENT-LIMITED, then the case-count-dependent branches) so every one of
-the five rows above maps to exactly one branch with no residual ambiguity --
-unlike the SS6 table's REFUTED/COUNTRY SWITCH overlap this amendment fixes.
+`classify_outcome` evaluates these in a strict priority order (INSUFFICIENT-
+COHORT, then INVALID, then INSTRUMENT-LIMITED, then the case-count-dependent
+branches) so every verdict above maps to exactly one branch with no residual
+ambiguity -- unlike the SS6 table's REFUTED/COUNTRY SWITCH overlap this
+amendment fixes.
+
+ADVERSARIAL-REVIEW FIX -- `cases_recovered` fed into `classify_outcome` MUST
+already exclude any case whose recovery is PROVEN circular (spec SS3: every
+path found for it is attested solely by a source that row's own
+`excluded_from_retrieval` names -- see `split_recovered_by_source_separation`
+and the `recovered_circular` figure in `main()`). Counting such a case would
+let the project's own journalism/inquiry ingest manufacture an affirmative
+claim about a named person or company -- the single most damaging failure
+mode this script can produce, worse than a null.
 
 COUNTRY_SWITCH IS NOT A VERDICT (A2.1.2) -- it is an action triggered by
-PARTIAL, REFUTED, or INSTRUMENT-LIMITED. See `country_switch_triggered`.
+PARTIAL, REFUTED, or INSTRUMENT-LIMITED (never by INSUFFICIENT-COHORT or
+INVALID). See `country_switch_triggered`.
 
 Statistical reporting (amendment A2.5): a `0/N` control or negative-control
 count is never printed bare -- `wilson_upper_bound` computes the ~95%
-one-sided upper bound reported alongside it. Benchmark precision (on the
-constructed 20-ish-case : 200-negative sample) is reported labelled as such,
-never as an operational/field precision figure, alongside sensitivity and
-false-positive rate as separate, explicitly named metrics.
+one-sided upper bound reported alongside it, including alongside
+`false_positive_rate` itself, not just the raw negative-control count.
+Benchmark precision (on the constructed 20-ish-case : 200-negative sample)
+is reported labelled as such, never as an operational/field precision
+figure, alongside sensitivity (denominator explicitly named as ALL cases,
+including untestable/no_trace_by_design ones) and false-positive rate as
+separate, explicitly named metrics.
 
 Usage:
     PYTHONPATH=.:src python scripts/run_gold_benchmark.py \\
@@ -145,6 +167,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTROLS_PASS_FRACTION = 0.9  # >=9/10 retrieval controls
 CONFIRM_MIN_CASES = 4  # >=4/20 cases (not rows -- A2.1.1)
 CONFIRM_MIN_PRECISION = 0.80  # >=80% benchmark precision
+
+# The "4/20" and "0/20" thresholds are calibrated to a 20-case cohort (spec
+# SS5). Applying them to a smaller -- or smaller-than-it-looks -- cohort
+# misrepresents statistical power. See PREREGISTERED_COHORT_SIZE below.
+PREREGISTERED_COHORT_SIZE = 20
 
 # Priority order for rolling per-row statuses up to a case (higher wins).
 # no_trace_by_design (spec A2.3.3) ranks lowest: it is an EXPECTED non-result
@@ -228,15 +255,32 @@ def load_temporal_gate(path: Path) -> TemporalGate | None:
     exactly like `passed=False` -- a missing measurement is never an implicit
     pass (spec A2.3: "REFUTED may be reported only when ... the temporal
     control gate passes").
+
+    The JSON's own `"passed"` flag is NOT trusted verbatim -- `passed` is
+    RECOMPUTED here from `overall_recovered`/`overall_total`/`failing_strata`
+    in the same payload (spec A2.3: ~27/30 i.e. >=90% overall, AND every
+    material stratum individually clearing its own bar, i.e.
+    `failing_strata` empty). A producer that writes `"passed": true` without
+    the numbers actually supporting it cannot force a pass this way.
     """
     if not path.exists():
         return None
     data = json.loads(path.read_text())
+    overall_recovered = data.get("overall_recovered")
+    overall_total = data.get("overall_total")
+    failing_strata = tuple(data.get("failing_strata", ()))
+    recomputed_passed = (
+        overall_recovered is not None
+        and overall_total is not None
+        and overall_total > 0
+        and (overall_recovered / overall_total) >= CONTROLS_PASS_FRACTION
+        and not failing_strata
+    )
     return TemporalGate(
-        passed=bool(data["passed"]),
-        overall_recovered=data.get("overall_recovered"),
-        overall_total=data.get("overall_total"),
-        failing_strata=tuple(data.get("failing_strata", ())),
+        passed=recomputed_passed,
+        overall_recovered=overall_recovered,
+        overall_total=overall_total,
+        failing_strata=failing_strata,
     )
 
 
@@ -470,6 +514,38 @@ def evaluate_case(
     )
 
 
+def split_recovered_by_source_separation(
+    case_evaluations: list[CaseEvaluation],
+) -> tuple[list[CaseEvaluation], list[CaseEvaluation]]:
+    """Split `status == "recovered"` cases into (clean, circular).
+
+    Adversarial-review defect: a case whose `source_separation == "violation"`
+    means `check_source_separation` has already PROVEN every path found for
+    it is attested SOLELY by a source that row's own `excluded_from_retrieval`
+    names -- exactly the circularity spec SS3 exists to rule out ("if a
+    relationship is only recoverable because we ingested the newspaper
+    article that revealed it, we have measured our own ingest, not the
+    registers"). Counting such a case toward CONFIRMED would let the
+    project's own journalism/inquiry ingest manufacture an affirmative,
+    reputation-bearing claim about a named person or company.
+
+    `clean` is every other recovered case ("ok" -- an independent, permitted
+    path exists -- or "cannot_verify", where nothing PROVES circularity, only
+    an unattested edge). Only `clean` may ever count toward
+    CONFIRMED/PARTIAL/REFUTED thresholds; `circular` must be reported
+    prominently and never silently folded back in.
+
+    If a case has both a clean and a tainted path, `evaluate_case`'s own
+    roll-up already resolves this: source_separation is "ok" the moment ANY
+    contributing row's path is clean, so such a case lands in `clean` here
+    too -- the clean path carries it, as required.
+    """
+    recovered = [c for c in case_evaluations if c.status == "recovered"]
+    circular = [c for c in recovered if c.source_separation == "violation"]
+    clean = [c for c in recovered if c.source_separation != "violation"]
+    return clean, circular
+
+
 def wilson_upper_bound(successes: int, n: int, z: float = _Z_95) -> float:
     """Wilson score interval upper bound for a binomial proportion.
 
@@ -506,6 +582,9 @@ def compute_precision(cases_recovered: int, negatives_recovered: int) -> float:
 
 def classify_outcome(
     cases_recovered: int,
+    cases_total: int,
+    cases_untestable: int,
+    cases_no_trace_by_design: int,
     precision: float,
     retrieval_controls_recovered: int,
     retrieval_controls_total: int,
@@ -513,21 +592,49 @@ def classify_outcome(
 ) -> str:
     """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, all case-level.
 
-    Strict priority order -- each of the five verdicts maps to exactly one
-    branch, with no overlap (unlike the original SS6 table's REFUTED/COUNTRY
-    SWITCH ambiguity this amendment replaces):
+    Strict priority order -- each of the six verdicts (five from A2.1.2 plus
+    INSUFFICIENT-COHORT, added below) maps to exactly one branch, with no
+    overlap:
 
-      1. retrieval controls fail (<9/10)      -> INVALID
-      2. temporal gate fails (A2.3)            -> INSTRUMENT-LIMITED
-      3. (both gates pass) >=4 cases & >=80%   -> CONFIRMED
-      4. (both gates pass) 0 cases             -> REFUTED
-      5. (both gates pass) 1-3 cases           -> PARTIAL
+      0. testable cases < PREREGISTERED_COHORT_SIZE  -> INSUFFICIENT-COHORT
+      1. retrieval controls fail (<9/10)              -> INVALID
+      2. temporal gate fails (A2.3)                    -> INSTRUMENT-LIMITED
+      3. (both gates pass) >=4 cases & >=80%           -> CONFIRMED
+      4. (both gates pass) 0 cases                     -> REFUTED
+      5. (both gates pass) 1-3 cases                   -> PARTIAL
+
+    ADVERSARIAL-REVIEW FIX (INSUFFICIENT-COHORT, checked FIRST): the locked
+    "4/20" and "0/20" thresholds are calibrated to a 20-case cohort where
+    those 20 cases actually produced a recovered/undated_only/not_recovered
+    verdict. `cases_untestable` (resolution failures) and
+    `cases_no_trace_by_design` (PSC, spec A2.3.3) are cases that were never
+    really put to the test -- if every gold case fails to resolve, that is a
+    resolver regression or an ingestion gap for those specific companies, NOT
+    evidence against H1, yet `cases_recovered == 0` would otherwise satisfy
+    REFUTED's condition regardless of how many cases were actually testable
+    (Phase C v1's exact defect, reintroduced one level up). The guard is
+    `cases_total - cases_untestable - cases_no_trace_by_design <
+    PREREGISTERED_COHORT_SIZE`, which subsumes a too-small raw manifest too
+    (a smaller total can only ever produce a smaller-or-equal testable
+    count), and is applied uniformly -- it also blocks a false CONFIRMED
+    against a small, unrepresentative partial manifest, not just a false
+    REFUTED.
+
+    `cases_recovered` MUST already exclude any case whose only recovered
+    evidence is a PROVEN source-separation violation (spec SS3) -- see
+    `split_recovered_by_source_separation`. This function does not (and
+    cannot) re-derive that exclusion from a bare count; it is the caller's
+    responsibility, exactly like the temporal gate.
 
     `temporal_gate` is REQUIRED and may be `None` (not yet measured);
     `None` is treated identically to a failing gate -- it can NEVER route to
     CONFIRMED or REFUTED. This is the mechanism spec A2.3 demands: "REFUTED
     may be reported only when ... the temporal control gate passes."
     """
+    testable = cases_total - cases_untestable - cases_no_trace_by_design
+    if testable < PREREGISTERED_COHORT_SIZE:
+        return "INSUFFICIENT-COHORT"
+
     retrieval_pass = (
         retrieval_controls_total > 0
         and (retrieval_controls_recovered / retrieval_controls_total) >= CONTROLS_PASS_FRACTION
@@ -550,8 +657,10 @@ def country_switch_triggered(outcome: str) -> bool:
     """Spec A2.1.2: COUNTRY_SWITCH is an ACTION, not a verdict.
 
     Triggered by PARTIAL, REFUTED, or INSTRUMENT-LIMITED -- i.e. by every
-    verdict except CONFIRMED and INVALID (a broken pipeline licenses no
-    action at all until it is fixed).
+    verdict except CONFIRMED, INVALID, and INSUFFICIENT-COHORT (a broken
+    pipeline or an inadequately-sized/tested cohort licenses no action at
+    all until it is fixed -- switching country does not fix a resolver
+    regression or a too-small manifest).
     """
     return outcome in ("PARTIAL", "REFUTED", "INSTRUMENT-LIMITED")
 
@@ -682,7 +791,9 @@ def main() -> None:
     def _count(evals: list, status: str) -> int:
         return sum(1 for e in evals if e.status == status)
 
-    cases_recovered = _count(case_evaluations, "recovered")
+    clean_recovered, circular_recovered = split_recovered_by_source_separation(case_evaluations)
+    cases_recovered = len(clean_recovered)
+    cases_recovered_circular = len(circular_recovered)
     cases_undated_only = _count(case_evaluations, "undated_only")
     cases_not_recovered = _count(case_evaluations, "not_recovered")
     cases_untestable = _count(case_evaluations, "untestable")
@@ -695,12 +806,20 @@ def main() -> None:
     rows_no_trace_by_design = _count(row_evaluations, "no_trace_by_design")
 
     benchmark_precision = compute_precision(cases_recovered, negatives_recovered)
-    sensitivity = cases_recovered / len(manifest_result.cases) if manifest_result.cases else 0.0
+    # Denominator is EVERY case, including untestable and no_trace_by_design
+    # ones -- named explicitly so a reader cannot mistake a low figure here
+    # for evidence of absence when it may just reflect resolution gaps.
+    sensitivity_over_all_cases = (
+        cases_recovered / len(manifest_result.cases) if manifest_result.cases else 0.0
+    )
     false_positive_rate = negatives_recovered / negatives_total if negatives_total else 0.0
     negatives_fp_upper_95 = wilson_upper_bound(negatives_recovered, negatives_total)
 
     outcome = classify_outcome(
         cases_recovered,
+        len(manifest_result.cases),
+        cases_untestable,
+        cases_no_trace_by_design,
         benchmark_precision,
         retrieval_controls_recovered,
         retrieval_controls_total,
@@ -708,12 +827,20 @@ def main() -> None:
     )
     switch_action = country_switch_triggered(outcome)
 
+    # `violations` is EVERY case with a proven-circular source (recovered or
+    # undated_only -- SS3's rule applies regardless of temporal admissibility);
+    # `circular_recovered` (above) is the verdict-critical subset.
     violations = [c for c in case_evaluations if c.source_separation == "violation"]
+    undated_only_violations = [c for c in violations if c.status == "undated_only"]
     unverifiable = [c for c in case_evaluations if c.source_separation == "cannot_verify"]
 
     print(f"\n=== PHASE C GOLD BENCHMARK (max {args.max_hops} hops, case-level) ===")
     print(f"cases total (distinct awardees)    : {len(manifest_result.cases)}")
-    print(f"  recovered (pre-award)            : {cases_recovered}")
+    print(f"  recovered (pre-award, clean)     : {cases_recovered}")
+    print(
+        f"  recovered_circular (SS3 violation): {cases_recovered_circular}"
+        "  -- PROVEN circular, EXCLUDED from recovered/CONFIRMED/REFUTED"
+    )
     print(
         f"  undated_only (temporal unknown)  : {cases_undated_only}"
         "  -- never recovery, never refutation"
@@ -748,14 +875,29 @@ def main() -> None:
         f"(95% CI upper bound: {negatives_fp_upper_95:.1%}) -- spec A2.5: never a bare zero"
     )
     print(f"benchmark precision (NOT field precision, spec A2.5): {benchmark_precision:.3f}")
-    print(f"sensitivity (recall)               : {sensitivity:.3f}")
-    print(f"false_positive_rate                : {false_positive_rate:.3f}")
+    print(
+        f"sensitivity (recall, over ALL {len(manifest_result.cases)} cases incl. "
+        f"untestable/no_trace_by_design): {sensitivity_over_all_cases:.3f}"
+    )
+    print(
+        f"false_positive_rate                : {false_positive_rate:.3f} "
+        f"(95% CI upper bound: {negatives_fp_upper_95:.1%})"
+    )
     print(f"\n>>> OUTCOME: {outcome} <<<")
     print(f">>> COUNTRY_SWITCH action triggered: {switch_action} <<<")
-    if violations:
+    if circular_recovered:
         print(
-            f"\nWARNING: spec SS3 source-separation VIOLATION on "
-            f"{len(violations)} case(s): {[c.case_key for c in violations]}"
+            f"\nWARNING: spec SS3 source-separation VIOLATION -- "
+            f"{cases_recovered_circular} case(s) recovered ONLY through a proven-circular "
+            f"path (excluded from the recovered count above): "
+            f"{[c.case_key for c in circular_recovered]}"
+        )
+    if undated_only_violations:
+        print(
+            f"\nNOTE: {len(undated_only_violations)} undated_only case(s) also carry a proven "
+            f"SS3 source-separation violation (does not affect the verdict -- undated_only "
+            f"never counts as recovered -- but is a real circularity in that evidence): "
+            f"{[c.case_key for c in undated_only_violations]}"
         )
     if unverifiable:
         print(
@@ -767,15 +909,18 @@ def main() -> None:
         "outcome": outcome,
         "country_switch_triggered": switch_action,
         "benchmark_precision": benchmark_precision,
-        "sensitivity": sensitivity,
+        "sensitivity_over_all_cases": sensitivity_over_all_cases,
         "false_positive_rate": false_positive_rate,
+        "false_positive_rate_upper_bound_95pct": negatives_fp_upper_95,
         "cases": {
             "total": len(manifest_result.cases),
             "recovered": cases_recovered,
+            "recovered_circular": cases_recovered_circular,
             "undated_only": cases_undated_only,
             "not_recovered": cases_not_recovered,
             "untestable": cases_untestable,
             "no_trace_by_design": cases_no_trace_by_design,
+            "recovered_circular_case_keys": [c.case_key for c in circular_recovered],
             "concentrated": [
                 {
                     "case_key": c.case_key,
@@ -814,6 +959,12 @@ def main() -> None:
         },
         "source_separation": {
             "violations": [c.case_key for c in violations],
+            "violations_recovered_excluded_from_cases_recovered": [
+                c.case_key for c in circular_recovered
+            ],
+            "violations_undated_only_no_verdict_impact": [
+                c.case_key for c in undated_only_violations
+            ],
             "unverifiable": [c.case_key for c in unverifiable],
             "known_limits": (
                 "Best-effort Attestation.source_name substring match only. Cannot detect an "

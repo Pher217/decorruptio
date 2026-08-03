@@ -25,6 +25,7 @@ import pytest
 from scripts.load_gold_manifest import GoldCase, GoldRow, load_gold_manifest
 from scripts.phase_c_paths import build_adjacency, surname
 from scripts.run_gold_benchmark import (
+    CaseEvaluation,
     TemporalGate,
     check_source_separation,
     classify_outcome,
@@ -33,6 +34,7 @@ from scripts.run_gold_benchmark import (
     evaluate_case,
     evaluate_row,
     load_temporal_gate,
+    split_recovered_by_source_separation,
     wilson_upper_bound,
 )
 
@@ -333,7 +335,18 @@ class TestGoldCase:
 
 
 class TestClassifyOutcome:
-    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, case-level."""
+    """Spec A2.1.2 (amendment v2.1) LOCKED verdict set, case-level, plus the
+    INSUFFICIENT-COHORT guard added after an adversarial review found the
+    original five verdicts had no floor on how many cases were actually
+    tested -- a manifest where every case is untestable, or a manifest
+    smaller than the pre-registered 20, must never reach REFUTED or
+    CONFIRMED on raw counts alone.
+
+    Unless a test is specifically exercising the cohort-size guard, all
+    tests here use a "healthy" cohort (20 total, 0 untestable, 0
+    no_trace_by_design) so the ORIGINAL verdict logic is exercised exactly
+    as before.
+    """
 
     PASSING_GATE = TemporalGate(passed=True, overall_recovered=28, overall_total=30)
     FAILING_GATE = TemporalGate(passed=False, overall_recovered=13, overall_total=30)
@@ -345,6 +358,9 @@ class TestClassifyOutcome:
         gate -- spec: the positives result 'must not be reported'."""
         outcome = classify_outcome(
             cases_recovered=20,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=1.0,
             retrieval_controls_recovered=8,
             retrieval_controls_total=10,
@@ -358,6 +374,9 @@ class TestClassifyOutcome:
         THEN it is INSTRUMENT-LIMITED, never REFUTED (spec A2.3)."""
         outcome = classify_outcome(
             cases_recovered=0,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=0.0,
             retrieval_controls_recovered=10,
             retrieval_controls_total=10,
@@ -372,6 +391,9 @@ class TestClassifyOutcome:
         implicit pass, so REFUTED can never be emitted without one."""
         outcome = classify_outcome(
             cases_recovered=0,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=0.0,
             retrieval_controls_recovered=10,
             retrieval_controls_total=10,
@@ -386,6 +408,9 @@ class TestClassifyOutcome:
         THEN it is CONFIRMED."""
         outcome = classify_outcome(
             cases_recovered=4,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=0.80,
             retrieval_controls_recovered=9,
             retrieval_controls_total=10,
@@ -401,6 +426,9 @@ class TestClassifyOutcome:
         a hard requirement, not merely advisory."""
         outcome = classify_outcome(
             cases_recovered=10,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=1.0,
             retrieval_controls_recovered=10,
             retrieval_controls_total=10,
@@ -409,12 +437,15 @@ class TestClassifyOutcome:
         assert outcome == "INSTRUMENT-LIMITED"
 
     def test_refuted_fires_at_zero_cases_with_both_gates_passing(self):
-        """GIVEN 0/20 cases recovered while retrieval controls AND the
-        temporal gate both pass
+        """GIVEN 0/20 cases recovered, on a full 20-case testable cohort,
+        while retrieval controls AND the temporal gate both pass
         WHEN the outcome is classified
         THEN it is REFUTED."""
         outcome = classify_outcome(
             cases_recovered=0,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=0.0,
             retrieval_controls_recovered=10,
             retrieval_controls_total=10,
@@ -424,18 +455,215 @@ class TestClassifyOutcome:
 
     def test_partial_fires_for_one_to_three_cases_with_both_gates_passing(self):
         """GIVEN both gates pass but cases recovered is short of the
-        CONFIRMED threshold without being exactly zero
+        CONFIRMED threshold without being exactly zero, on a full 20-case
+        testable cohort
         WHEN the outcome is classified
         THEN it is PARTIAL -- real traces below the pre-registered
         confirmation bar, never rendered as a confirmation."""
         outcome = classify_outcome(
             cases_recovered=2,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
             precision=1.0,
             retrieval_controls_recovered=10,
             retrieval_controls_total=10,
             temporal_gate=self.PASSING_GATE,
         )
         assert outcome == "PARTIAL"
+
+    def test_insufficient_cohort_blocks_a_false_refuted_when_every_case_is_untestable(self):
+        """ADVERSARIAL TEST -- sneak past REFUTED via an all-untestable cohort.
+
+        GIVEN all 20 gold cases fail to resolve (a resolver regression, or an
+        ingestion gap for exactly those companies) so cases_recovered == 0,
+        while retrieval controls and the temporal gate -- measured on a
+        disjoint entity set -- both pass independently
+        WHEN the outcome is classified
+        THEN it is INSUFFICIENT-COHORT, never REFUTED -- a testable
+        denominator of 0 can never support "0/20 recovered" as a refutation
+        of H1; it is a resolver problem, not evidence against the
+        hypothesis."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            cases_total=20,
+            cases_untestable=20,
+            cases_no_trace_by_design=0,
+            precision=0.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
+        )
+        assert outcome == "INSUFFICIENT-COHORT"
+
+    def test_insufficient_cohort_blocks_a_false_confirmed_on_a_small_raw_manifest(self):
+        """ADVERSARIAL TEST -- sneak past CONFIRMED via a too-small manifest.
+
+        GIVEN only 10 total cases in the manifest (half the pre-registered
+        20) with 8 recovered and full precision/controls/temporal-gate pass
+        WHEN the outcome is classified
+        THEN it is INSUFFICIENT-COHORT, never CONFIRMED -- the locked
+        '>=4/20' bar is calibrated to a 20-case cohort; applying it to a
+        smaller, unrepresentative one overstates the evidence."""
+        outcome = classify_outcome(
+            cases_recovered=8,
+            cases_total=10,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            precision=1.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
+        )
+        assert outcome == "INSUFFICIENT-COHORT"
+
+    def test_insufficient_cohort_counts_no_trace_by_design_cases_as_untested_too(self):
+        """GIVEN a full 20-case manifest where 15 are PSC no_trace_by_design
+        (spec A2.3.3) and the remaining 5 are all not_recovered, so
+        cases_recovered == 0
+        WHEN the outcome is classified
+        THEN it is INSUFFICIENT-COHORT, never REFUTED -- PSC rows are
+        expected non-results by design and must never pad out a refutation's
+        denominator, exactly like untestable rows."""
+        outcome = classify_outcome(
+            cases_recovered=0,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=15,
+            precision=0.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
+        )
+        assert outcome == "INSUFFICIENT-COHORT"
+
+    def test_confirmed_still_reachable_at_exactly_the_pre_registered_cohort_size(self):
+        """GIVEN exactly 20 testable cases (0 untestable, 0 no_trace_by_design)
+        and every other threshold clearing
+        WHEN the outcome is classified
+        THEN it is CONFIRMED -- the cohort-size guard must not block a
+        legitimate result at the exact pre-registered size."""
+        outcome = classify_outcome(
+            cases_recovered=4,
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            precision=0.80,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=self.PASSING_GATE,
+        )
+        assert outcome == "CONFIRMED"
+
+
+class TestSplitRecoveredBySourceSeparation:
+    """ADVERSARIAL FIX: a case recovered ONLY via a proven source-separation
+    violation must never count as recovered (spec SS3)."""
+
+    def _case(self, status: str, source_separation: str, key: str = "01234567") -> CaseEvaluation:
+        return CaseEvaluation(
+            case_key=key,
+            company_number=key,
+            row_count=1,
+            award_count=1,
+            earliest_award_date="2021-06-01",
+            row_case_ids=["SYNTH-1"],
+            status=status,
+            source_separation=source_separation,
+            row_evaluations=[],
+        )
+
+    def test_circular_recovered_case_is_excluded_from_clean(self):
+        """GIVEN a recovered case whose source_separation is 'violation'
+        (every path found is attested solely by an excluded source)
+        WHEN recovered cases are split
+        THEN it appears in `circular`, not `clean`."""
+        case = self._case("recovered", "violation")
+        clean, circular = split_recovered_by_source_separation([case])
+        assert clean == []
+        assert circular == [case]
+
+    def test_ok_recovered_case_is_clean(self):
+        """GIVEN a recovered case whose source_separation is 'ok' (an
+        independent, permitted path exists)
+        WHEN recovered cases are split
+        THEN it appears in `clean`, not `circular`."""
+        case = self._case("recovered", "ok")
+        clean, circular = split_recovered_by_source_separation([case])
+        assert clean == [case]
+        assert circular == []
+
+    def test_cannot_verify_recovered_case_is_clean_not_circular(self):
+        """GIVEN a recovered case whose source_separation is 'cannot_verify'
+        (an unattested edge -- nothing PROVES circularity)
+        WHEN recovered cases are split
+        THEN it appears in `clean`, not `circular` -- only a PROVEN
+        violation is excluded, not an unresolved unknown."""
+        case = self._case("recovered", "cannot_verify")
+        clean, circular = split_recovered_by_source_separation([case])
+        assert clean == [case]
+        assert circular == []
+
+    def test_non_recovered_cases_are_ignored(self):
+        """GIVEN cases that are undated_only, not_recovered, or untestable
+        WHEN recovered cases are split
+        THEN none of them appear in either clean or circular -- only
+        status == 'recovered' cases are considered at all."""
+        cases = [
+            self._case("undated_only", "violation", key="1"),
+            self._case("not_recovered", "not_applicable", key="2"),
+            self._case("untestable", "not_applicable", key="3"),
+        ]
+        clean, circular = split_recovered_by_source_separation(cases)
+        assert clean == []
+        assert circular == []
+
+    def test_a_false_confirmed_via_circularity_is_impossible(self):
+        """ADVERSARIAL TEST, end-to-end -- sneak past CONFIRMED via the
+        project's own journalism ingest.
+
+        GIVEN 4 cases all showing status='recovered' but source_separation
+        == 'violation' on every one (check_source_separation has PROVEN the
+        only path found for each is attested solely by that row's own
+        excluded_from_retrieval source), with everything else passing
+        (precision, retrieval controls, temporal gate, cohort size)
+        WHEN the recovered cases are split and the clean count is fed into
+        classify_outcome
+        THEN the outcome is NOT CONFIRMED -- a case recoverable only through
+        the project's own excluded/circular ingest must never produce an
+        affirmative claim about a named person or company."""
+        circular_cases = [self._case("recovered", "violation", key=str(i)) for i in range(4)]
+        clean, circular = split_recovered_by_source_separation(circular_cases)
+        assert len(circular) == 4
+        assert len(clean) == 0
+
+        outcome = classify_outcome(
+            cases_recovered=len(clean),
+            cases_total=20,
+            cases_untestable=0,
+            cases_no_trace_by_design=0,
+            precision=1.0,
+            retrieval_controls_recovered=10,
+            retrieval_controls_total=10,
+            temporal_gate=TemporalGate(passed=True, overall_recovered=28, overall_total=30),
+        )
+        assert outcome != "CONFIRMED"
+
+    def test_case_with_both_a_clean_and_a_tainted_path_is_clean_not_circular(self):
+        """GIVEN evaluate_case's own roll-up logic (spec SS3): a case with
+        one row landing 'ok' and another landing 'violation', both
+        contributing to the winning 'recovered' status
+        WHEN the case rollup's resulting source_separation is fed through the
+        split
+        THEN it is 'ok' (the clean path carries the case), so it lands in
+        `clean` -- the distinction survives the case rollup, not just the
+        per-row check."""
+        # This mirrors evaluate_case's own aggregation rule directly:
+        # "ok" in seps wins over "violation" being present too.
+        case = self._case("recovered", "ok")
+        clean, circular = split_recovered_by_source_separation([case])
+        assert case in clean
+        assert case not in circular
 
 
 class TestCountrySwitchTriggered:
@@ -448,11 +676,12 @@ class TestCountrySwitchTriggered:
         THEN it is triggered."""
         assert country_switch_triggered(outcome) is True
 
-    @pytest.mark.parametrize("outcome", ["CONFIRMED", "INVALID"])
-    def test_action_not_triggered_by_confirmed_or_invalid(self, outcome):
-        """GIVEN a verdict of CONFIRMED or INVALID
+    @pytest.mark.parametrize("outcome", ["CONFIRMED", "INVALID", "INSUFFICIENT-COHORT"])
+    def test_action_not_triggered_by_confirmed_invalid_or_insufficient_cohort(self, outcome):
+        """GIVEN a verdict of CONFIRMED, INVALID, or INSUFFICIENT-COHORT
         WHEN checking whether the country-switch action fires
-        THEN it is not triggered."""
+        THEN it is not triggered -- an inadequate cohort is fixed by
+        sourcing more cases, not by switching country."""
         assert country_switch_triggered(outcome) is False
 
 
@@ -474,13 +703,14 @@ class TestWilsonUpperBound:
     """Spec A2.5: '0/200 is not a zero false-positive rate' -- must always
     carry an upper bound, never a bare zero."""
 
-    def test_zero_successes_has_a_small_positive_upper_bound(self):
+    def test_zero_successes_out_of_two_hundred_is_the_exact_wilson_value(self):
         """GIVEN zero spurious hits out of 200 trials
         WHEN the Wilson upper bound is computed
-        THEN it is a small positive number, not zero -- spec A2.5's whole
-        point is that 0/200 does not mean a 0% rate."""
+        THEN it is the exact ~1.88% Wilson score value, not merely 'small
+        and positive' -- spec A2.5's whole point is that 0/200 does not mean
+        a 0% rate, and the exact figure is what gets quoted in a result."""
         bound = wilson_upper_bound(0, 200)
-        assert 0.0 < bound < 0.05
+        assert bound == pytest.approx(0.018845326377266575, abs=1e-9)
 
     def test_zero_trials_returns_zero(self):
         """GIVEN zero trials
@@ -790,6 +1020,79 @@ class TestLoadTemporalGate:
             overall_total=30,
             failing_strata=("declared_interest/Lords",),
         )
+
+    def test_claimed_passed_true_is_not_trusted_when_numbers_do_not_support_it(self, tmp_path):
+        """ADVERSARIAL TEST -- a producer script claims 'passed: true' but
+        its own numbers (13/30, well below the ~27/30 bar) do not support it.
+
+        GIVEN a temporal gate report whose 'passed' field is 'true' but whose
+        overall_recovered/overall_total fail the spec A2.3 ratio
+        WHEN it is loaded
+        THEN `passed` is False -- recomputed from the numbers, never trusted
+        verbatim from the file."""
+        path = tmp_path / "temporal_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "passed": True,
+                    "overall_recovered": 13,
+                    "overall_total": 30,
+                    "failing_strata": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        gate = load_temporal_gate(path)
+
+        assert gate.passed is False
+
+    def test_claimed_passed_false_is_overridden_when_numbers_do_support_it(self, tmp_path):
+        """GIVEN a temporal gate report whose 'passed' field is 'false' but
+        whose numbers (28/30, no failing strata) DO clear the spec A2.3 bar
+        WHEN it is loaded
+        THEN `passed` is True -- the recomputation is symmetric, not merely
+        a one-directional distrust of an optimistic claim."""
+        path = tmp_path / "temporal_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "passed": False,
+                    "overall_recovered": 28,
+                    "overall_total": 30,
+                    "failing_strata": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        gate = load_temporal_gate(path)
+
+        assert gate.passed is True
+
+    def test_nonempty_failing_strata_blocks_passed_even_with_a_high_overall_ratio(self, tmp_path):
+        """GIVEN a temporal gate report with a strong overall ratio (29/30)
+        but a non-empty failing_strata list
+        WHEN it is loaded
+        THEN `passed` is False -- spec A2.3 requires the overall ratio AND
+        every material stratum individually clearing its own bar; an
+        aggregate pass cannot hide a failing stratum."""
+        path = tmp_path / "temporal_gate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "passed": True,
+                    "overall_recovered": 29,
+                    "overall_total": 30,
+                    "failing_strata": ["declared_interest/Lords"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        gate = load_temporal_gate(path)
+
+        assert gate.passed is False
 
 
 @pytest.mark.django_db

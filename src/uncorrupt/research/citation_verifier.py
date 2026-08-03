@@ -276,6 +276,22 @@ _DASH_CHARS: dict[str, str] = {
 _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
+# A space immediately before one of these marks has no valid reading in
+# English prose (nobody writes "the cat 's toy" or "hello , world") -- it
+# is a PDF text-extraction kerning artefact, the same family of rendering
+# noise as the curly-quote/dash normalisation above. Confirmed on real
+# manifest rows: pypdf inserting a spurious space before a possessive
+# apostrophe ("Geidt 's") and before a comma ("point , in"). Deliberately
+# narrow to marks with NO valid preceding-space reading -- quote marks and
+# dashes are excluded because a space before an opening quote or a spaced
+# em-dash is often intentional prose, not an artefact. This does NOT
+# address the opposite artefact (pypdf sometimes drops a space between two
+# words entirely, e.g. "toldme") -- that direction cannot be safely
+# reversed without guessing where the missing word boundary was, so it is
+# deliberately left alone; a false VERBATIM is worse than a human glancing
+# at an accurate NEAR.
+_SPACE_BEFORE_TERMINAL_PUNCTUATION_RE = re.compile(r" (?=['.,;:!?)\]])")
+
 # Bound on how many characters of a document are fuzzy-matched against, so
 # one huge document cannot make verification pathologically slow. A
 # character bound, not a sentence-count bound: a sentence-count cap made
@@ -353,10 +369,11 @@ class _FetchOutcome:
 
 
 def _normalize(text: str) -> str:
-    """Normalise whitespace, quote-mark style, and dash style for comparison.
+    """Normalise whitespace, quote-mark style, dash style, and space-before-
+    terminal-punctuation rendering artefacts for comparison.
 
     Deliberately does NOT lowercase -- VERBATIM is defined as an exact match
-    modulo whitespace/quote/dash rendering only, not modulo case.
+    modulo rendering differences only, not modulo case or wording.
     """
     text = unicodedata.normalize("NFKC", text)
     for src, dst in _QUOTE_CHARS.items():
@@ -364,7 +381,8 @@ def _normalize(text: str) -> str:
     for src, dst in _DASH_CHARS.items():
         text = text.replace(src, dst)
     text = text.replace(" ", " ")
-    return _WHITESPACE_RE.sub(" ", text).strip()
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    return _SPACE_BEFORE_TERMINAL_PUNCTUATION_RE.sub("", text)
 
 
 def _domain(url: str) -> str:

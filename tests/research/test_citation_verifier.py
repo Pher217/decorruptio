@@ -158,6 +158,63 @@ class TestVerbatimMatch:
         assert result.status == CitationStatus.VERBATIM
 
 
+class TestSpaceBeforePunctuationNormalization:
+    """Follow-up to routing PDF extraction through pypdf (see the S1 tests):
+    real manifest rows showed pypdf occasionally inserting a spurious space
+    immediately before punctuation that is never legitimately preceded by a
+    space in English prose (a possessive apostrophe, a comma) -- confirmed
+    on a real row: "Geidt 's assessment ... point , in February". This is
+    the same family of PDF-rendering artefact as the curly-quote/dash
+    normalisation already applied, so `_normalize` now absorbs it too.
+    Deliberately narrow: it must not swallow a genuine wording difference
+    into a false VERBATIM."""
+
+    def test_space_before_apostrophe_and_comma_normalises_to_verbatim(self):
+        """GIVEN fetched text with a spurious space inserted before a
+        possessive apostrophe and before a comma (the exact pypdf artefact
+        confirmed on a real manifest row) WHEN verified against the
+        correctly-spaced claimed quote THEN the status is VERBATIM -- the
+        rendering artefact is absorbed by normalisation rather than left to
+        cost a human a NEAR review for no reason connected to the quote's
+        authenticity."""
+        fetched = (
+            "Lord Geidt 's assessment appears to be that I should have declared "
+            "an interest. At that point , in February 2019, nothing further "
+            "was disclosed."
+        )
+        quote = (
+            "Lord Geidt's assessment appears to be that I should have declared "
+            "an interest. At that point, in February 2019, nothing further "
+            "was disclosed."
+        )
+
+        result = verify_citation(
+            "https://example.test/spaced-punctuation",
+            quote,
+            fetched_text=fetched,
+        )
+
+        assert result.status == CitationStatus.VERBATIM
+
+    def test_a_genuinely_different_word_near_punctuation_is_not_verbatim(self):
+        """GIVEN fetched text that differs from the claimed quote by a real
+        word substitution (not just spacing) immediately next to the same
+        kind of punctuation WHEN verified THEN the status is NEAR, not
+        VERBATIM -- the space-before-punctuation normalisation must not
+        widen far enough to swallow an actual wording difference; ABSENT
+        still means something."""
+        fetched = "Lord Geidt's assessment appears to be that I should have declined an interest."
+        quote = "Lord Geidt's assessment appears to be that I should have declared an interest."
+
+        result = verify_citation(
+            "https://example.test/spaced-punctuation-2",
+            quote,
+            fetched_text=fetched,
+        )
+
+        assert result.status == CitationStatus.NEAR
+
+
 class TestNearMatch:
     def test_paraphrase_is_near_with_best_matching_sentence_returned(self):
         """GIVEN a claimed quote that paraphrases (rather than quotes) the source

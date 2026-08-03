@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from django.core.exceptions import MultipleObjectsReturned
 from django.db import transaction
 
 from uncorrupt.graph.lords_interests import (
@@ -334,6 +335,19 @@ def ingest_lords_snapshot(
     coverage bias (see `describe_page_coverage_bias`): page 1 is archived
     far more densely than deeper pages, so lift measured from snapshots is
     confounded by a member's surname position unless this is reported.
+
+    Each interest is written in its OWN transaction, not one atomic block
+    over the whole snapshot (~40 pages, ~800 interests). Confirmed live
+    against the production graph: `_resolve_counterparty` (owned by
+    lords_interests.py, not editable here) can raise
+    `MultipleObjectsReturned` when a company_number already has 2+ Entity
+    rows — a real, pre-existing, INTENTIONAL condition (commit a8355c0,
+    "MULTIPLE LEIS PER COMPANY": distinct claims that must not be merged),
+    not a bug this module can fix. One ambiguous company must not roll back
+    the other ~800 interests on the same snapshot, so it is caught, counted
+    as `ambiguous_company_number`, and skipped — the same "count and skip
+    rather than crash or guess" discipline `_resolve_counterparty` already
+    applies to an ambiguous NAME match, just not (yet) to this case.
     """
     html_dir = Path(html_dir)
     page_files = sorted(html_dir.glob("page_*.html"))
@@ -348,81 +362,100 @@ def ingest_lords_snapshot(
     skipped_private_individual = 0
     skipped_no_counterparty = 0
     skipped_implausible_name = 0
+    ambiguous_company_number = 0
 
-    with transaction.atomic():
-        for page_file in page_files:
-            page_number = _page_number(page_file)
-            html_content = page_file.read_text(encoding="utf-8")
-            members = _parse_lords_page(html_content)
+    for page_file in page_files:
+        page_number = _page_number(page_file)
+        html_content = page_file.read_text(encoding="utf-8")
+        members = _parse_lords_page(html_content)
 
-            for member in members:
-                member_entity = _get_or_create_lord_entity(
-                    member["member_id"],
-                    {
-                        "name": member["name"],
-                        "party": member["party"],
-                        "peer_type": member["peer_type"],
-                    },
-                )
+        for member in members:
+            member_entity = _get_or_create_lord_entity(
+                member["member_id"],
+                {
+                    "name": member["name"],
+                    "party": member["party"],
+                    "peer_type": member["peer_type"],
+                },
+            )
 
-                for interest in member["interests"]:
-                    total_interests += 1
-                    description = interest["description"]
-                    category = interest["category"]
+            for interest in member["interests"]:
+                total_interests += 1
+                description = interest["description"]
+                category = interest["category"]
 
-                    name, company_number, is_private = _extract_counterparty(description)
+                name, company_number, is_private = _extract_counterparty(description)
 
-                    if name and len(name) > _MAX_COUNTERPARTY_NAME:
-                        skipped_implausible_name += 1
-                        continue
-                    if is_private:
-                        skipped_private_individual += 1
-                        continue
-                    if not name:
-                        skipped_no_counterparty += 1
-                        continue
+                if name and len(name) > _MAX_COUNTERPARTY_NAME:
+                    skipped_implausible_name += 1
+                    continue
+                if is_private:
+                    skipped_private_individual += 1
+                    continue
+                if not name:
+                    skipped_no_counterparty += 1
+                    continue
 
-                    interest_key = _interest_key(member["member_id"], category, name)
-                    resolved = _resolve_counterparty(name, company_number, interest_key)
-                    if resolved is None:
-                        unmatched_counterparty += 1
-                        continue
-                    counterparty_entity, confidence, method, resolve_props = resolved
+                interest_key = _interest_key(member["member_id"], category, name)
 
-                    valid_to = interest.get("ceased_date")
+                # One interest per transaction, not one atomic block over the
+                # whole snapshot: `_resolve_counterparty` (owned by
+                # lords_interests.py, not editable here) can raise
+                # MultipleObjectsReturned when a company_number already has
+                # 2+ Entity rows (a real, pre-existing condition — see
+                # commit a8355c0, "MULTIPLE LEIS PER COMPANY" — intentional,
+                # not a bug to merge away). A single ambiguous company must
+                # not roll back the other ~800 interests on this snapshot;
+                # this mirrors that same commit's other lesson ("ONE
+                # TRANSACTION OVER 21K OFFICERS" -> commit per unit of work).
+                try:
+                    with transaction.atomic():
+                        resolved = _resolve_counterparty(name, company_number, interest_key)
+                        if resolved is None:
+                            unmatched_counterparty += 1
+                            continue
+                        counterparty_entity, confidence, method, resolve_props = resolved
 
-                    edge, _ = Edge.objects.get_or_create(
-                        edge_type="declared_interest",
-                        source_entity=member_entity,
-                        target_entity=counterparty_entity,
-                        valid_from=None,
-                        valid_to=valid_to,
-                        defaults={
-                            "properties": {
-                                "category": category,
-                                "description": description,
-                                **resolve_props,
+                        valid_to = interest.get("ceased_date")
+
+                        edge, _ = Edge.objects.get_or_create(
+                            edge_type="declared_interest",
+                            source_entity=member_entity,
+                            target_entity=counterparty_entity,
+                            valid_from=None,
+                            valid_to=valid_to,
+                            defaults={
+                                "properties": {
+                                    "category": category,
+                                    "description": description,
+                                    **resolve_props,
+                                },
                             },
-                        },
-                    )
+                        )
 
-                    snapshot_reference = f"{interest_key}:{capture.timestamp}:p{page_number:02d}"
-                    _, created = Attestation.objects.get_or_create(
-                        edge=edge,
-                        source_name=source_name,
-                        source_reference=snapshot_reference,
-                        defaults={
-                            "source_url": snapshot_source_url,
-                            "observed_at": capture.captured_at,
-                            "snapshot_ref": content_hash,
-                            "match_confidence": confidence,
-                            "match_method": method,
-                        },
-                    )
-                    if created:
-                        new_attestations += 1
-                    else:
-                        existing_attestations += 1
+                        snapshot_reference = (
+                            f"{interest_key}:{capture.timestamp}:p{page_number:02d}"
+                        )
+                        _, created = Attestation.objects.get_or_create(
+                            edge=edge,
+                            source_name=source_name,
+                            source_reference=snapshot_reference,
+                            defaults={
+                                "source_url": snapshot_source_url,
+                                "observed_at": capture.captured_at,
+                                "snapshot_ref": content_hash,
+                                "match_confidence": confidence,
+                                "match_method": method,
+                            },
+                        )
+                except MultipleObjectsReturned:
+                    ambiguous_company_number += 1
+                    continue
+
+                if created:
+                    new_attestations += 1
+                else:
+                    existing_attestations += 1
 
     return {
         "capture_timestamp": capture.timestamp,
@@ -433,6 +466,7 @@ def ingest_lords_snapshot(
         "skipped_private_individual": skipped_private_individual,
         "skipped_no_counterparty": skipped_no_counterparty,
         "skipped_implausible_name": skipped_implausible_name,
+        "ambiguous_company_number": ambiguous_company_number,
     }
 
 

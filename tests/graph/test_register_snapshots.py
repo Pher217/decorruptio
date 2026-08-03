@@ -225,6 +225,104 @@ class TestIngestLordsSnapshot:
         assert att.snapshot_ref == "deadbeef" * 8
         assert "Wayback archive snapshot" in att.source_name
 
+    def test_ambiguous_company_number_is_counted_not_crashed(self, tmp_path):
+        """A company_number with 2+ pre-existing Entity rows (a real,
+        intentional condition confirmed live in production — commit
+        a8355c0, "MULTIPLE LEIS PER COMPANY": distinct claims that must not
+        be merged) makes `_resolve_counterparty`'s
+        `Entity.objects.get_or_create(entity_type="company",
+        company_number=...)` raise MultipleObjectsReturned. One ambiguous
+        interest must not crash the whole snapshot ingest — it is counted
+        and skipped, and does not prevent OTHER interests from being
+        ingested."""
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        # Two pre-existing Entity rows sharing a company_number but
+        # different registry_scheme — exactly the real production state
+        # that raised MultipleObjectsReturned.
+        Entity.objects.create(
+            entity_type="company",
+            company_number="01234567",
+            registry_scheme="GB-COH",
+            registry_id="01234567",
+            name="Microlink PC (UK) Ltd",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            company_number="01234567",
+            registry_scheme="GLEIF",
+            registry_id="some-lei",
+            name="Microlink PC (UK) Ltd",
+        )
+        (tmp_path / "page_01.html").write_text(SAMPLE_HTML, encoding="utf-8")
+        capture = _make_capture("20200617183732")
+
+        summary = ingest_lords_snapshot(tmp_path, capture, content_hash="hash")
+
+        assert summary["ambiguous_company_number"] == 1
+        assert summary["new_attestations"] == 0
+        assert summary["total_interests"] == 1
+
+    def test_one_ambiguous_interest_does_not_roll_back_other_interests(self, tmp_path):
+        """A MultipleObjectsReturned on one member's interest must not roll
+        back a DIFFERENT member's interest ingested in the same snapshot —
+        each interest commits independently."""
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        Entity.objects.create(
+            entity_type="company",
+            company_number="01234567",
+            registry_scheme="GB-COH",
+            registry_id="01234567",
+            name="Microlink PC (UK) Ltd",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            company_number="01234567",
+            registry_scheme="GLEIF",
+            registry_id="some-lei",
+            name="Microlink PC (UK) Ltd",
+        )
+        html_with_second_member = SAMPLE_HTML.replace(
+            "</body></html>",
+            """
+  <div class="card-expandable">
+    <a class="card card-member" href="/member/9999/contact">
+      <div class="card-inner"><div class="content">
+        <div class="primary-info">Lord Second</div>
+        <div class="secondary-info">Crossbench</div>
+        <div class="secondary-info">Life peer</div>
+      </div></div>
+    </a>
+    <div class="expand-area"><div class="expand-area-content">
+      <div class="card card-child">
+        <div class="card-inner"><div class="content">
+          <div class="primary-info">Category 1: Directorships</div>
+          <ul><li>Director, Untangled Holdings Ltd (finance)</li></ul>
+        </div></div>
+      </div>
+    </div></div>
+  </div>
+</body></html>""",
+        )
+        (tmp_path / "page_01.html").write_text(html_with_second_member, encoding="utf-8")
+        capture = _make_capture("20200617183732")
+
+        summary = ingest_lords_snapshot(tmp_path, capture, content_hash="hash")
+
+        assert summary["ambiguous_company_number"] == 1
+        assert summary["new_attestations"] == 1
+        second_lord = Entity.objects.get(registry_id="9999")
+        assert Edge.objects.filter(
+            source_entity=second_lord, edge_type="declared_interest"
+        ).exists()
+
     def test_reingesting_same_capture_is_idempotent(self, tmp_path):
         """Re-running the same snapshot does not duplicate the attestation."""
         Company.objects.create(

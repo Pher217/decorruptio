@@ -54,7 +54,14 @@ VIP_CH_CACHE = "experiments/vip_ch_cache.json"
 # rather than inventing a per-row date we cannot source.
 AWARD_CUTOFF = date(2020, 3, 1)
 
-_SUFFIXES = re.compile(r"\b(LIMITED|LTD|PLC|LLP|LP|GROUP|HOLDINGS|INTERNATIONAL|UK|THE|AND|CO)\b")
+# GROUP and HOLDINGS are deliberately NOT in this list -- they are legally
+# distinguishing words, not filler. Stripping them collapsed three real,
+# separately-registered companies onto one normalised key: "CLOSE BROTHERS
+# GROUP PLC" (the parent, GB-COH 00520241), "CLOSE BROTHERS LIMITED" (a
+# subsidiary, 00195626), and "CLOSE BROTHERS HOLDINGS LIMITED" (another
+# subsidiary, 06582618) all normalised to "CLOSE BROTHERS", turning a single
+# unambiguous name into a 3-way collision (found via a positive-control run).
+_SUFFIXES = re.compile(r"\b(LIMITED|LTD|PLC|LLP|LP|INTERNATIONAL|UK|THE|AND|CO)\b")
 
 
 def normalise_company_number(cn: str) -> str:
@@ -141,6 +148,27 @@ def surname(person_name: str) -> str:
     return tokens[-1].lower() if tokens else ""
 
 
+def prefer_companies_house(candidates: list[Entity]) -> list[Entity]:
+    """Disambiguate a name-matched candidate SET without merging anything.
+
+    GLEIF publishes an LEI for organisations registered with a UK authority
+    other than Companies House (e.g. a charity that is also a company limited
+    by guarantee), which the ingest correctly leaves un-cross-linked
+    (`company_number` NULL) -- see `graph.gleif._resolve_gb_company`. That
+    surfaces at name-resolution time as two exact-name-matching Entity rows
+    for one real organisation: a GB-COH record and a GLEIF-LEI record ("EDGE
+    FOUNDATION", found via a positive control). Companies House is the
+    authoritative national company register, so when a GB-COH candidate is
+    present and unique among the matches, it wins the tie -- the GLEIF-LEI
+    row is untouched in the database, just not the chosen path-search node.
+    Any other ambiguity (e.g. two GB-COH candidates) is left unresolved.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    gb_coh = [e for e in candidates if e.registry_scheme == "GB-COH"]
+    return gb_coh if len(gb_coh) == 1 else candidates
+
+
 def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = None) -> Entity | None:
     """Registry ID first, exact normalised name second. Never a fuzzy guess.
 
@@ -169,7 +197,7 @@ def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = Non
     if not target:
         return None
     nearby = Entity.objects.filter(entity_type="company", name__icontains=name.strip()[:15])[:200]
-    candidates = [e for e in nearby if normalise_name(e.name) == target]
+    candidates = prefer_companies_house([e for e in nearby if normalise_name(e.name) == target])
     # Uniqueness guard: 2+ candidates means we cannot say which, so we say none.
     return candidates[0] if len(candidates) == 1 else None
 

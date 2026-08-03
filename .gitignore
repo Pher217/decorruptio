@@ -20,3 +20,8 @@ dashboard/dist/
 # OS
 .DS_Store
 decorruptio_dev.db
+
+# graphify writes its output into the CWD — never let it land in the code repo.
+# Canonical graph home is ~/dev/Graphify/{Project}/{repo}/ (see graphify-canonical.sh).
+graphify-out/
+.graphify_*

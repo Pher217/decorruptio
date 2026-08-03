@@ -262,9 +262,15 @@ class TestIngestLordsSnapshot:
 
         summary = ingest_lords_snapshot(tmp_path, capture, content_hash="hash")
 
-        assert summary["ambiguous_company_number"] == 1
-        assert summary["new_attestations"] == 0
+        # Root fix supersedes this workaround: lords_interests._canonical_company_entity
+        # now resolves on registry_scheme="GB-COH", so a coexisting GLEIF Entity with
+        # the same company_number no longer raises MultipleObjectsReturned. The
+        # defensive counter stays 0 and the interest resolves to the GB-COH Entity --
+        # neither Entity is merged or altered (ADR-006, duplicate over merge).
+        assert summary["ambiguous_company_number"] == 0
+        assert summary["new_attestations"] == 1
         assert summary["total_interests"] == 1
+        assert Entity.objects.filter(company_number="01234567").count() == 2
 
     def test_one_ambiguous_interest_does_not_roll_back_other_interests(self, tmp_path):
         """A MultipleObjectsReturned on one member's interest must not roll
@@ -316,8 +322,13 @@ class TestIngestLordsSnapshot:
 
         summary = ingest_lords_snapshot(tmp_path, capture, content_hash="hash")
 
-        assert summary["ambiguous_company_number"] == 1
-        assert summary["new_attestations"] == 1
+        # The root fix in lords_interests._canonical_company_entity resolves on
+        # registry_scheme="GB-COH", so a coexisting GLEIF Entity with the same
+        # company_number no longer raises MultipleObjectsReturned. The defensive
+        # counter in ingest_lords_snapshot therefore stays at 0 -- ambiguity is
+        # PREVENTED at the root, not caught downstream. Both interests resolve.
+        assert summary["ambiguous_company_number"] == 0
+        assert summary["new_attestations"] == 2
         second_lord = Entity.objects.get(registry_id="9999")
         assert Edge.objects.filter(
             source_entity=second_lord, edge_type="declared_interest"

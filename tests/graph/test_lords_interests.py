@@ -502,6 +502,7 @@ class TestLordsInterestsIngest:
         assert summary["matched"] == 0
         assert summary["total_members"] == 2
 
+
 class TestLordsInterestsRegisterContract:
     def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
         """GIVEN sources/uk_lords_interests.yml cannot be resolved (its source_id is

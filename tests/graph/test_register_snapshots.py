@@ -21,6 +21,7 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.graph.register_snapshots import (
     EvidenceLevel,
     WaybackCapture,
+    describe_page_coverage_bias,
     edge_evidence_level,
     find_all_paths,
     ingest_lords_snapshot,
@@ -30,6 +31,7 @@ from uncorrupt.graph.register_snapshots import (
     path_evidence_level,
     query_wayback_cdx,
     relationship_evidence_level,
+    snapshot_evidence_pages,
     wilson_interval,
 )
 from uncorrupt.staging.companies_house import _normalise_name
@@ -218,7 +220,7 @@ class TestIngestLordsSnapshot:
         assert summary["new_attestations"] == 1
         lord = Entity.objects.get(registry_id="3898")
         edge = Edge.objects.get(source_entity=lord, edge_type="declared_interest")
-        att = edge.attestations.get(source_reference__endswith=":20200617183732")
+        att = edge.attestations.get(source_reference__endswith=":20200617183732:p01")
         assert att.observed_at == datetime(2020, 6, 17, 18, 37, 32, tzinfo=UTC)
         assert att.snapshot_ref == "deadbeef" * 8
         assert "Wayback archive snapshot" in att.source_name
@@ -293,6 +295,86 @@ class TestIngestLordsSnapshot:
 
         lord = Entity.objects.get(registry_id="3898")
         assert Edge.objects.filter(source_entity=lord, edge_type="declared_interest").count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Alphabetical-coverage bias
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestSnapshotEvidencePages:
+    def test_reports_the_page_a_snapshot_was_ingested_from(self, tmp_path):
+        """A snapshot ingested from page_03.html records page 3 on the edge."""
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        (tmp_path / "page_03.html").write_text(SAMPLE_HTML, encoding="utf-8")
+        capture = _make_capture("20200617183732")
+
+        ingest_lords_snapshot(tmp_path, capture, content_hash="hash_a")
+
+        lord = Entity.objects.get(registry_id="3898")
+        edge = Edge.objects.get(source_entity=lord, edge_type="declared_interest")
+        assert snapshot_evidence_pages(edge) == [3]
+
+    def test_excludes_attestations_on_or_after_award_date(self, tmp_path):
+        """A snapshot observed on/after the award date is not pre-award
+        evidence and is excluded when `award_date` is supplied."""
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        (tmp_path / "page_01.html").write_text(SAMPLE_HTML, encoding="utf-8")
+        # Capture dated AFTER the award date used below.
+        capture = _make_capture("20210401143530")
+
+        ingest_lords_snapshot(tmp_path, capture, content_hash="hash_a")
+
+        lord = Entity.objects.get(registry_id="3898")
+        edge = Edge.objects.get(source_entity=lord, edge_type="declared_interest")
+        assert snapshot_evidence_pages(edge, award_date=date(2020, 3, 1)) == []
+
+    def test_edge_with_no_snapshot_attestations_returns_empty_list(self):
+        """An edge with no snapshot evidence at all reports no pages — not an
+        error, just nothing to report."""
+        person = Entity.objects.create(entity_type="person", name="Test")
+        company = Entity.objects.create(entity_type="company", name="Test Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+
+        assert snapshot_evidence_pages(edge) == []
+
+
+class TestDescribePageCoverageBias:
+    def test_reports_capture_count_per_requested_page(self):
+        """Each requested page number gets its own CDX-derived capture count —
+        used to show the register's archival density falls off with depth."""
+        responses = {
+            "1": 3,
+            "2": 1,
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_url = request.url.params.get("url", "")
+            count = responses["2"] if "page=2" in requested_url else responses["1"]
+            rows = [
+                ["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"]
+            ]
+            rows += [
+                ["k", f"2020010{i}000000", "https://x", "text/html", "200", f"D{i}", "100"]
+                for i in range(count)
+            ]
+            return httpx.Response(200, json=rows)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        result = describe_page_coverage_bias([1, 2], client=client)
+
+        assert result == {1: 3, 2: 1}
 
 
 # ---------------------------------------------------------------------------

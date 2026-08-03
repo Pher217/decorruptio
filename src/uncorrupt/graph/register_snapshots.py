@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ from django.db import transaction
 
 from uncorrupt.graph.lords_interests import (
     _MAX_COUNTERPARTY_NAME,
+    LORDS_REGISTER_URL,
     WAYBACK_PREFIX,
     LordsFetchResult,
     _extract_counterparty,
@@ -272,6 +274,21 @@ def fetch_lords_snapshot(
 # ---------------------------------------------------------------------------
 
 
+_PAGE_FILE_RE = re.compile(r"page_(\d+)")
+
+
+def _page_number(page_file: Path) -> int:
+    """Extract the register page number from a `page_NN.html` filename.
+
+    `lords_interests.fetch_lords_register` names pages `page_{n:02d}.html`
+    (1-based) — 0 is an impossible page number and signals a filename that
+    doesn't match the expected pattern, so callers can tell it apart from a
+    real page.
+    """
+    m = _PAGE_FILE_RE.match(page_file.stem)
+    return int(m.group(1)) if m else 0
+
+
 def _interest_key(member_id: str, category: str, name: str) -> str:
     """Mirrors `lords_interests.ingest_lords_register`'s own interest_key
     derivation, so a snapshot attestation's reference correlates with the
@@ -308,9 +325,15 @@ def ingest_lords_snapshot(
     dedup, not stored here.
 
     The Attestation is keyed on `(edge, source_name, f"{interest_key}:
-    {capture.timestamp}")` — distinct per snapshot, so N historical
-    snapshots of the same still-registered interest produce N separate,
-    correctly-dated attestations rather than collapsing onto one.
+    {capture.timestamp}:p{page_number}")` — distinct per snapshot AND per
+    register page, so N historical snapshots of the same still-registered
+    interest produce N separate, correctly-dated attestations rather than
+    collapsing onto one. The embedded page number lets
+    `snapshot_evidence_pages` trace which register page supplied a given
+    edge's evidence — needed to quantify the register's alphabetical-
+    coverage bias (see `describe_page_coverage_bias`): page 1 is archived
+    far more densely than deeper pages, so lift measured from snapshots is
+    confounded by a member's surname position unless this is reported.
     """
     html_dir = Path(html_dir)
     page_files = sorted(html_dir.glob("page_*.html"))
@@ -328,6 +351,7 @@ def ingest_lords_snapshot(
 
     with transaction.atomic():
         for page_file in page_files:
+            page_number = _page_number(page_file)
             html_content = page_file.read_text(encoding="utf-8")
             members = _parse_lords_page(html_content)
 
@@ -382,7 +406,7 @@ def ingest_lords_snapshot(
                         },
                     )
 
-                    snapshot_reference = f"{interest_key}:{capture.timestamp}"
+                    snapshot_reference = f"{interest_key}:{capture.timestamp}:p{page_number:02d}"
                     _, created = Attestation.objects.get_or_create(
                         edge=edge,
                         source_name=source_name,
@@ -410,6 +434,78 @@ def ingest_lords_snapshot(
         "skipped_no_counterparty": skipped_no_counterparty,
         "skipped_implausible_name": skipped_implausible_name,
     }
+
+
+# ---------------------------------------------------------------------------
+# Alphabetical-coverage bias — the register is sorted alphabetically and
+# Wayback's archival density is NOT uniform across it
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_REFERENCE_PAGE_RE = re.compile(r":p(\d+)$")
+
+
+def snapshot_evidence_pages(edge: Edge, award_date: date | None = None) -> list[int]:
+    """Which register page(s) supplied `edge`'s snapshot evidence.
+
+    Parses the page number `ingest_lords_snapshot` embeds in
+    `Attestation.source_reference`. If `award_date` is given, only
+    attestations observed strictly before it are considered (matching
+    PRE_AWARD_OBSERVED's own definition); otherwise every snapshot-sourced
+    attestation on the edge is included.
+
+    This exists to quantify the register's ALPHABETICAL-COVERAGE BIAS:
+    verified live (2026-08-02) that the register is sorted alphabetically
+    (page 1 starts "Lord Aberdare"/"Baroness Adams..."; page 2 "Lord
+    Arbuthnot..."; page 20 "Lord Hunt..."; page 40 "Baroness Warsi...") and
+    that Wayback's archival density falls off sharply with page depth (see
+    `describe_page_coverage_bias`). A member early in the alphabet has far
+    more chances to be caught by a pre-award snapshot than one late in it —
+    independent of whether their relationship is real — so any lift number
+    must be reported broken down by page, not averaged across the cohort.
+    """
+    qs = edge.attestations.filter(snapshot_ref__isnull=False)
+    if award_date is not None:
+        award_datetime = datetime.combine(award_date, datetime.min.time(), tzinfo=UTC)
+        qs = qs.filter(observed_at__lt=award_datetime)
+
+    pages: set[int] = set()
+    for source_reference in qs.values_list("source_reference", flat=True):
+        if not source_reference:
+            continue
+        m = _SNAPSHOT_REFERENCE_PAGE_RE.search(source_reference)
+        if m:
+            pages.add(int(m.group(1)))
+    return sorted(pages)
+
+
+def describe_page_coverage_bias(
+    page_numbers: Sequence[int],
+    client: httpx.Client | None = None,
+) -> dict[int, int]:
+    """Wayback capture count for each requested Lords-register page number.
+
+    Live numbers checked 2026-08-02 (`collapse=digest`, 2020-06 to
+    2026-07): page 1 has 51 unique captures, page 2 has 14, page 5 has 7,
+    page 20 has 4, page 40 has 6. Page 1 is archived roughly 3-10x more
+    densely than any deeper page — deeper pages are all in the same thin
+    4-14 range, not a smooth decline. Combined with the register's
+    alphabetical ordering (see `snapshot_evidence_pages`), this means
+    snapshot-derived pre-award evidence is structurally easier to find for
+    members whose surname sorts early — a confound on any lift measurement,
+    not a footnote.
+    """
+    owns_client = client is None
+    client = client or httpx.Client(timeout=30.0)
+    try:
+        result: dict[int, int] = {}
+        for page in page_numbers:
+            url = LORDS_REGISTER_URL if page == 1 else f"{LORDS_REGISTER_URL}?page={page}"
+            captures = query_wayback_cdx(url, client=client)
+            result[page] = len(captures)
+        return result
+    finally:
+        if owns_client:
+            client.close()
 
 
 # ---------------------------------------------------------------------------

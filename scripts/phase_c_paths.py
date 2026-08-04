@@ -169,6 +169,54 @@ def prefer_companies_house(candidates: list[Entity]) -> list[Entity]:
     return gb_coh if len(gb_coh) == 1 else candidates
 
 
+def _resolve_by_company_number(cn: str) -> Entity | None:
+    """Deterministic, GB-COH-preferring lookup for one normalised company number.
+
+    A company number can be carried by more than one Entity row: GLEIF
+    cross-links a UK company's LEI record with the same `company_number` as
+    its Companies House twin (`graph.gleif._resolve_gb_company`), so
+    `Entity.objects.filter(company_number=cn)` can return several rows for
+    one real organisation. Django's `.first()` implicitly orders an unordered
+    queryset by `pk`, so a plain `.first()` here always picks whichever
+    candidate happened to get the lowest database id -- an accident of
+    ingestion order (which source ran first, whether the graph was rebuilt),
+    not a rule about which register is authoritative. That is a
+    reproducibility hazard across graph builds, and it is liable to land on
+    the GLEIF twin: `officer_of` edges attach to the GB-COH node, so
+    resolving to the GLEIF twin silently yields a company with no officers,
+    a recall failure indistinguishable from a genuine null.
+
+    The GB-COH node for a company number is unique by construction
+    (`unique_registry_id` constraint on (`registry_scheme`, `registry_id`),
+    and every GB-COH-creating ingest path sets `registry_id` = its own
+    `company_number` -- see `ch_appointments._canonical_company_entity` /
+    `ch_officers._canonical_company_entity`), so looking it up directly is
+    both deterministic and authoritative regardless of ingestion order. Only
+    when no GB-COH row exists for this number do we fall back to
+    `prefer_companies_house` over whatever `company_number`-tagged rows do
+    exist, same disambiguation convention used for name matches below --
+    never a second, ad hoc tie-break.
+
+    Intentional, measured behaviour change from the old plain-`.first()`
+    version: when an ambiguous `company_number` has NO GB-COH row at all
+    (so the fallback's `prefer_companies_house` sees no authoritative
+    candidate and stays ambiguous among 2+ rows), this now returns `None`
+    where the old code returned whichever row had the lowest pk. Exactly 4
+    such groups exist in the graph as measured, all with 0 edges attached
+    (so nothing downstream was relying on the old pick), and one of them
+    (`04867747`) holds two genuinely different companies sharing a reused
+    company number, for which `None` is the more correct answer than an
+    arbitrary pick.
+    """
+    found = Entity.objects.filter(registry_scheme="GB-COH", registry_id=cn).first()
+    if found:
+        return found
+    candidates = prefer_companies_house(
+        list(Entity.objects.filter(company_number=cn).order_by("id"))
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = None) -> Entity | None:
     """Registry ID first, exact normalised name second. Never a fuzzy guess.
 
@@ -177,26 +225,46 @@ def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = Non
     so it is tried before the cache and before name matching.
     """
     if company_number and company_number.strip():
-        cn = normalise_company_number(company_number)
-        found = Entity.objects.filter(company_number=cn).first()
-        if found:
-            return found
-        found = Entity.objects.filter(registry_scheme="GB-COH", registry_id=cn).first()
+        found = _resolve_by_company_number(normalise_company_number(company_number))
         if found:
             return found
 
     cached = ch_cache.get(name.strip())
     if cached and cached.get("company_number"):
-        cn = normalise_company_number(cached["company_number"])
-        found = Entity.objects.filter(company_number=cn).first()
-        if found:
-            return found
-        return Entity.objects.filter(registry_scheme="GB-COH", registry_id=cn).first()
+        return _resolve_by_company_number(normalise_company_number(cached["company_number"]))
 
     target = normalise_name(name)
     if not target:
         return None
-    nearby = Entity.objects.filter(entity_type="company", name__icontains=name.strip()[:15])[:200]
+    # Ordered and fetched one row past the cap so truncation is detectable.
+    # An unordered `[:200]` slice is DB-order-dependent, and if a genuine
+    # second exact-name match happens to fall outside the window, the
+    # uniqueness guard below sees only one candidate and wrongly passes it --
+    # truncation manufacturing apparent uniqueness. A capped window is
+    # therefore never trusted to prove uniqueness; we return None instead
+    # (same precision-over-recall stance as the guard itself).
+    #
+    # Known over-conservatism: this guard counts rows matching the 15-char
+    # SUBSTRING prefix, but the question it is standing in for is whether an
+    # EXACT-name match is unique -- a check measured at one scope (substring
+    # window size) and applied to a different one (exact-name uniqueness).
+    # That means it can reject a resolution as unprovable even when the
+    # exact-name candidate set underneath it is trivially unique. It fails
+    # closed (this never produces a wrong link, only a missed one), and it is
+    # unreachable in practice today: the worst observed substring window
+    # across this cohort is 21 rows against a cap of 200, and 0 of 52 cohort
+    # names and 0 of 300 sampled company names come anywhere near the cap.
+    # Left as-is deliberately -- precision-over-recall makes the conservative
+    # behaviour acceptable here -- but it is a latent recall trap if the
+    # company table grows enough that ordinary substrings start landing
+    # windows near 200.
+    nearby = list(
+        Entity.objects.filter(entity_type="company", name__icontains=name.strip()[:15]).order_by(
+            "id"
+        )[:201]
+    )
+    if len(nearby) > 200:
+        return None
     candidates = prefer_companies_house([e for e in nearby if normalise_name(e.name) == target])
     # Uniqueness guard: 2+ candidates means we cannot say which, so we say none.
     return candidates[0] if len(candidates) == 1 else None

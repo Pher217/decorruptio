@@ -27,3 +27,9 @@ dashboard/dist/
 # OS
 .DS_Store
 decorruptio_dev.db
+
+# graphify build output — canonical home is ~/dev/Graphify/{Project}/{repo}/
+graphify-out/
+
+# playwright-mcp scratch output (downloaded registers, console logs)
+.playwright-mcp/

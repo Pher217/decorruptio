@@ -208,6 +208,25 @@ class TestResolveCandidates:
 
         assert resolved["00000001"] is None
 
+    def test_calls_resolve_supplier_with_an_empty_name(self, monkeypatch):
+        """GIVEN a candidate WHEN resolve_candidates runs THEN
+        resolve_supplier is called with name="" -- pinning the deliberate
+        choice not to engage the name-matching fallback tier directly,
+        independent of whether any particular fixture entity happens to
+        coincidentally name-match (which the scenario-based test above
+        cannot rule out on its own)."""
+        calls: list[tuple[str, dict, str | None]] = []
+
+        def fake_resolve_supplier(name, ch_cache, company_number=None):
+            calls.append((name, ch_cache, company_number))
+            return None
+
+        monkeypatch.setattr(lead_scan, "resolve_supplier", fake_resolve_supplier)
+
+        resolve_candidates({"00000001": date(2020, 1, 1)})
+
+        assert calls == [("", {}, "00000001")]
+
 
 @pytest.mark.django_db
 class TestScanStatuses:
@@ -710,3 +729,38 @@ class TestBuildReportIntegration:
         assert pre_award_row["status"] == "pre_award"
         assert pre_award_row["pre_award_paths"][0]["member_registry_id"] == "1001"
         assert pre_award_row["pre_award_paths"][0]["company_registry_id"] == "00000001"
+
+    def test_default_max_hops_is_two_not_three(self):
+        """GIVEN a company reachable from a member only via a chain that
+        costs THREE real (non-same_as) hops (officer_of -> ownership ->
+        ownership) WHEN build_report runs with its default max_hops THEN
+        that company is reported as no_path -- pinning DEFAULT_MAX_HOPS at
+        2, not some looser budget that would silently widen what this
+        script counts as a 'two-hop' lead."""
+        company_a = _company_entity("00000002", "INTERMEDIATE A LTD")
+        company_b = _company_entity("00000003", "INTERMEDIATE B LTD")
+        target = _company_entity("00000001", "TARGET LTD")
+        member = _member("Lord Example", "1001")
+        officer = _officer("EXAMPLE, Lord")
+        _same_as(member, officer, 0.60, "surname_title_only")
+        _officer_of(officer, company_a, date(2010, 1, 1))
+        Edge.objects.create(
+            edge_type="ownership",
+            source_entity=company_a,
+            target_entity=company_b,
+            valid_from=date(2011, 1, 1),
+        )
+        Edge.objects.create(
+            edge_type="ownership",
+            source_entity=company_b,
+            target_entity=target,
+            valid_from=date(2012, 1, 1),
+        )
+        _resolution("Target Ltd", "00000001")
+        _award("Target Ltd", date(2020, 1, 1))
+
+        report = build_report()
+
+        target_row = next(r for r in report["rows"] if r["company_number"] == "00000001")
+        assert target_row["status"] == "no_path"
+        assert target_row["any_2hop_path"] is False

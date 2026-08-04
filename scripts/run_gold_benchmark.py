@@ -503,13 +503,26 @@ def compute_graph_hash() -> str:
     """Canonical, order-independent graph hash (spec A2.4.5) -- a drift
     detector, not a cryptographic commitment: sha256 over every edge's
     (edge_type, source_entity_id, target_entity_id, valid_from) tuple,
-    sorted so insertion order never changes the hash."""
-    rows = sorted(
-        Edge.objects.values_list("edge_type", "source_entity_id", "target_entity_id", "valid_from")
+    sorted so insertion order never changes the hash.
+
+    Sorting happens on the SAME string serialization that gets hashed, not
+    on the raw tuples. Real `officer_of` reappointment pairs share
+    (edge_type, source_entity_id, target_entity_id) with one row's
+    `valid_from` `None` and the other's a `datetime.date` -- Python raises
+    `TypeError: '<' not supported between instances of 'NoneType' and
+    'datetime.date'` comparing those tuples directly. Sorting the rendered
+    strings sidesteps the cross-type comparison entirely (strings are
+    always orderable) while staying exactly as deterministic and
+    order-independent as a raw-tuple sort would be, and it hashes undated
+    edges same as before -- nothing is dropped from the hash.
+    """
+    rows = Edge.objects.values_list(
+        "edge_type", "source_entity_id", "target_entity_id", "valid_from"
     )
+    serialized_rows = sorted("|".join(str(x) for x in row) for row in rows)
     h = hashlib.sha256()
-    for row in rows:
-        h.update("|".join(str(x) for x in row).encode("utf-8"))
+    for row in serialized_rows:
+        h.update(row.encode("utf-8"))
         h.update(b"\n")
     return h.hexdigest()
 

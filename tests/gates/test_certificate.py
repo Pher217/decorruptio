@@ -96,6 +96,71 @@ class TestBuildNoScoreCertificate:
         )
         assert "no external control battery" in blocker["reason"]
 
+    def test_failing_stratum_gate_names_the_blocker_with_its_exact_score(self):
+        """GIVEN a stratum measurement that IS available (a real 12-row control
+        battery ran) but scores below the >=9/10 gate -- the real measured
+        Companies House shape (7/12 retrieval, 7/12 temporal, spec amendment
+        v2.10)
+        WHEN a no-score certificate is built
+        THEN it names that exact stratum as a blocker and the blocker detail
+        carries the real recovered/total counts, not just a boolean."""
+        strata = {
+            "ch_officer_appointment": StratumMeasurement(
+                name="ch_officer_appointment",
+                available=True,
+                retrieval_recovered=7,
+                retrieval_total=12,
+                temporal_recovered=7,
+                temporal_total=12,
+            )
+        }
+
+        certificate = build_no_score_certificate(_freeze_state(), stratum_measurements=strata)
+
+        assert certificate is not None
+        blocker = next(
+            b for b in certificate["blockers"] if b["gate"] == "stratum:ch_officer_appointment"
+        )
+        assert blocker["detail"]["retrieval_recovered"] == 7
+        assert blocker["detail"]["retrieval_total"] == 12
+        assert blocker["detail"]["temporal_recovered"] == 7
+        assert blocker["detail"]["temporal_total"] == 12
+
+    def test_certificate_cannot_claim_a_pass_when_a_gate_failed(self):
+        """GIVEN a stratum battery with one measured, failing gate (CH 7/12,
+        below the 90% bar) alongside one passing gate (Electoral Commission
+        11/12)
+        WHEN a no-score certificate is built
+        THEN the certificate is emitted with no_score=True -- there is no code
+        path in which a failing measured gate produces a certificate claiming
+        overall success; a passing sibling stratum never masks the failure."""
+        strata = {
+            "ch_officer_appointment": StratumMeasurement(
+                name="ch_officer_appointment",
+                available=True,
+                retrieval_recovered=7,
+                retrieval_total=12,
+                temporal_recovered=7,
+                temporal_total=12,
+            ),
+            "electoral_commission": StratumMeasurement(
+                name="electoral_commission",
+                available=True,
+                retrieval_recovered=11,
+                retrieval_total=12,
+                temporal_recovered=11,
+                temporal_total=12,
+            ),
+        }
+
+        certificate = build_no_score_certificate(_freeze_state(), stratum_measurements=strata)
+
+        assert certificate is not None
+        assert certificate["no_score"] is True
+        gates_named = {b["gate"] for b in certificate["blockers"]}
+        assert gates_named == {"stratum:ch_officer_appointment"}
+        assert "stratum:electoral_commission" not in gates_named
+
     def test_certificate_binds_to_the_freeze_state(self):
         """GIVEN a freeze state
         WHEN a no-score certificate is built for a failing gate

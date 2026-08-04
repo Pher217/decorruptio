@@ -267,7 +267,8 @@ def _resolve_donor_company(row: dict[str, str]) -> tuple[Company | None, float, 
 def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
     """Ingest a previously-downloaded EC donations CSV into Entity/Edge rows.
 
-    Returns summary stats: {matched, unmatched_donor, skipped_individual, total}.
+    Returns summary stats: {matched, unmatched_donor, skipped_individual,
+    attestations_updated, total}.
     """
     load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     csv_path = Path(csv_path)
@@ -276,6 +277,7 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
     skipped_individual = 0
     skipped_no_recipient_name = 0
     invalid_received_date = 0
+    attestations_updated = 0
     total = 0
 
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -368,18 +370,46 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
                 }
                 if ec_ref:
                     att_lookup["source_reference"] = ec_ref
-                Attestation.objects.get_or_create(
-                    **att_lookup,
-                    defaults={
-                        "source_url": (
-                            f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
-                            if ec_ref
-                            else None
-                        ),
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    },
+                source_url = (
+                    f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
+                    if ec_ref
+                    else None
                 )
+
+                # get_or_create's `defaults` are silently discarded once a
+                # row exists (the same bug class identity_resolution.py had
+                # -- see its fix for the general shape). ECRef is a stable
+                # key across ingests, but _resolve_donor_company() re-queries
+                # the live Company table on every run, and this module is a
+                # "live export of the CURRENT donation register" (see
+                # fetch_ec_donations_csv) that gets re-fetched over time --
+                # so the SAME ECRef can legitimately resolve via a different
+                # tier on a later re-ingest (e.g. a CompanyRegistrationNumber
+                # the EC backfills, or drops, between two exports) even
+                # though the donor company -- and therefore this edge --
+                # never changes. Correct the persisted confidence/method to
+                # this run's decision in either direction, but only when it
+                # actually changed. `observed_at` is deliberately left alone:
+                # this connector never sets it (a live current-register
+                # snapshot has no capture date of its own to record -- see
+                # the module docstring), so there is no bitemporal field
+                # here to update or preserve.
+                existing_attestation = Attestation.objects.filter(**att_lookup).first()
+                if existing_attestation is None:
+                    Attestation.objects.create(
+                        **att_lookup,
+                        source_url=source_url,
+                        match_confidence=confidence,
+                        match_method=method,
+                    )
+                elif (
+                    existing_attestation.match_confidence != confidence
+                    or existing_attestation.match_method != method
+                ):
+                    existing_attestation.match_confidence = confidence
+                    existing_attestation.match_method = method
+                    existing_attestation.save(update_fields=["match_confidence", "match_method"])
+                    attestations_updated += 1
                 if edge_created:
                     matched += 1
 
@@ -389,5 +419,6 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
         "skipped_individual": skipped_individual,
         "skipped_no_recipient_name": skipped_no_recipient_name,
         "invalid_received_date": invalid_received_date,
+        "attestations_updated": attestations_updated,
         "total": total,
     }

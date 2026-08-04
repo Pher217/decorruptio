@@ -35,3 +35,11 @@ graphify-out/
 
 # playwright-mcp scratch output (downloaded registers, console logs)
 .playwright-mcp/
+
+# Claude Code local session state. Agent worktrees, scheduler locks and the
+# next-session handoff are machine-local: the durable version of session state
+# is the vault (02 Projects/Ideas/Decorruptio/03 Sessions/hot.md), per
+# vault-as-source-of-truth. Skills/agents/plans stay trackable by design.
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/TOMORROW.md

@@ -67,10 +67,19 @@ not). Never inferred or defaulted — left null and counted when absent.
 Counterparty resolution mirrors the EC donations uniqueness guard: a company
 number resolves with zero name matching (confidence 1.0); a unique exact
 name match to `staging.Company` resolves at confidence 0.9; 2+ candidates
-sharing a normalised name is never guessed (no edge, counted separately).
-Unlike EC donations, a named counterparty that doesn't resolve to a known
-company is still recorded — but never as a shared node keyed on the bare
-name (that would merge unrelated organisations that happen to share a
+sharing a normalised name is never guessed (no edge, counted separately). If
+the exact (case/whitespace-only) normalisation finds nothing, a second,
+suffix/punctuation-tolerant pass (`_normalise_name_loose`) is tried before
+giving up — a declared free-text name routinely differs from the Companies
+House legal name by exactly a legal-form suffix ("Ltd" vs "Limited") or
+punctuation ("&" vs "and"); a unique match there resolves at confidence 0.8,
+method "normalised_name", and 2+ candidates is refused exactly like the
+exact-match case. Verified live 2026-08-04: 22 of the 25 ever-ingested
+Commons declared_interest edges resolved to a placeholder instead of an
+already-known real Company for exactly this reason before this fallback
+existed. Unlike EC donations, a named counterparty that doesn't resolve to a
+known company is still recorded — but never as a shared node keyed on the
+bare name (that would merge unrelated organisations that happen to share a
 name). It is scoped to the interest that named it
 (`registry_scheme="UK-PARLIAMENT-UNRESOLVED"`,
 `registry_id=f"{interest_id}:{normalised_name}"`, confidence 0.5, method
@@ -558,6 +567,30 @@ def _counterparty_groups(
     return groups
 
 
+_LOOSE_SUFFIX_RE = re.compile(r"\b(LIMITED|LTD|PLC|LLP|LP|INTERNATIONAL|UK|THE|AND|CO)\b")
+
+
+def _normalise_name_loose(name: str) -> str:
+    """Suffix/punctuation-tolerant normalisation for the name-only Company fallback.
+
+    `_normalise_name` (case/whitespace only) is the primary, highest-confidence
+    match — it never merges two companies that only coincidentally share a
+    normalised name. But a Parliament-register free-text organisation name
+    routinely differs from the Companies House legal name by exactly a legal
+    form suffix ("Ltd" vs "Limited"/"PLC"), a leading "The", or punctuation
+    ("&" vs "and") — e.g. the declared "DODS GROUP LTD" vs Companies House's
+    real "DODS GROUP LIMITED". Verified live 2026-08-04 against the graph: 22
+    of the 25 ever-ingested Commons declared_interest edges resolved to a
+    UK-PARLIAMENT-UNRESOLVED placeholder instead of an already-known real
+    Company for exactly this reason. Mirrors `scripts/phase_c_paths
+    .normalise_name`'s discipline — duplicated here rather than imported,
+    since `scripts/` imports from `src/`, never the reverse.
+    """
+    stripped = re.sub(r"[^A-Z0-9 ]", " ", name.upper())
+    stripped = _LOOSE_SUFFIX_RE.sub(" ", stripped)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
 def _canonical_company_entity(company: Company) -> Entity:
     """The Companies House node for a company, creating it if absent.
 
@@ -627,6 +660,33 @@ def _resolve_counterparty_entity(
         return entity, 0.9, "exact_name", {}
     if match_count >= 2:
         return None
+
+    # The exact (case/whitespace-only) normalisation found no candidate —
+    # fall back to a suffix/punctuation-tolerant comparison before giving up
+    # and scoping a placeholder (see `_normalise_name_loose`). Narrowed via
+    # an `icontains` pre-filter anchored on the first LOOSE-normalised word
+    # (mirroring `scripts/run_commons_controls.resolve_organisation
+    # _candidates`) rather than a fixed-length slice of either name: a
+    # punctuation difference positioned before the slice boundary (e.g. the
+    # declared "Guardian news and media" vs the real "Guardian News & Media
+    # Limited" — the "&" sits before character 15 either way round) breaks a
+    # same-position substring match even though both normalise identically.
+    # A full-corpus scan isn't needed since a real match always shares a
+    # name substring.
+    loose_target = _normalise_name_loose(name)
+    if loose_target:
+        loose_words = loose_target.split()
+        prefix = loose_words[0] if loose_words else loose_target
+        loose_matches = [
+            c
+            for c in Company.objects.filter(company_name__icontains=prefix)[:200]
+            if _normalise_name_loose(c.company_name) == loose_target
+        ]
+        if len(loose_matches) == 1:
+            entity = _canonical_company_entity(loose_matches[0])
+            return entity, 0.8, "normalised_name", {}
+        if len(loose_matches) >= 2:
+            return None
 
     entity, _ = Entity.objects.get_or_create(
         entity_type="regulated_entity",

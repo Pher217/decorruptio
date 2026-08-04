@@ -830,6 +830,81 @@ class TestParliamentInterestsIngest:
         assert summary["matched"] == 0
         assert not Entity.objects.filter(name="Example Family Trust").exists()
 
+    def test_name_only_counterparty_resolves_despite_legal_suffix_mismatch(self, tmp_path):
+        """A declared organisation name differing from the Companies House legal
+        name only by legal-form suffix ("Ltd" vs "Limited") must still resolve
+        to the real Company, not fall back to a UK-PARLIAMENT-UNRESOLVED
+        placeholder.
+
+        Regression test: `_resolve_counterparty_entity`'s name-only path tried
+        only `_normalise_name` (case/whitespace only, no suffix/punctuation
+        stripping) as its sole match attempt. Verified live 2026-08-04 against
+        the real graph: 22 of the 25 ever-ingested Commons declared_interest
+        edges resolved to a UK-PARLIAMENT-UNRESOLVED placeholder instead of an
+        already-known real Company for exactly this reason -- e.g. the
+        declared "DODS GROUP LTD" never matched Companies House's real "DODS
+        GROUP LIMITED" (company number 01262354).
+        """
+        Company.objects.create(
+            company_number="01262354",
+            company_name="Dods Group Limited",
+            normalised_name="DODS GROUP LIMITED",
+        )
+        items = [
+            _interest(
+                17100,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Dods Group Ltd"),
+                    _field("PayerIsPrivateIndividual", False, "Boolean"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 1
+        edge = Attestation.objects.get(source_reference="17100").edge
+        assert edge.target_entity.registry_scheme == "GB-COH"
+        assert edge.target_entity.company_number == "01262354"
+        attestation = edge.attestations.get()
+        assert attestation.match_method == "normalised_name"
+        assert attestation.match_confidence == 0.8
+
+    def test_name_only_counterparty_ambiguous_after_suffix_stripping_is_not_guessed(self, tmp_path):
+        """Two companies that only collide once legal-form suffixes are
+        stripped must never be guessed through — same "duplication over
+        merging" discipline as the exact-match ambiguity guard, applied to
+        the suffix-tolerant fallback too."""
+        Company.objects.create(
+            company_number="00000001",
+            company_name="Example Ltd",
+            normalised_name="EXAMPLE LTD",
+        )
+        Company.objects.create(
+            company_number="00000002",
+            company_name="Example Limited",
+            normalised_name="EXAMPLE LIMITED",
+        )
+        items = [
+            _interest(
+                17101,
+                "Employment and earnings",
+                [
+                    _field("PayerName", "Example PLC"),
+                    _field("PayerIsPrivateIndividual", False, "Boolean"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 0
+        assert summary["unmatched_counterparty"] == 1
+        assert Attestation.objects.filter(source_reference="17101").count() == 0
+
 
 class TestParliamentInterestsFetch:
     def test_fetch_uses_valid_sort_order(self, tmp_path, monkeypatch):

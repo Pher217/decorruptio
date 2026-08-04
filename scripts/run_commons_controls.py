@@ -134,7 +134,18 @@ def resolve_organisation_candidates(
     target = normalise_name(organisation_name)
     if not target:
         return []
-    prefix = organisation_name.strip()[:15]
+    # Anchor the DB pre-filter on the first word of the NORMALISED name, not
+    # a fixed-length slice of the raw declared name: a raw-name slice can
+    # straddle a punctuation/suffix difference the real Companies House name
+    # doesn't share -- e.g. "Guardian news a[nd media]" (control #1) vs the
+    # real "Guardian News & Media Limited": the "&" breaks a same-position
+    # substring match well before character 15, even though `normalise_name`
+    # resolves both to the same string. The first normalised word is never
+    # affected by a trailing suffix difference and, since `normalise_name`
+    # already strips the leading/joining words this module treats as noise
+    # ("The", "And", ...), is a safe icontains anchor.
+    words = target.split()
+    prefix = words[0] if words else organisation_name.strip()[:15]
     nearby = Entity.objects.filter(entity_type="company", name__icontains=prefix)[:200]
     return prefer_companies_house([e for e in nearby if normalise_name(e.name) == target])
 

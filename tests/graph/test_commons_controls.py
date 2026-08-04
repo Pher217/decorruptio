@@ -167,6 +167,33 @@ class TestClassifyControlRecovered:
         assert len(candidates) == 1
         assert candidates[0].company_number == "01132389"
 
+    def test_organisation_resolves_when_punctuation_differs_within_prefix_window(self):
+        """GIVEN a real company Entity whose name differs from the declared
+        organisation name only by punctuation ("&" vs "and") positioned
+        WITHIN the first 15 characters of the declared name, and no
+        company_number to disambiguate
+        WHEN resolved
+        THEN it is still found -- a raw-declared-name character-count
+        prefix can straddle exactly this kind of difference and silently
+        miss a company the graph already holds (found via control #1 of
+        `commons_retrieval_controls.json`: "Guardian news and media" vs
+        the real "Guardian News & Media Limited", company number 00908396,
+        verified live 2026-08-04 -- the "&" sits before character 15,
+        so `organisation_name.strip()[:15]` was never a substring of the
+        real Entity name and the `icontains` pre-filter returned nothing)."""
+        Entity.objects.create(
+            entity_type="company",
+            name="Guardian News & Media Limited",
+            registry_scheme="GB-COH",
+            registry_id="00908396",
+            company_number="00908396",
+        )
+
+        candidates = resolve_organisation_candidates("Guardian news and media", company_number=None)
+
+        assert len(candidates) == 1
+        assert candidates[0].company_number == "00908396"
+
 
 @pytest.mark.django_db
 class TestClassifyControlNotFound:

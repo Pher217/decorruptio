@@ -1,13 +1,13 @@
 {
   "no_score": true,
   "certificate_version": 1,
-  "issued_at": "2026-08-04T04:03:40.220687+00:00",
+  "issued_at": "2026-08-04T05:43:01.010015+00:00",
   "freeze_state": {
-    "code_commit": "47aa2d3e3b03fc4e7a660ff75499b227d743d7a0",
-    "graph_hash": "2a913ebc475294382c931271b2ddd2539d821e7bec410d11353bcd50b5a0ca6e",
-    "attestation_inclusive_hash": "c7642f0ff085bf68297f9dbee205c975550342bf9106ff127bde82662aee5465",
+    "code_commit": "24fca1c0069896a59c965cb37aa3224988cead3c",
+    "graph_hash": "66149680889c6f5413f5e4b3690c182dbbe050d142eae9daf3e4f18580f265c9",
+    "attestation_inclusive_hash": "8c4035346aac6e88cefe378841cc85406803d6b3b3e2f8f7b8040a4786b38e01",
     "manifest_hash": "UNAVAILABLE: no file at data/gold_manifest.csv in this environment. Cohort identity for this certificate is independently checkable anyway -- see `sealed_cohort` below, which publishes all 20 company numbers inline against spec 'SEALED COHORT v2' -- recorded explicitly here rather than omitted or fabricated (ADR-008).",
-    "measured_at": "2026-08-04T04:03:33.373642+00:00",
+    "measured_at": "2026-08-04T05:42:54.430613+00:00",
     "control_fixtures_hash": "175db04d4563e4d1acc856e7f0107d658f083553e596e3a6816aa3bad4936e73"
   },
   "blockers": [
@@ -106,13 +106,13 @@
         "id": 4,
         "company_number": "NF002699",
         "company_name": "BRITISH AIRWAYS PLC",
-        "reason": "no staging.Company row for this company_number -- absent from the ingested Companies House bulk CSV entirely, a legacy/non-file identifier the current architecture cannot resolve"
+        "reason": "no staging.Company row for this company_number -- absent from the ingested Companies House bulk CSV entirely, a legacy/non-file identifier THE CURRENT PIPELINE cannot resolve. Not established as intrinsically unresolvable (spec v2.11)"
       },
       {
         "id": 9,
         "company_number": "NF001553",
         "company_name": "MARKS AND SPENCER P.L.C.",
-        "reason": "no staging.Company row for this company_number -- absent from the ingested Companies House bulk CSV entirely, a legacy/non-file identifier the current architecture cannot resolve"
+        "reason": "no staging.Company row for this company_number -- absent from the ingested Companies House bulk CSV entirely, a legacy/non-file identifier THE CURRENT PIPELINE cannot resolve. Not established as intrinsically unresolvable (spec v2.11)"
       }
     ],
     "structurally_blocked_count": 2,
@@ -122,7 +122,9 @@
     "gate_fraction": 0.9,
     "gate_pct": 90.0,
     "ceiling_passes_gate": false,
-    "finding": "2 of 12 Companies House controls cite a company_number with no staging.Company row at all (legacy/non-file identifiers absent from the BasicCompanyDataAsOneFile bulk CSV, which gates company-entity creation) -- no amount of further officer ingestion can ever resolve these rows. Maximum achievable score is 10/12 (83.3%), which is still below the 90% gate (FAILS)."
+    "ceiling_kind": "CURRENT_PIPELINE",
+    "characterisation": "CURRENT-PIPELINE ceiling, not a proven structural limit (spec v2.11). Measured and standing: no amount of further officer/appointment INGESTION lifts this. NOT established: that no general, source-derived remediation could. A former-name alias layer was built and does NOT reach these rows -- NF/FC/SF is Companies House's oversea-company branch-registration scheme, not a rename record. The mechanism that might is foreign_company_details.registration_number, a published per-record cross-reference absent from the bulk CSV. Until that is built and run, 'these rows are unresolvable' is UNVERIFIED and must be reported as such.",
+    "finding": "2 of 12 Companies House controls cite a company_number with no staging.Company row at all (legacy/non-file identifiers absent from the BasicCompanyDataAsOneFile bulk CSV, which gates company-entity creation) -- no amount of further officer ingestion can resolve these rows under the current pipeline. Maximum achievable score is 10/12 (83.3%), which is still below the 90% gate (FAILS)."
   },
   "threshold_arithmetic": {
     "gate": ">= 9/10 (i.e. 90%) per spec A2.4.3 -- NOT 'nine successes regardless of denominator'. Reading it that way was a real error made during this run (spec amendment v2.10 A2.10.1) and is the reason this table exists.",
@@ -232,7 +234,7 @@
       "SC179860"
     ],
     "scored": false,
-    "statement": "The sealed 20-case gold cohort (spec 'SEALED COHORT v2', selection salt 'decorruptio-gold-cohort-v1:') was NOT scored and remains unspent. The pre-registered stop rule (spec amendment v2.10) fired before any gold row was evaluated: the Companies House control battery's structural ceiling (10/12 = 83.3%) cannot reach the 90% readiness gate under any amount of further ingestion. As measured, 5 gate(s) currently block scoring (stratum:commons_declared_interest, stratum:lords_declared_interest, stratum:ch_officer_appointment, coverage:companies_house_officer_roster, coverage:commons_register); see `blockers` for the exact recovered/total score behind each -- scoring proceeds only once every material stratum passes both retrieval and temporal (spec A2.4.4)."
+    "statement": "The sealed 20-case gold cohort (spec 'SEALED COHORT v2', selection salt 'decorruptio-gold-cohort-v1:') was NOT scored and remains unspent. The pre-registered stop rule (spec amendment v2.10) fired before any gold row was evaluated: the Companies House control battery's current-pipeline ceiling (10/12 = 83.3%) cannot reach the 90% readiness gate under any amount of further ingestion. As measured, 5 gate(s) currently block scoring (stratum:commons_declared_interest, stratum:lords_declared_interest, stratum:ch_officer_appointment, coverage:companies_house_officer_roster, coverage:commons_register); see `blockers` for the exact recovered/total score behind each -- scoring proceeds only once every material stratum passes both retrieval and temporal (spec A2.4.4)."
   },
   "electoral_commission_materiality": {
     "in_material_strata": false,

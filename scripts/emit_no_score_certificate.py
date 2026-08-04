@@ -3,7 +3,7 @@ run (spec `phase-c-gold-manifest-preregistration.md` amendment v2.10).
 
 The pre-registered stop rule has fired: the Companies House control battery
 scores 7/12 against the spec A2.4.3 gate (`>=9/10`, i.e. 90%), and its own
-structural ceiling -- two controls cite legacy `NF`-prefixed identifiers with
+current-pipeline ceiling -- two controls cite legacy `NF`-prefixed identifiers with
 no row at all in the Companies House bulk CSV, so no graph `Entity` can ever
 be created for them regardless of further ingestion -- is 10/12 (83.3%),
 still below the gate. Per ADR-008 this MUST produce an auditable no-score
@@ -23,8 +23,8 @@ This script does not reimplement measurement. It reuses, unmodified:
     `write_no_score_certificate` / `assert_all_required_families_accounted_for`
 
 What this script adds, because the generic certificate builder does not
-compute them: the Companies House structural-ceiling finding (which control
-rows are structurally unrecoverable vs. merely not-yet-ingested, with its
+compute them: the Companies House current-pipeline-ceiling finding (which control
+rows the current pipeline cannot resolve vs. merely not-yet-ingested, with its
 prose DERIVED from `ceiling_passes_gate` rather than hard-coded, so a future
 rerun after a general `NF -> live number` alias fix -- spec A2.10.3 -- cannot
 print a self-contradiction like "100%, still below the gate"), the
@@ -308,12 +308,12 @@ def sealed_cohort_statement(ceiling: dict[str, Any], certificate: dict[str, Any]
 
     if ceiling["ceiling_passes_gate"]:
         ch_clause = (
-            f"the Companies House control battery's structural ceiling ({ceiling_summary}) "
+            f"the Companies House control battery's current-pipeline ceiling ({ceiling_summary}) "
             f"clears the {gate_pct} readiness gate, so it does not by itself block scoring"
         )
     else:
         ch_clause = (
-            f"the Companies House control battery's structural ceiling ({ceiling_summary}) "
+            f"the Companies House control battery's current-pipeline ceiling ({ceiling_summary}) "
             f"cannot reach the {gate_pct} readiness gate under any amount of further ingestion"
         )
 
@@ -519,7 +519,7 @@ def main() -> None:
         )
 
     ceiling = ch_structural_ceiling(args.ch_controls)
-    print(f"\n--- Companies House structural ceiling ---\n{ceiling['finding']}")
+    print(f"\n--- Companies House current-pipeline ceiling ---\n{ceiling['finding']}")
 
     stratum_certificate = build_no_score_certificate(freeze_state, stratum_measurements=strata)
     if stratum_certificate is None:

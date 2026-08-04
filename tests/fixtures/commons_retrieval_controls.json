@@ -1,0 +1,139 @@
+{
+  "control_set": "UK House of Commons Register of Members' Financial Interests — retrieval + temporal controls",
+  "purpose": "Externally specified ground truth for testing whether the pipeline recovers a known MP<->organisation declared interest, INCLUDING its exact registrationDate, from the live Interests API. Every row was fetched live from https://interests-api.parliament.uk and never touched our database during selection — a control sampled from our own graph would test traversal conditional on the data already being ingested and would be structurally blind to ingestion failure, which is the dominant failure mode for this stratum (see coverage note below).",
+  "coverage_note": "The Commons source is severely under-ingested as of this control set's construction (~0.6%, 25 of 4,057 interests — see uncorrupt.gates.coverage.measure_commons_coverage). Most rows below are therefore EXPECTED to classify not-found; that is the correct, informative result of this control battery, not a defect in it — see scripts/run_commons_controls.py's module docstring.",
+  "source": {
+    "name": "UK Parliament Interests API",
+    "source_url": "https://interests-api.parliament.uk/api/v1/Interests",
+    "retrieval_method": "httpx GET, ExpandChildInterests=true, SortOrder=PublishingDateDescending (the only accepted enum value — see src/uncorrupt/graph/parliament_interests.py), paginated Skip/Take=20, RegisteredFrom=2015-01-01..RegisteredTo=2026-08-01",
+    "retrieved_at": "2026-08-04T01:55:00+00:00",
+    "extraction_method": "Counterparty name/company_number extracted via the SAME _extract_counterparty_name/_leaf_interests helpers the real ingest module (src/uncorrupt/graph/parliament_interests.py) uses -- imported read-only, never modified -- so the 'organisation_name' recorded here is exactly the string the pipeline itself would try to resolve, not a hand-rolled reimplementation that could differ subtly.",
+    "selection_rule": "Pooled 411 leaves with a positively-classified organisation counterparty and a non-null registrationDate across the fetched range, deduplicated by interest id, sorted ascending, then selected via an EVEN STRIDE across the whole pool (stride = floor(pool_size / 12)) so the 12 rows are spread across the full id range rather than clustered at either end -- the same discipline the Lords fixture used spreading across register pages 1-35."
+  },
+  "controls": [
+    {
+      "id": 1,
+      "interest_id": 5336,
+      "member_id": 4088,
+      "member_name": "Ms Stella Creasy",
+      "category": "Employment and earnings",
+      "organisation_name": "Guardian news and media",
+      "company_number": null,
+      "registration_date": "2026-01-29"
+    },
+    {
+      "id": 2,
+      "interest_id": 14423,
+      "member_id": 5070,
+      "member_name": "Lisa Smart",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "National Liberal Club",
+      "company_number": "01355034",
+      "registration_date": "2026-01-27"
+    },
+    {
+      "id": 3,
+      "interest_id": 14566,
+      "member_id": 5352,
+      "member_name": "Dr Roz Savage",
+      "category": "Employment and earnings",
+      "organisation_name": "Leading Minds Worldwide Ltd",
+      "company_number": null,
+      "registration_date": "2026-06-23"
+    },
+    {
+      "id": 4,
+      "interest_id": 14678,
+      "member_id": 39,
+      "member_name": "Sir John Whittingdale",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "BPI (British Recorded Music) Ltd",
+      "company_number": "01132389",
+      "registration_date": "2026-03-04"
+    },
+    {
+      "id": 5,
+      "interest_id": 14799,
+      "member_id": 4008,
+      "member_name": "Dame Caroline Dinenage",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "BPI (British Recorded Music Industry) Limited",
+      "company_number": "01132389",
+      "registration_date": "2026-03-19"
+    },
+    {
+      "id": 6,
+      "interest_id": 14939,
+      "member_id": 4356,
+      "member_name": "Angela Rayner",
+      "category": "Donations and other support (including loans) for activities as an MP",
+      "organisation_name": "Refrigeration House Limited",
+      "company_number": "15999252",
+      "registration_date": "2026-04-17"
+    },
+    {
+      "id": 7,
+      "interest_id": 15077,
+      "member_id": 4979,
+      "member_name": "Andrew Western",
+      "category": "Donations and other support (including loans) for activities as an MP",
+      "organisation_name": "World Metal Recycling Limited",
+      "company_number": "06865444",
+      "registration_date": "2026-04-22"
+    },
+    {
+      "id": 8,
+      "interest_id": 15194,
+      "member_id": 4514,
+      "member_name": "Sir Keir Starmer",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "The Arsenal Football Club Limited",
+      "company_number": "00109244",
+      "registration_date": "2026-05-08"
+    },
+    {
+      "id": 9,
+      "interest_id": 15290,
+      "member_id": 4243,
+      "member_name": "Dan Jarvis",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "Barnsley Football Club",
+      "company_number": "04573250",
+      "registration_date": "2026-05-22"
+    },
+    {
+      "id": 10,
+      "interest_id": 15423,
+      "member_id": 5074,
+      "member_name": "Mr Paul Foster",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "Rugby Football League (RFL)",
+      "company_number": "05835638",
+      "registration_date": "2026-06-10"
+    },
+    {
+      "id": 11,
+      "interest_id": 15869,
+      "member_id": 4263,
+      "member_name": "Lucy Powell",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "PRS for Music Limited",
+      "company_number": "03444246",
+      "registration_date": "2026-06-25"
+    },
+    {
+      "id": 12,
+      "interest_id": 16141,
+      "member_id": 4787,
+      "member_name": "James Wild",
+      "category": "Gifts, benefits and hospitality from UK sources",
+      "organisation_name": "Ascot Racecourse Limited",
+      "company_number": "04320977",
+      "registration_date": "2026-07-06"
+    }
+  ],
+  "scope_limits": {
+    "closes": "The Commons-stratum control gap: 12 externally verified, independently checkable MP<->organisation declared interests (with exact registrationDate) that a scorer can gate on.",
+    "does_not_close": "Wiring this fixture into uncorrupt.gates.stratum.measure_commons_stratum (which still hard-codes available=False pending a runner) -- out of this deliverable's allowed scope; another workstream owns that file. Nor does it close the underlying Commons under-ingestion gap (25/4,057) itself -- that is a separate, much larger ingest task."
+  }
+}

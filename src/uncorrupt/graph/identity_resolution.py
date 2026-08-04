@@ -346,7 +346,22 @@ def _titles_compatible(parliament_title: str | None, officer_title: str | None) 
     return _normalize_title(parliament_title) == _normalize_title(officer_title)
 
 
-def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
+_MEMBER_SCHEME = "UK-PARLIAMENT-MEMBER"
+
+# Refuse to delete more than this fraction of the persisted `same_as` set in
+# one run. 83 of 351 (~24%) was the real reconciliation that motivated this
+# code; a run proposing almost nothing means an upstream ingest is missing,
+# not that the graph is genuinely stale.
+MAX_DELETE_FRACTION = 0.50
+
+# Below this many persisted edges the fraction carries no signal (1 of 1 is
+# 100%), so the floor does not apply. Well under the live set of 351.
+MIN_PERSISTED_FOR_DELETE_FLOOR = 20
+
+
+def resolve_cross_register_identities(
+    dry_run: bool = False, allow_bulk_delete: bool = False
+) -> dict[str, Any]:
     """Reconcile the persisted `same_as` edge set to match this run's decisions.
 
     This resolver is authoritative for `same_as` -- it is the only writer
@@ -389,9 +404,7 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
             by_surname.setdefault(parsed["surname"], []).append((officer, parsed))
 
     observed_at = datetime.now(UTC)
-    members = list(
-        Entity.objects.filter(entity_type="person", registry_scheme="UK-PARLIAMENT-MEMBER")
-    )
+    members = list(Entity.objects.filter(entity_type="person", registry_scheme=_MEMBER_SCHEME))
 
     # "Lord Smith" is not a unique parliament member either: a (surname,
     # title) bucket containing more than one real peer is "contested" -- the
@@ -633,13 +646,54 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
         ]
         stats["edges_deleted_stale"] = len(stale_edge_ids)
 
+        # Delete floor. This function was additive-only until reconciliation
+        # was added; it can now destroy the whole persisted set. If an
+        # upstream ingest has not run, or officer/member `registry_scheme`
+        # values have drifted, resolution proposes nothing and every
+        # persisted edge looks stale -- a silent wipe. Deleting most of the
+        # set is never a routine outcome, so refuse and make the operator
+        # opt in explicitly rather than discovering it afterwards.
+        # The fraction is only meaningful once the persisted set is big enough
+        # for it to mean anything: deleting 1 of 1 is 100% and says nothing.
+        # Small sets are normal in tests and in a freshly-seeded graph, so the
+        # floor applies only above a size where a majority-delete is genuinely
+        # anomalous. Live is 351.
+        if len(persisted) >= MIN_PERSISTED_FOR_DELETE_FLOOR and not allow_bulk_delete:
+            delete_fraction = len(stale_edge_ids) / len(persisted)
+            if delete_fraction > MAX_DELETE_FRACTION:
+                raise RuntimeError(
+                    "identity_resolution: refusing to delete "
+                    f"{len(stale_edge_ids)} of {len(persisted)} persisted "
+                    f"same_as edges ({delete_fraction:.1%} > "
+                    f"{MAX_DELETE_FRACTION:.0%} floor). This usually means an "
+                    "upstream ingest did not run or registry_scheme values "
+                    "drifted, not that the edges are genuinely stale. Re-run "
+                    "with dry_run=True to inspect, then pass "
+                    "allow_bulk_delete=True if the deletion is intended."
+                )
+
         if stale_edge_ids and not dry_run:
             # Deleting the Edge cascades to its Attestation rows
             # (Attestation.edge is on_delete=CASCADE) -- an Attestation
             # with no Edge to attest is meaningless, never orphaned data
             # worth keeping, so this is the intended, documented cascade,
             # not an incidental side effect.
-            Edge.objects.filter(id__in=stale_edge_ids).delete()
+            #
+            # Attestation.derived_from is ALSO a self-FK with CASCADE, so an
+            # attestation on a surviving edge that derives from one of these
+            # would be destroyed too. Nothing in production sets
+            # `derived_from` (live non-null count is 0; only test fixtures
+            # populate it), so this is unreachable today -- recorded because
+            # it stops being unreachable the moment provenance chaining ships.
+            Edge.objects.filter(
+                id__in=stale_edge_ids,
+                # Scope the delete to the edges this resolver owns rather than
+                # relying on `same_as` having exactly one writer. That is true
+                # today (verified by grep) but is an unenforced invariant, and
+                # a company<->company same_as written by a future connector
+                # would otherwise be deleted here as "stale".
+                source_entity__registry_scheme=_MEMBER_SCHEME,
+            ).delete()
 
         for member, matched, confidence, tier in final_decisions:
             if tier == "surname_forename_title":
@@ -650,6 +704,14 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
                 stats["linked_title_only"] += 1
 
             if dry_run:
+                # Report what a real run WOULD create, rather than 0. A dry
+                # run that tells you what it deletes but not what it adds
+                # invites approving a net loss by mistake -- the whole point
+                # of the dry run is to see both sides before committing.
+                persisted_pairs = {(m, o) for _eid, m, o in persisted}
+                stats["edges_created"] += sum(
+                    1 for officer, _op in matched if (member.id, officer.id) not in persisted_pairs
+                )
                 continue
 
             for officer, _op in matched:

@@ -18,6 +18,7 @@ from uncorrupt.graph.identity_resolution import (
     CONFIDENCE_TERRITORIAL,
     CONFIDENCE_TITLE_ONLY,
     CONFIDENCE_WITH_FORENAME,
+    MIN_PERSISTED_FOR_DELETE_FLOOR,
     _territorial_compatible,
     _titles_compatible,
     parse_officer_name,
@@ -695,3 +696,87 @@ class TestSameAsReconciliation:
         assert existing_edge.target_entity_id == officer.id
         assert stats["edges_deleted_stale"] == 0
         assert Edge.objects.filter(edge_type="same_as").count() == 1
+
+
+@pytest.mark.django_db
+class TestDeleteFloor:
+    """Reconciliation made this resolver destructive: it deletes persisted
+    `same_as` edges its current logic no longer proposes. If an upstream
+    ingest has not run -- or `registry_scheme` values drift -- the resolver
+    proposes nothing and EVERY persisted edge looks stale, silently wiping
+    the set. The floor refuses that, because a majority delete is never a
+    routine reconciliation outcome."""
+
+    @staticmethod
+    def _persist_orphan_edges(count: int) -> None:
+        """Persist `count` `same_as` edges whose officers no resolution run
+        can ever propose (no matching member name), so every one of them is
+        stale on the next run."""
+        for i in range(count):
+            member = _make_member(f"orphan-mp-{i}", f"Lord Nonesuch{i} of Nowhere{i}")
+            officer = _make_officer(f"orphan-officer-{i}", f"ZZZUNMATCHED{i}, Nobody, Lord")
+            _make_same_as_edge(member, officer)
+
+    def test_deleting_a_majority_of_a_large_persisted_set_is_refused(self):
+        """GIVEN more persisted `same_as` edges than the floor's minimum, all
+        of which this run's logic no longer proposes
+        WHEN identities are resolved without opting in to a bulk delete
+        THEN it raises rather than wiping the set, and every edge survives."""
+        self._persist_orphan_edges(MIN_PERSISTED_FOR_DELETE_FLOOR)
+
+        with pytest.raises(RuntimeError, match="refusing to delete"):
+            resolve_cross_register_identities()
+
+        assert Edge.objects.filter(edge_type="same_as").count() == MIN_PERSISTED_FOR_DELETE_FLOOR
+
+    def test_allow_bulk_delete_opts_in_to_the_majority_delete(self):
+        """GIVEN the same wipe-the-set condition
+        WHEN identities are resolved with allow_bulk_delete=True
+        THEN the deletion proceeds, because the operator asked for it."""
+        self._persist_orphan_edges(MIN_PERSISTED_FOR_DELETE_FLOOR)
+
+        stats = resolve_cross_register_identities(allow_bulk_delete=True)
+
+        assert stats["edges_deleted_stale"] == MIN_PERSISTED_FOR_DELETE_FLOOR
+        assert Edge.objects.filter(edge_type="same_as").count() == 0
+
+    def test_floor_does_not_fire_below_its_minimum_set_size(self):
+        """GIVEN fewer persisted edges than the floor's minimum -- where a
+        percentage carries no signal, since deleting 1 of 1 is 100%
+        WHEN identities are resolved
+        THEN the ordinary reconciliation runs and deletes them."""
+        self._persist_orphan_edges(MIN_PERSISTED_FOR_DELETE_FLOOR - 1)
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["edges_deleted_stale"] == MIN_PERSISTED_FOR_DELETE_FLOOR - 1
+
+    def test_dry_run_reports_the_would_be_deletions_without_raising(self):
+        """GIVEN the wipe-the-set condition
+        WHEN identities are resolved with dry_run=True
+        THEN the floor still refuses -- a dry run must surface the same
+        objection a real run would, not quietly report a plan that cannot
+        execute."""
+        self._persist_orphan_edges(MIN_PERSISTED_FOR_DELETE_FLOOR)
+
+        with pytest.raises(RuntimeError, match="refusing to delete"):
+            resolve_cross_register_identities(dry_run=True)
+
+        assert Edge.objects.filter(edge_type="same_as").count() == MIN_PERSISTED_FOR_DELETE_FLOOR
+
+
+@pytest.mark.django_db
+class TestDryRunReportsCreations:
+    def test_dry_run_reports_edges_it_would_create(self):
+        """GIVEN a resolvable member/officer pair with nothing persisted yet
+        WHEN identities are resolved with dry_run=True
+        THEN edges_created reports what a real run would create rather than
+        0 -- a dry run that shows deletions but not creations invites
+        approving a net loss by mistake -- and still writes nothing."""
+        _make_member("mp-dry", "Lord Howard of Rising")
+        _make_officer("officer-dry", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising")
+
+        stats = resolve_cross_register_identities(dry_run=True)
+
+        assert stats["edges_created"] == 1
+        assert Edge.objects.filter(edge_type="same_as").count() == 0

@@ -268,7 +268,8 @@ def main() -> None:
     print(
         f"Ingested: {summary['edges_created']} officer edges "
         f"({summary['officers_no_id']} without a stable officer ID), "
-        f"{summary['companies_unmatched']} companies unmatched "
+        f"{summary['companies_unmatched']} companies unmatched, "
+        f"{summary['ambiguous_company_number']} companies ambiguous "
         f"(of {summary['companies_processed']} processed, "
         f"{summary['total_officers']} officer records, "
         f"{summary['missing_appointed_on']} missing appointed_on)"

@@ -313,6 +313,88 @@ class TestChOfficersIngest:
 
 
 @pytest.mark.django_db
+class TestIngestCompanyOfficersAmbiguousCompanyNumber:
+    def test_company_number_with_three_registry_scheme_entities_resolves_to_coh(self, tmp_path):
+        """GIVEN a company_number with THREE Entity rows across different registry
+        schemes (SC214564's real shape in the live graph: one GB-COH row plus two
+        GLEIF-LEI rows -- GLEIF publishes more than one LEI record for some UK
+        companies) WHEN ingesting THEN resolution lands on the GB-COH entity without
+        raising MultipleObjectsReturned, and neither GLEIF entity is merged or altered
+        (ADR-006: duplicate over merge).
+
+        Regression test: `Entity.objects.get_or_create(entity_type="company",
+        company_number=...)` without registry_scheme matches on company_number alone
+        and raises MultipleObjectsReturned as soon as 2+ Entity rows share it.
+        """
+        Company.objects.create(company_number="SC214564", company_name="Example Scottish Co Ltd")
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GB-COH",
+            registry_id="SC214564",
+            name="Example Scottish Co Ltd",
+            company_number="SC214564",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GLEIF-LEI",
+            registry_id="529900AAAAAAAAAAAA01",
+            name="Example Scottish Co Ltd",
+            company_number="SC214564",
+        )
+        Entity.objects.create(
+            entity_type="company",
+            registry_scheme="GLEIF-LEI",
+            registry_id="529900BBBBBBBBBBBB02",
+            name="Example Scottish Co Ltd (Renamed)",
+            company_number="SC214564",
+        )
+        _write_cache(tmp_path, "SC214564", [RAW_OFFICER_ITEM])
+
+        summary = ingest_company_officers(["SC214564"], tmp_path)
+
+        assert summary["ambiguous_company_number"] == 0
+        coh_entity = Entity.objects.get(registry_scheme="GB-COH", registry_id="SC214564")
+        edge = Attestation.objects.get(source_reference="abc123def456").edge
+        assert edge.target_entity_id == coh_entity.id
+        # Both GLEIF entities must still exist, untouched — never merged
+        assert (
+            Entity.objects.filter(registry_scheme="GLEIF-LEI", company_number="SC214564").count()
+            == 2
+        )
+
+    def test_ambiguous_company_number_counter_increments_run_continues(self, tmp_path, monkeypatch):
+        """GIVEN company entity resolution raises MultipleObjectsReturned for one of two
+        companies WHEN ingest_company_officers runs THEN that company is counted under
+        `ambiguous_company_number` and skipped, while the other company's officers are
+        still ingested normally -- one bad row must not crash or lose the whole run.
+        """
+        Company.objects.create(company_number="12410514", company_name="PPE Medpro Ltd")
+        Company.objects.create(company_number="00000099", company_name="Clean Co Ltd")
+        _write_cache(tmp_path, "12410514", [RAW_OFFICER_ITEM])
+        clean_item = {
+            **RAW_OFFICER_ITEM,
+            "links": {"officer": {"appointments": "/officers/xyz789/appointments"}},
+        }
+        _write_cache(tmp_path, "00000099", [clean_item])
+
+        real_canonical = ch_officers_module._canonical_company_entity
+
+        def _raise_for_one_company(company):
+            if company.company_number == "12410514":
+                raise Entity.MultipleObjectsReturned("simulated ambiguity")
+            return real_canonical(company)
+
+        monkeypatch.setattr(ch_officers_module, "_canonical_company_entity", _raise_for_one_company)
+
+        summary = ingest_company_officers(["12410514", "00000099"], tmp_path)
+
+        assert summary["ambiguous_company_number"] == 1
+        assert summary["companies_processed"] == 1
+        assert Attestation.objects.filter(source_reference="xyz789").exists()
+        assert not Attestation.objects.filter(source_reference="abc123def456").exists()
+
+
+@pytest.mark.django_db
 class TestIngestCompanyOfficersSelectionRule:
     def test_selection_rule_is_stamped_on_newly_created_edge(self, tmp_path):
         """GIVEN a selection_rule WHEN a new officer_of edge is created THEN the edge's

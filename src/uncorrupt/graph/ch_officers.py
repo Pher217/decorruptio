@@ -666,6 +666,37 @@ def append_run_manifest(output_dir: str | Path, **fields: Any) -> Path:
     return manifest_path
 
 
+def _canonical_company_entity(company: Company) -> Entity:
+    """The Companies House node for a company, creating it if absent.
+
+    Mirrors ch_appointments._canonical_company_entity. A plain
+    ``get_or_create(company_number=...)`` raises MultipleObjectsReturned
+    here: GLEIF can hold a distinct Entity for the same company under
+    registry_scheme="GLEIF-LEI" that also carries this company_number --
+    those are legitimately separate claims and must never be merged
+    (ADR-006, duplicate over merge). Resolving on registry_scheme="GB-COH"
+    + registry_id is unique by DB constraint, so this can never be
+    ambiguous.
+    """
+    coh = Entity.objects.filter(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+    ).first()
+    if coh:
+        return coh
+    entity, _ = Entity.objects.get_or_create(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+        defaults={
+            "name": company.company_name,
+            "company_number": company.company_number,
+        },
+    )
+    return entity
+
+
 def ingest_company_officers(
     company_numbers: Sequence[str],
     input_dir: str | Path,
@@ -675,8 +706,9 @@ def ingest_company_officers(
 
     Reads `{company_number}.json` files written by `fetch_company_officers`
     out of `input_dir`. Returns summary stats: {edges_created,
-    companies_processed, companies_unmatched, officers_no_id,
-    missing_appointed_on, unparseable_resigned_on, total_officers}.
+    companies_processed, companies_unmatched, ambiguous_company_number,
+    officers_no_id, missing_appointed_on, unparseable_resigned_on,
+    total_officers}.
 
     `selection_rule`, when given, is stamped onto `Edge.properties
     ["selection_rule"]` for every officer_of edge **newly created** by this
@@ -695,135 +727,144 @@ def ingest_company_officers(
     edges_created = 0
     companies_processed = 0
     companies_unmatched = 0
+    ambiguous_company_number = 0
     officers_no_id = 0
     missing_appointed_on = 0
     unparseable_resigned_on = 0
     total_officers = 0
 
-    with transaction.atomic():
-        for company_number in company_numbers:
-            json_path = input_dir / f"{company_number}.json"
-            if not json_path.exists():
-                companies_unmatched += 1
-                continue
+    for company_number in company_numbers:
+        json_path = input_dir / f"{company_number}.json"
+        if not json_path.exists():
+            companies_unmatched += 1
+            continue
 
-            company = Company.objects.filter(
-                company_number=normalise_company_number(company_number)
-            ).first()
-            if company is None:
-                companies_unmatched += 1
-                continue
+        company = Company.objects.filter(
+            company_number=normalise_company_number(company_number)
+        ).first()
+        if company is None:
+            companies_unmatched += 1
+            continue
 
-            items = json.loads(json_path.read_text())
-            company_entity, _ = Entity.objects.get_or_create(
-                entity_type="company",
-                company_number=company.company_number,
-                defaults={
-                    "name": company.company_name,
-                    "registry_scheme": "GB-COH",
-                    "registry_id": company.company_number,
-                },
-            )
+        items = json.loads(json_path.read_text())
+        officers_url = f"{CH_API_BASE}/company/{company_number}/officers"
 
-            officers_url = f"{CH_API_BASE}/company/{company_number}/officers"
-            companies_processed += 1
+        # Commit per company, not the whole sweep in one transaction: a
+        # giant transaction over tens of thousands of companies holds locks
+        # for the entire ingest and loses everything already processed if
+        # one row (or the process) dies partway through -- mirrors the same
+        # discipline in lords_interests.py / parliament_interests.py.
+        try:
+            with transaction.atomic():
+                company_entity = _canonical_company_entity(company)
+                companies_processed += 1
 
-            for item in items:
-                total_officers += 1
-                name = (item.get("name") or "").strip()
-                if not name:
-                    continue
+                for item in items:
+                    total_officers += 1
+                    name = (item.get("name") or "").strip()
+                    if not name:
+                        continue
 
-                officer_id = _parse_officer_id(item)
-                if officer_id:
-                    person_entity, _ = Entity.objects.get_or_create(
-                        entity_type="person",
-                        registry_scheme="GB-COH-OFFICER",
-                        registry_id=officer_id,
-                        defaults={"name": name},
+                    officer_id = _parse_officer_id(item)
+                    if officer_id:
+                        person_entity, _ = Entity.objects.get_or_create(
+                            entity_type="person",
+                            registry_scheme="GB-COH-OFFICER",
+                            registry_id=officer_id,
+                            defaults={"name": name},
+                        )
+                        confidence = 1.0
+                        match_method = "identifier"
+                    else:
+                        # No stable CH officer ID: never merge same-named
+                        # people across companies (governing principle —
+                        # duplication over merging). Scope the identity to
+                        # THIS company so "John Smith" at Company A and
+                        # "John Smith" at Company B are always distinct
+                        # entities unless proven otherwise.
+                        officers_no_id += 1
+                        person_entity, _ = Entity.objects.get_or_create(
+                            entity_type="person",
+                            registry_scheme="GB-COH-OFFICER-UNRESOLVED",
+                            registry_id=f"{company_number}:{_normalise_name(name)}",
+                            defaults={"name": name},
+                        )
+                        confidence = _PERSON_MATCH_CONFIDENCE_NO_ID
+                        match_method = "name_company_scoped"
+
+                    appointed_on = item.get("appointed_on")
+                    valid_from = _parse_ch_date(appointed_on)
+                    if valid_from is None:
+                        missing_appointed_on += 1
+
+                    resigned_on_raw = item.get("resigned_on")
+                    edge_properties: dict[str, Any] = {}
+                    if resigned_on_raw:
+                        valid_to = _parse_ch_date(resigned_on_raw)
+                        if valid_to is None:
+                            # Present but unparseable: do NOT read as still
+                            # serving. Record it as ended-but-unknown-when
+                            # rather than open-ended.
+                            unparseable_resigned_on += 1
+                            edge_properties["resigned_on_unparsed"] = resigned_on_raw
+                            edge_properties["resignation_status"] = "ended_date_unknown"
+                    else:
+                        valid_to = None
+
+                    role = (item.get("officer_role") or "").strip()
+                    if role:
+                        edge_properties["officer_role"] = role
+
+                    if selection_rule:
+                        edge_properties["selection_rule"] = selection_rule
+
+                    appointment_ref = _parse_appointment_self_link(item)
+                    if appointment_ref:
+                        source_reference = appointment_ref
+                    elif officer_id:
+                        source_reference = officer_id
+                        edge_properties["source_reference_scope"] = "officer_id_not_appointment"
+                    else:
+                        source_reference = f"{company_number}:{name}:{appointed_on or ''}"
+
+                    # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                    edge, _ = Edge.objects.get_or_create(
+                        edge_type="officer_of",
+                        source_entity=person_entity,
+                        target_entity=company_entity,
+                        valid_from=valid_from,
+                        valid_to=valid_to,
+                        defaults={
+                            "properties": edge_properties,
+                        },
                     )
-                    confidence = 1.0
-                    match_method = "identifier"
-                else:
-                    # No stable CH officer ID: never merge same-named people
-                    # across companies (governing principle — duplication
-                    # over merging). Scope the identity to THIS company so
-                    # "John Smith" at Company A and "John Smith" at Company
-                    # B are always distinct entities unless proven otherwise.
-                    officers_no_id += 1
-                    person_entity, _ = Entity.objects.get_or_create(
-                        entity_type="person",
-                        registry_scheme="GB-COH-OFFICER-UNRESOLVED",
-                        registry_id=f"{company_number}:{_normalise_name(name)}",
-                        defaults={"name": name},
+
+                    # Attestation = THE EVIDENCE
+                    Attestation.objects.get_or_create(
+                        edge=edge,
+                        source_name=SOURCE_NAME,
+                        source_reference=source_reference,
+                        defaults={
+                            "source_url": officers_url,
+                            "match_confidence": confidence,
+                            "match_method": match_method,
+                        },
                     )
-                    confidence = _PERSON_MATCH_CONFIDENCE_NO_ID
-                    match_method = "name_company_scoped"
-
-                appointed_on = item.get("appointed_on")
-                valid_from = _parse_ch_date(appointed_on)
-                if valid_from is None:
-                    missing_appointed_on += 1
-
-                resigned_on_raw = item.get("resigned_on")
-                edge_properties: dict[str, Any] = {}
-                if resigned_on_raw:
-                    valid_to = _parse_ch_date(resigned_on_raw)
-                    if valid_to is None:
-                        # Present but unparseable: do NOT read as still
-                        # serving. Record it as ended-but-unknown-when
-                        # rather than open-ended.
-                        unparseable_resigned_on += 1
-                        edge_properties["resigned_on_unparsed"] = resigned_on_raw
-                        edge_properties["resignation_status"] = "ended_date_unknown"
-                else:
-                    valid_to = None
-
-                role = (item.get("officer_role") or "").strip()
-                if role:
-                    edge_properties["officer_role"] = role
-
-                if selection_rule:
-                    edge_properties["selection_rule"] = selection_rule
-
-                appointment_ref = _parse_appointment_self_link(item)
-                if appointment_ref:
-                    source_reference = appointment_ref
-                elif officer_id:
-                    source_reference = officer_id
-                    edge_properties["source_reference_scope"] = "officer_id_not_appointment"
-                else:
-                    source_reference = f"{company_number}:{name}:{appointed_on or ''}"
-
-                # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
-                edge, _ = Edge.objects.get_or_create(
-                    edge_type="officer_of",
-                    source_entity=person_entity,
-                    target_entity=company_entity,
-                    valid_from=valid_from,
-                    valid_to=valid_to,
-                    defaults={
-                        "properties": edge_properties,
-                    },
-                )
-
-                # Attestation = THE EVIDENCE
-                Attestation.objects.get_or_create(
-                    edge=edge,
-                    source_name=SOURCE_NAME,
-                    source_reference=source_reference,
-                    defaults={
-                        "source_url": officers_url,
-                        "match_confidence": confidence,
-                        "match_method": match_method,
-                    },
-                )
-                edges_created += 1
+                    edges_created += 1
+        except Entity.MultipleObjectsReturned:
+            # A company_number can legitimately resolve to 2+ Entity rows
+            # under different registry schemes (GB-COH, GLEIF-LEI -- ADR-006
+            # duplicate-over-merge). Count and move on rather than losing
+            # the whole run to one row -- this killed one multi-hour sweep
+            # at the ingest step after ~24,500 artifacts had been fetched.
+            ambiguous_company_number += 1
+            continue
 
     return {
         "edges_created": edges_created,
         "companies_processed": companies_processed,
         "companies_unmatched": companies_unmatched,
+        "ambiguous_company_number": ambiguous_company_number,
         "officers_no_id": officers_no_id,
         "missing_appointed_on": missing_appointed_on,
         "unparseable_resigned_on": unparseable_resigned_on,

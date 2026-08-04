@@ -15,6 +15,7 @@ from uncorrupt.staging.aliases import (
     BULK_CSV_SOURCE_URL,
     SOURCE_BULK_PREVIOUS_NAMES,
     AliasIndex,
+    CompanyAlias,
     build_alias_table,
     write_alias_table,
 )
@@ -310,3 +311,78 @@ class TestWriteAndLoadAliasTable:
         write_alias_table(aliases, out_path)
 
         assert out_path.exists()
+
+
+class TestAliasIndexMixedKinds:
+    """A single AliasIndex loaded from BOTH former-name and legacy-identifier
+    rows (concatenated before construction) keeps the two keyspaces
+    independent -- see uncorrupt.staging.oversea_company_aliases for the
+    legacy-identifier producer."""
+
+    def _former_name_alias(self) -> CompanyAlias:
+        return CompanyAlias(
+            alias_name="ROYAL DUTCH SHELL PLC",
+            normalised_alias_name="ROYAL DUTCH SHELL PLC",
+            live_company_number="04366849",
+            name_changed_on="2022-01-21",
+            source=SOURCE_BULK_PREVIOUS_NAMES,
+            source_url=BULK_CSV_SOURCE_URL,
+            retrieved_at="2026-07-01",
+        )
+
+    def _legacy_identifier_alias(self) -> CompanyAlias:
+        return CompanyAlias(
+            alias_name="NF003690",
+            normalised_alias_name="NF003690",
+            live_company_number="SC222690",
+            name_changed_on=None,
+            source="companies_house_api.foreign_company_details",
+            source_url="https://api.company-information.service.gov.uk/company/NF003690",
+            retrieved_at="2026-08-04T00:00:00+00:00",
+            alias_kind="legacy_identifier",
+        )
+
+    def test_resolve_identifier_finds_the_legacy_identifier_row(self):
+        """GIVEN a mixed index WHEN resolve_identifier is called with the legacy
+        NF number THEN it returns the live number, unaffected by the former-name
+        row also present."""
+        index = AliasIndex([self._former_name_alias(), self._legacy_identifier_alias()])
+
+        assert index.resolve_identifier("NF003690") == "SC222690"
+
+    def test_resolve_does_not_see_legacy_identifier_rows(self):
+        """GIVEN a mixed index WHEN resolve (name lookup) is called with the legacy
+        identifier string THEN it returns None -- the two keyspaces never cross."""
+        index = AliasIndex([self._former_name_alias(), self._legacy_identifier_alias()])
+
+        assert index.resolve("NF003690") is None
+
+    def test_resolve_identifier_does_not_see_former_name_rows(self):
+        """GIVEN a mixed index WHEN resolve_identifier is called with a former
+        company NAME THEN it returns None -- a name is never mistaken for an
+        identifier."""
+        index = AliasIndex([self._former_name_alias(), self._legacy_identifier_alias()])
+
+        assert index.resolve_identifier("Royal Dutch Shell plc") is None
+
+    def test_resolve_identifier_none_and_empty_return_none(self):
+        """GIVEN a mixed index WHEN resolve_identifier is called with None or an
+        empty string THEN both return None without raising."""
+        index = AliasIndex([self._legacy_identifier_alias()])
+
+        assert index.resolve_identifier(None) is None
+        assert index.resolve_identifier("") is None
+
+    def test_unknown_legacy_identifier_returns_none(self):
+        """GIVEN a mixed index WHEN resolve_identifier is called with an identifier
+        that was never built as an alias THEN it returns None, not a guess."""
+        index = AliasIndex([self._legacy_identifier_alias()])
+
+        assert index.resolve_identifier("FC999999") is None
+
+    def test_len_counts_both_kinds(self):
+        """GIVEN one former-name row and one legacy-identifier row WHEN the index
+        length is inspected THEN it counts both."""
+        index = AliasIndex([self._former_name_alias(), self._legacy_identifier_alias()])
+
+        assert len(index) == 2

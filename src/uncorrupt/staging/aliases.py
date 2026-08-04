@@ -38,20 +38,26 @@ REST API and the bulk snapshot this pipeline already downloads):
    `GET /company/NF003690` returns
    `foreign_company_details.registration_number: "SC222690"` -- a
    cross-reference to that same legal entity's own, separate Scottish
-   registration. Two findings follow: (a) this cross-reference field is
-   NOT present in the bulk CSV -- recovering it at scale needs one live
-   API call per branch registration (~15,000+ oversea-company rows across
-   NF/FC/SF/other prefixes; not attempted here, see the module's read on
-   scope below), and (b) every sampled NF/FC/SF row in the bulk snapshot
-   is a small "Other company type"/"oversea-company" entity, never a
-   household-name PLC -- so even fully built out, this mechanism would not
-   generalise to "an old identifier for a company that later renamed". It
-   is a structurally different relationship (a parallel branch
-   registration, not a superseded identifier). No general mapping from an
-   arbitrary external, non-CH identifier scheme to a live CH number was
-   found published anywhere in CH's data. Where an identifier does not
-   correspond to a real CH company number, this module reports no alias
-   rather than inventing one.
+   registration. This IS a general, published, per-record cross-reference --
+   not present in the bulk CSV, so it needs one live API call per branch
+   registration -- and it does not merge into THIS module's former-name
+   table (a rename and a branch cross-reference are structurally different
+   relationships: one supersedes an identifier, the other parallels it).
+   `uncorrupt.staging.oversea_company_aliases` is the general remediation
+   this finding called for: it fetches `foreign_company_details.
+   registration_number` for every NF/FC/SF-prefixed record (measured
+   2026-08-04 against the real bulk snapshot: 509 NF + 13,823 FC + 184 SF =
+   14,516 rows -- small enough for a single bounded, rate-limited sweep,
+   not the "~15,000+ ... not attempted here" open question this docstring
+   used to leave unresolved), producing `CompanyAlias` rows with
+   `alias_kind="legacy_identifier"` that `AliasIndex.resolve_identifier`
+   below looks up. Whether the mechanism generalises to useful coverage
+   (most oversea-company records actually carrying a populated
+   `registration_number`, vs. mostly empty) is an empirical question that
+   module's build report answers by measurement, never assumed here. Where
+   an identifier does not correspond to a real CH company number, that
+   module reports no alias rather than inventing one -- same discipline as
+   the former-name matching below.
 
 Ambiguity -- never guess. Over 5.7M companies and decades of history,
 names get reused after dissolution. A former name is usable as an alias
@@ -88,7 +94,20 @@ _CONDATE_FORMATS = ("%d/%m/%Y", "%Y-%m-%d")
 
 @dataclass(frozen=True)
 class CompanyAlias:
-    """One alias row: a former company name resolved to its live CH number.
+    """One alias row: an alias resolved to its live CH number.
+
+    Two mechanisms feed this one shape (`alias_kind` distinguishes them so
+    `AliasIndex` can route each to the right lookup):
+    - `"former_name"` (default, built by `build_alias_table` below): a
+      former COMPANY NAME, free-text-matched with the ambiguity guard
+      documented in the module docstring.
+    - `"legacy_identifier"` (built by
+      `uncorrupt.staging.oversea_company_aliases.
+      build_oversea_company_alias_table`): an NF/FC/SF-prefixed oversea-
+      company branch registration number, cross-referenced via CH's
+      `foreign_company_details.registration_number`. Keyed by a unique
+      registry ID rather than free text, so it does not need the same
+      "collides with another company" guard -- see that module's docstring.
 
     `source`/`source_url`/`retrieved_at` are carried per row (rather than
     only once at the table level) so a single alias row is independently
@@ -103,6 +122,7 @@ class CompanyAlias:
     source: str
     source_url: str
     retrieved_at: str
+    alias_kind: str = "former_name"
 
 
 @dataclass(frozen=True)
@@ -272,7 +292,17 @@ def write_alias_table(aliases: list[CompanyAlias], output_path: str | Path) -> N
 
 
 class AliasIndex:
-    """Read-only lookup: a former company name -> its live CH company number.
+    """Read-only lookup: a former name OR legacy identifier -> its live CH
+    company number.
+
+    Two independent lookup tables, kept separate rather than merged into one
+    dict: former company names and legacy oversea-company branch identifiers
+    are different keyspaces (free text vs. a registry ID) built by different
+    mechanisms with different ambiguity guards (see `CompanyAlias`'s
+    docstring for the `alias_kind` distinction). Loading both former-name and
+    legacy-identifier rows into one `AliasIndex` (concatenate the two lists
+    before constructing) makes both `resolve` and `resolve_identifier`
+    available together.
 
     Usage (once a resolver chooses to adopt it -- not wired in this branch):
 
@@ -281,12 +311,19 @@ class AliasIndex:
         '04366849'
         >>> index.resolve("a name that was never anyone's") is None
         True
+        >>> oversea = AliasIndex.load("data/oversea_company_aliases.json")
+        >>> oversea.resolve_identifier("NF003690")
+        'SC222690'
     """
 
     def __init__(self, aliases: list[CompanyAlias]):
-        self._by_name: dict[str, str] = {
-            a.normalised_alias_name: a.live_company_number for a in aliases
-        }
+        self._by_name: dict[str, str] = {}
+        self._by_identifier: dict[str, str] = {}
+        for a in aliases:
+            if a.alias_kind == "legacy_identifier":
+                self._by_identifier[a.normalised_alias_name] = a.live_company_number
+            else:
+                self._by_name[a.normalised_alias_name] = a.live_company_number
 
     @classmethod
     def load(cls, path: str | Path) -> AliasIndex:
@@ -296,15 +333,33 @@ class AliasIndex:
     def resolve(self, name_or_identifier: str | None) -> str | None:
         """Return the live company number for a former name, or None.
 
-        Looks up by normalised former COMPANY NAME only -- the alias
-        table's entire source is `previous_company_names`/
-        `PreviousName_N` (see module docstring for why no general
-        legacy-*identifier* mapping exists to look up by identifier
-        instead). A miss returns None, never a guess.
+        Looks up by normalised former COMPANY NAME only -- former names come
+        from `previous_company_names`/`PreviousName_N` (see module
+        docstring, point 1). A miss returns None, never a guess. For an
+        NF/FC/SF-prefixed legacy identifier, use `resolve_identifier`
+        instead -- that is a different mechanism (point 2) with its own
+        keyspace, never merged into this lookup.
         """
         if not name_or_identifier:
             return None
         return self._by_name.get(_normalise_name(name_or_identifier))
 
+    def resolve_identifier(self, company_number: str | None) -> str | None:
+        """Return the live company number for a legacy identifier, or None.
+
+        Looks up by normalised company-number IDENTIFIER (e.g. an
+        NF/FC/SF-prefixed oversea-company branch registration) -- built from
+        `uncorrupt.staging.oversea_company_aliases`, the cross-reference
+        resolver the module docstring's point 2 finding called for. A miss
+        returns None, never a guess, and never falls back to `resolve`'s
+        name-keyed table (a company number is never a company name).
+        """
+        if not company_number:
+            return None
+        normalised = normalise_company_number(company_number)
+        if not normalised:
+            return None
+        return self._by_identifier.get(normalised)
+
     def __len__(self) -> int:
-        return len(self._by_name)
+        return len(self._by_name) + len(self._by_identifier)

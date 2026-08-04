@@ -181,10 +181,19 @@ def ch_structural_ceiling(
     resolve a company via `Company.objects.filter(company_number=...)`).
 
     A control whose `Company` row is ABSENT can never be recovered by any
-    amount of further officer/appointment ingestion -- that is the
-    structural ceiling. A control whose `Company` row EXISTS but which still
-    failed today is a coverage gap, not a structural one, and is excluded
-    from the "structurally blocked" count.
+    amount of further officer/appointment ingestion. A control whose
+    `Company` row EXISTS but which still failed today is a coverage gap and
+    is excluded from the blocked count.
+
+    NAMING, per spec amendment v2.11: this is a CURRENT-PIPELINE ceiling, not
+    a proven structural limit of the registers. v2.10 called it "structural"
+    while simultaneously holding (A2.10.3) that a general `NF -> live number`
+    alias layer "would be a legitimate pipeline correction" -- a ceiling
+    cannot be both structural and remediable, and the stronger reading was
+    withdrawn. "Further INGESTION cannot lift this" is measured and stands;
+    "no remediation can" was never established. The identifiers and function
+    name are kept for continuity with previously published certificates; the
+    emitted `characterisation` field carries the corrected claim.
     """
     controls = json.loads(Path(ch_controls_path).read_text(encoding="utf-8"))["controls"]
     structurally_blocked = []
@@ -200,7 +209,8 @@ def ch_structural_ceiling(
                     "reason": (
                         "no staging.Company row for this company_number -- absent from the "
                         "ingested Companies House bulk CSV entirely, a legacy/non-file "
-                        "identifier the current architecture cannot resolve"
+                        "identifier THE CURRENT PIPELINE cannot resolve. Not established as "
+                        "intrinsically unresolvable (spec v2.11)"
                     ),
                 }
             )
@@ -232,12 +242,24 @@ def ch_structural_ceiling(
         "gate_fraction": GATE_FRACTION,
         "gate_pct": GATE_FRACTION * 100,
         "ceiling_passes_gate": ceiling_passes_gate,
+        "ceiling_kind": "CURRENT_PIPELINE",
+        "characterisation": (
+            "CURRENT-PIPELINE ceiling, not a proven structural limit (spec v2.11). Measured "
+            "and standing: no amount of further officer/appointment INGESTION lifts this. NOT "
+            "established: that no general, source-derived remediation could. A former-name "
+            "alias layer was built and does NOT reach these rows -- NF/FC/SF is Companies "
+            "House's oversea-company branch-registration scheme, not a rename record. The "
+            "mechanism that might is foreign_company_details.registration_number, a published "
+            "per-record cross-reference absent from the bulk CSV. Until that is built and run, "
+            "'these rows are unresolvable' is UNVERIFIED and must be reported as such."
+        ),
         "finding": (
             f"{blocked} of {total} Companies House controls cite a company_number with no "
             "staging.Company row at all (legacy/non-file identifiers absent from the "
             "BasicCompanyDataAsOneFile bulk CSV, which gates company-entity creation) -- no "
-            f"amount of further officer ingestion can ever resolve these rows. Maximum "
-            f"achievable score is {ceiling}/{total} ({round(100 * ceiling_fraction, 1)}%), "
+            f"amount of further officer ingestion can resolve these rows under the current "
+            f"pipeline. Maximum achievable score is {ceiling}/{total} "
+            f"({round(100 * ceiling_fraction, 1)}%), "
             f"which {gate_relation} ({'PASSES' if ceiling_passes_gate else 'FAILS'})."
         ),
     }

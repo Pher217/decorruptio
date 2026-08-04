@@ -11,6 +11,7 @@ from uncorrupt.pipelines.freshness import (
     check_freshness,
     check_freshness_for_source,
 )
+from uncorrupt.pipelines.run_recorder import Completeness, record_ingest_run
 from uncorrupt.staging.models import IngestRun
 
 
@@ -52,6 +53,14 @@ class TestComputeLabel:
 
     def test_no_ingest_is_critical(self):
         assert _compute_label(None, 7) == "critical"
+
+    def test_no_ingest_and_never_run_is_unknown(self):
+        """GIVEN no days-since-success value AND has_any_run=False
+        WHEN computing the label
+        THEN it is reported as "unknown" (never attempted), not "critical"
+        (attempted and failed) — the distinction this pass exists to add.
+        """
+        assert _compute_label(None, 7, has_any_run=False) == "unknown"
 
     def test_within_sla_is_fresh(self):
         assert _compute_label(3, 7) == "fresh"
@@ -111,9 +120,30 @@ class TestCheckFreshnessForSource:
         assert status.label == "critical"
         assert status.is_within_sla is False
 
-    def test_no_successful_ingest_is_critical(self):
-        """A source with no successful ingest is critical."""
+    def test_never_run_is_unknown(self):
+        """GIVEN a source with no IngestRun row at all (never attempted)
+        WHEN checking its freshness
+        THEN the label is "unknown", not "critical" -- "critical" is
+        reserved for a source that HAS been attempted (an IngestRun row
+        exists) but never succeeded, or succeeded too long ago.
+        """
         status = check_freshness_for_source("ec_donations", sla_days=7)
+        assert status.label == "unknown"
+        assert status.days_since_success is None
+
+    def test_attempted_but_always_failed_is_critical(self):
+        """GIVEN a source with only failed IngestRun rows (attempted, no success)
+        WHEN checking its freshness
+        THEN the label is "critical", distinct from "unknown" (never attempted).
+        """
+        now = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+        _create_ingest_run(
+            "ec_donations",
+            now - timedelta(hours=2),
+            now - timedelta(hours=1),
+            status="failed",
+        )
+        status = check_freshness_for_source("ec_donations", sla_days=7, now=now)
         assert status.label == "critical"
         assert status.days_since_success is None
 
@@ -168,7 +198,10 @@ class TestCheckFreshnessAll:
         assert results[0].source_id == "ec_donations"
         assert results[0].label == "fresh"
         assert results[1].source_id == "uk_contracts_finder"
-        assert results[1].label == "critical"
+        # No IngestRun row exists at all for uk_contracts_finder in this test
+        # (never attempted) -- "unknown", not "critical" (which now means
+        # "attempted, but failed or too stale").
+        assert results[1].label == "unknown"
 
     def test_no_sources_dir_returns_empty(self, tmp_path):
         """A non-existent sources directory returns empty list."""
@@ -198,4 +231,61 @@ class TestCheckFreshnessAll:
         labels = {r.source_id: r.label for r in results}
         assert labels["source_a"] == "fresh"
         assert labels["source_b"] == "stale"
-        assert labels["source_c"] == "critical"
+        # source_c never got an IngestRun row in this test -- "unknown"
+        # (never attempted), not "critical".
+        assert labels["source_c"] == "unknown"
+
+
+@pytest.mark.django_db
+class TestGraphLayerCoverage:
+    """The bug this pass fixes: no graph-layer connector (ec_donations,
+    ch_officers, ch_appointments, lords_interests, parliament_interests,
+    gleif) writes to IngestRun yet, so freshness checking must report that
+    honestly instead of silently omitting or misreporting those sources.
+    """
+
+    def test_never_run_graph_source_is_reported_not_omitted(self):
+        """GIVEN the real source register (sources/*.yml, default sources_dir)
+        and a graph-layer source with zero IngestRun rows (true today for
+        every graph connector)
+        WHEN checking freshness across all registered sources
+        THEN the graph source appears in the results (not omitted) labelled
+        "unknown", proving a never-run connector is visible rather than
+        invisible.
+        """
+        now = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+        results = check_freshness(now=now)  # default sources_dir=Path("sources")
+
+        by_id = {r.source_id: r for r in results}
+        assert "gleif" in by_id  # connector_kind: graph, never wired to IngestRun
+        assert by_id["gleif"].label == "unknown"
+        assert by_id["gleif"].days_since_success is None
+
+    def test_recorded_run_yields_correct_freshness_label(self):
+        """GIVEN a graph connector that records a COMPLETE run via
+        run_recorder.record_ingest_run
+        WHEN checking its freshness immediately afterwards
+        THEN it is "fresh" -- proving the helper's write is what freshness.py
+        reads, closing the gap between the two.
+        """
+        with record_ingest_run("gleif") as run:
+            run.finish(Completeness.COMPLETE, records_fetched=500, records_ingested=500)
+
+        status = check_freshness_for_source("gleif", sla_days=7)
+        assert status.label == "fresh"
+        assert status.is_within_sla is True
+
+    def test_partial_run_is_not_reportable_as_healthy(self):
+        """GIVEN a graph connector that records a PARTIAL run (fetched fewer
+        records than expected) via run_recorder.record_ingest_run, made just
+        now
+        WHEN checking its freshness
+        THEN the label is NOT "fresh" -- ADR-008: only COMPLETE may feed
+        scoring, so a recent-but-partial run must not read as healthy.
+        """
+        with record_ingest_run("gleif") as run:
+            run.finish(Completeness.PARTIAL, records_fetched=500, records_ingested=300)
+
+        status = check_freshness_for_source("gleif", sla_days=7)
+        assert status.label != "fresh"
+        assert status.label == "critical"

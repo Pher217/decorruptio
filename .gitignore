@@ -12,7 +12,14 @@ __pycache__/
 data/
 dagster_home/
 *.duckdb
-# Experiment outputs (regenerated, not versioned)
+# Experiment outputs (regenerated, not versioned).
+# EXCEPTION: experiments/no_score_certificate.json is force-tracked
+# (git add -f) despite this rule. ADR-008 requires the no-score certificate
+# to be a permanent, auditable artifact naming exactly which control
+# blocked scoring; its graph_hash binds it to a live, mutating Postgres
+# database, so unlike every other file under experiments/ it cannot be
+# regenerated identically once deleted -- an ignored, worktree-only copy
+# would defeat the whole point of the certificate.
 experiments/
 # Node
 node_modules/
@@ -25,3 +32,6 @@ decorruptio_dev.db
 # Canonical graph home is ~/dev/Graphify/{Project}/{repo}/ (see graphify-canonical.sh).
 graphify-out/
 .graphify_*
+
+# playwright-mcp scratch output (downloaded registers, console logs)
+.playwright-mcp/

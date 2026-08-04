@@ -7,6 +7,7 @@ Verifies the core invariants:
   wrongly linked
 - Re-ingesting the same LEI updates rather than duplicating
 - A record missing the LEI is skipped and counted
+- fetch_gleif/ingest_gleif refuse to run without a sources/gleif.yml register entry
 """
 
 import json
@@ -15,6 +16,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+import uncorrupt.graph.gleif as gleif_module
+from uncorrupt.core.errors import RegisterError
 from uncorrupt.graph.gleif import fetch_gleif, ingest_gleif
 from uncorrupt.graph.models import Entity
 from uncorrupt.staging.models import Company
@@ -276,3 +279,28 @@ class TestGleifFetch:
 
         assert result.record_count == 1
         assert attempts == 2
+
+
+class TestGleifRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/gleif.yml cannot be resolved (its source_id is absent from the
+        register) WHEN ingest_gleif is called THEN it raises RegisterError and writes
+        nothing to the database."""
+        monkeypatch.setattr(gleif_module, "SOURCE_ID", "does_not_exist_xyz")
+        jsonl_path = _write_jsonl(tmp_path, [_gb_record()])
+
+        with pytest.raises(RegisterError):
+            ingest_gleif(jsonl_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/gleif.yml cannot be resolved WHEN fetch_gleif is called THEN it
+        raises RegisterError before making any HTTP request."""
+        monkeypatch.setattr(gleif_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_gleif must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(RegisterError):
+            fetch_gleif(tmp_path, country="GB", limit=1, client=client)

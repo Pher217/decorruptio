@@ -28,12 +28,11 @@ weeks. Falls back to `AcceptedDate` only if `ReceivedDate` is blank.
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
+import io
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -42,13 +41,18 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
+from uncorrupt.staging.raw import write_cached_fetch
 
 logger = logging.getLogger(__name__)
 
 EC_API_BASE = "https://search.electoralcommission.org.uk/api/csv/Donations"
 SOURCE_NAME = "Electoral Commission"
+# sources/uk_ec_donations.yml — connector refuses to run without it (ADR-001 D5)
+SOURCE_ID = "uk_ec_donations"
+CONNECTOR_VERSION = "0.1"
 
 # Donor statuses that identify an organisation we can resolve to a company.
 # "Individual" and similar person-level statuses are excluded by design
@@ -105,6 +109,7 @@ def fetch_ec_donations_csv(
     expected to point `output_dir` at a gitignored path (e.g. `experiments/`)
     — this function does not commit anything.
     """
+    source = load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "ec_donations.csv"
@@ -152,31 +157,37 @@ def fetch_ec_donations_csv(
             client.close()
 
     header = header or []
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(header)
+    writer.writerows(rows)
+    csv_bytes = buffer.getvalue().encode("utf-8")
 
-    content_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-    retrieved_at = datetime.now(UTC)
     et_list = list(entity_types)
     source_url_template = f"{EC_API_BASE}?from={from_date}&to={to_date}&et={et_list}"
-    provenance = {
-        "source_url_template": source_url_template,
-        "retrieved_at": retrieved_at.isoformat(),
-        "content_hash": f"sha256:{content_hash}",
-        "row_count": len(rows),
-        "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-    }
-    provenance_path.write_text(json.dumps(provenance, indent=2))
+    # observed_at: left unset -- this is a live export of the CURRENT donation
+    # register, not a historical snapshot with a capture date of its own.
+    cached = write_cached_fetch(
+        csv_bytes,
+        csv_path,
+        provenance_path,
+        source=source,
+        source_url=source_url_template,
+        connector_version=CONNECTOR_VERSION,
+        extra={
+            "source_url_template": source_url_template,
+            "row_count": len(rows),
+            "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+        },
+    )
 
     return FetchResult(
         csv_path=csv_path,
         provenance_path=provenance_path,
         row_count=len(rows),
         source_url_template=source_url_template,
-        retrieved_at=retrieved_at,
-        content_hash=f"sha256:{content_hash}",
+        retrieved_at=cached.provenance.retrieved_at,
+        content_hash=cached.provenance.content_hash,
     )
 
 
@@ -256,14 +267,17 @@ def _resolve_donor_company(row: dict[str, str]) -> tuple[Company | None, float, 
 def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
     """Ingest a previously-downloaded EC donations CSV into Entity/Edge rows.
 
-    Returns summary stats: {matched, unmatched_donor, skipped_individual, total}.
+    Returns summary stats: {matched, unmatched_donor, skipped_individual,
+    attestations_updated, total}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_ec_donations.yml
     csv_path = Path(csv_path)
     matched = 0
     unmatched_donor = 0
     skipped_individual = 0
     skipped_no_recipient_name = 0
     invalid_received_date = 0
+    attestations_updated = 0
     total = 0
 
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -356,18 +370,46 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
                 }
                 if ec_ref:
                     att_lookup["source_reference"] = ec_ref
-                Attestation.objects.get_or_create(
-                    **att_lookup,
-                    defaults={
-                        "source_url": (
-                            f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
-                            if ec_ref
-                            else None
-                        ),
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    },
+                source_url = (
+                    f"https://search.electoralcommission.org.uk/Search/Donations?ecref={ec_ref}"
+                    if ec_ref
+                    else None
                 )
+
+                # get_or_create's `defaults` are silently discarded once a
+                # row exists (the same bug class identity_resolution.py had
+                # -- see its fix for the general shape). ECRef is a stable
+                # key across ingests, but _resolve_donor_company() re-queries
+                # the live Company table on every run, and this module is a
+                # "live export of the CURRENT donation register" (see
+                # fetch_ec_donations_csv) that gets re-fetched over time --
+                # so the SAME ECRef can legitimately resolve via a different
+                # tier on a later re-ingest (e.g. a CompanyRegistrationNumber
+                # the EC backfills, or drops, between two exports) even
+                # though the donor company -- and therefore this edge --
+                # never changes. Correct the persisted confidence/method to
+                # this run's decision in either direction, but only when it
+                # actually changed. `observed_at` is deliberately left alone:
+                # this connector never sets it (a live current-register
+                # snapshot has no capture date of its own to record -- see
+                # the module docstring), so there is no bitemporal field
+                # here to update or preserve.
+                existing_attestation = Attestation.objects.filter(**att_lookup).first()
+                if existing_attestation is None:
+                    Attestation.objects.create(
+                        **att_lookup,
+                        source_url=source_url,
+                        match_confidence=confidence,
+                        match_method=method,
+                    )
+                elif (
+                    existing_attestation.match_confidence != confidence
+                    or existing_attestation.match_method != method
+                ):
+                    existing_attestation.match_confidence = confidence
+                    existing_attestation.match_method = method
+                    existing_attestation.save(update_fields=["match_confidence", "match_method"])
+                    attestations_updated += 1
                 if edge_created:
                     matched += 1
 
@@ -377,5 +419,6 @@ def ingest_ec_donations_csv(csv_path: str | Path) -> dict[str, Any]:
         "skipped_individual": skipped_individual,
         "skipped_no_recipient_name": skipped_no_recipient_name,
         "invalid_received_date": invalid_received_date,
+        "attestations_updated": attestations_updated,
         "total": total,
     }

@@ -6,14 +6,20 @@ Verifies the core invariants:
 - amount_cents is parsed as an integer, never a float
 - Donation date (ReceivedDate) maps to Edge.valid_from
 - Individual donors are never turned into Entities (ADR-004 D1)
+- fetch_ec_donations_csv/ingest_ec_donations_csv refuse to run without a
+  sources/uk_ec_donations.yml register entry
 """
 
 import csv
+from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 
-from uncorrupt.graph.ec_donations import ingest_ec_donations_csv
+import uncorrupt.graph.ec_donations as ec_donations_module
+from uncorrupt.core.errors import RegisterError
+from uncorrupt.graph.ec_donations import fetch_ec_donations_csv, ingest_ec_donations_csv
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.staging.models import Company
 
@@ -449,3 +455,236 @@ class TestEcDonationsIngest:
         assert summary["skipped_individual"] == 1
         assert Attestation.objects.filter(source_reference="C0501005").count() == 0
         assert not Entity.objects.filter(name="Anthony P Clarke").exists()
+
+
+@pytest.mark.django_db
+class TestAttestationConfidenceStaleness:
+    """`Attestation.objects.get_or_create(..., defaults={...})` silently
+    discards `defaults` once a row exists. `ECRef` is a STABLE key across
+    ingests (the Electoral Commission's own donation reference), but
+    `_resolve_donor_company()`'s (confidence, method) is computed by
+    re-querying the live `staging.Company` table on every run against a
+    source the module's own docstring calls "a live export of the CURRENT
+    donation register" (see `fetch_ec_donations_csv`) -- so the SAME ECRef
+    can legitimately resolve via a different tier on a later re-ingest (e.g.
+    a CompanyRegistrationNumber the EC backfills between two exports) even
+    though the underlying donor company, and therefore the edge, never
+    changes. A stale confidence left in place is a published number
+    (`mcp.tools.get_attestations` returns `match_confidence` verbatim for
+    any attestation, not just cross-register identity ones)."""
+
+    def test_a_confidence_upgrade_on_reingest_is_applied(self, tmp_path):
+        """GIVEN a donation already ingested once, when the CSV had no
+        CompanyRegistrationNumber and the donor was resolved only by a
+        uniqueness-guarded exact name match (exact_name / 0.9)
+        WHEN the SAME ECRef is re-ingested from a corrected CSV that now
+        carries the CompanyRegistrationNumber for the SAME donor company
+        THEN the persisted attestation is corrected UP to the stronger
+        identifier / 1.0 match in place -- not left frozen at the earlier
+        run's weaker tier, and not duplicated into a second row."""
+        Company.objects.create(
+            company_number="00000020",
+            company_name="Upgrade Co Ltd",
+            normalised_name="UPGRADE CO LTD",
+        )
+        base_row = {
+            "ECRef": "C0501020U",
+            "RegulatedEntityName": "Conservative and Unionist Party",
+            "RegulatedEntityType": "Political Party",
+            "Value": "£1,000.00",
+            "AcceptedDate": "10/01/2020",
+            "DonorName": "Upgrade Co Ltd",
+            "DonorStatus": "Company",
+            "ReceivedDate": "05/01/2020",
+            "RegulatedEntityId": "52",
+        }
+        csv_path_1 = _write_csv(tmp_path, [dict(base_row, CompanyRegistrationNumber="")])
+        summary_1 = ingest_ec_donations_csv(csv_path_1)
+        assert summary_1["matched"] == 1
+        attestation = Attestation.objects.get(source_reference="C0501020U")
+        assert attestation.match_confidence == 0.9
+        assert attestation.match_method == "exact_name"
+
+        csv_path_2 = _write_csv(tmp_path, [dict(base_row, CompanyRegistrationNumber="00000020")])
+        summary_2 = ingest_ec_donations_csv(csv_path_2)
+
+        assert Attestation.objects.filter(source_reference="C0501020U").count() == 1
+        attestation.refresh_from_db()
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+        assert summary_2["attestations_updated"] == 1
+
+    def test_an_unchanged_resolution_on_reingest_is_not_rewritten(self, tmp_path):
+        """GIVEN a donation already ingested with a resolution that the
+        current code would compute identically again (same
+        CompanyRegistrationNumber, same donor, nothing about the Company
+        table changed)
+        WHEN the SAME ECRef is re-ingested unchanged
+        THEN no attestation update is recorded -- the fix only corrects a
+        STALE confidence, it must not needlessly rewrite a row that already
+        matches what the current run would decide."""
+        Company.objects.create(
+            company_number="00000022",
+            company_name="Stable Co Ltd",
+            normalised_name="STABLE CO LTD",
+        )
+        row = {
+            "ECRef": "C0501022S",
+            "RegulatedEntityName": "Conservative and Unionist Party",
+            "RegulatedEntityType": "Political Party",
+            "Value": "£1,000.00",
+            "AcceptedDate": "10/01/2020",
+            "DonorName": "Stable Co Ltd",
+            "DonorStatus": "Company",
+            "CompanyRegistrationNumber": "00000022",
+            "ReceivedDate": "05/01/2020",
+            "RegulatedEntityId": "52",
+        }
+        csv_path = _write_csv(tmp_path, [row])
+        summary_1 = ingest_ec_donations_csv(csv_path)
+        assert summary_1["matched"] == 1
+
+        summary_2 = ingest_ec_donations_csv(csv_path)
+
+        assert summary_2["attestations_updated"] == 0
+        attestation = Attestation.objects.get(source_reference="C0501022S")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+
+    def test_a_confidence_downgrade_on_reingest_is_applied_not_protected(self, tmp_path):
+        """GIVEN a donation already ingested once at the stronger identifier
+        / 1.0 tier (CompanyRegistrationNumber present)
+        WHEN the SAME ECRef is re-ingested from a later export where
+        CompanyRegistrationNumber has gone missing (a data-quality
+        regression at the source) but the donor name still resolves
+        uniquely by exact name to the SAME company
+        THEN the persisted confidence is corrected DOWN to exact_name / 0.9
+        to match this run's weaker evidence -- a stale HIGH confidence left
+        in place would be fail-open (a stronger claim than the current
+        evidence supports stays published), so the correction must apply in
+        the downgrade direction too, not just upgrades."""
+        Company.objects.create(
+            company_number="00000021",
+            company_name="Downgrade Co Ltd",
+            normalised_name="DOWNGRADE CO LTD",
+        )
+        base_row = {
+            "ECRef": "C0501021D",
+            "RegulatedEntityName": "Conservative and Unionist Party",
+            "RegulatedEntityType": "Political Party",
+            "Value": "£1,000.00",
+            "AcceptedDate": "10/01/2020",
+            "DonorName": "Downgrade Co Ltd",
+            "DonorStatus": "Company",
+            "ReceivedDate": "05/01/2020",
+            "RegulatedEntityId": "52",
+        }
+        csv_path_1 = _write_csv(tmp_path, [dict(base_row, CompanyRegistrationNumber="00000021")])
+        summary_1 = ingest_ec_donations_csv(csv_path_1)
+        assert summary_1["matched"] == 1
+        attestation = Attestation.objects.get(source_reference="C0501021D")
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+
+        csv_path_2 = _write_csv(tmp_path, [dict(base_row, CompanyRegistrationNumber="")])
+        summary_2 = ingest_ec_donations_csv(csv_path_2)
+
+        attestation.refresh_from_db()
+        assert attestation.match_confidence == 0.9
+        assert attestation.match_method == "exact_name"
+        assert summary_2["attestations_updated"] == 1
+
+    def test_a_same_method_confidence_only_drift_is_still_corrected(self, tmp_path):
+        """GIVEN a persisted attestation whose match_method already equals
+        what the current run would compute (identifier) but whose
+        match_confidence disagrees with the value that method always carries
+        (1.0) -- isolating a confidence-only correction from a method change,
+        so a fix that checks only `match_method` (or only ever raises
+        `match_confidence`) cannot pass by accident
+        WHEN the same donation is (re-)ingested
+        THEN the confidence is corrected to what this run actually decided,
+        even though the method string alone gave no signal anything was
+        stale."""
+        company = Company.objects.create(
+            company_number="00000023",
+            company_name="Same Method Co Ltd",
+            normalised_name="SAME METHOD CO LTD",
+        )
+        donor_entity = Entity.objects.create(
+            entity_type="company",
+            company_number=company.company_number,
+            name=company.company_name,
+            registry_scheme="GB-COH",
+            registry_id=company.company_number,
+        )
+        recipient_entity = Entity.objects.create(
+            entity_type="political_party",
+            registry_scheme="EC-REGULATED-ENTITY",
+            registry_id="52",
+            name="Conservative and Unionist Party",
+        )
+        edge = Edge.objects.create(
+            edge_type="donation",
+            source_entity=donor_entity,
+            target_entity=recipient_entity,
+            valid_from=date(2020, 1, 5),
+            amount_cents=100000,
+            currency="GBP",
+        )
+        attestation = Attestation.objects.create(
+            edge=edge,
+            source_name="Electoral Commission",
+            source_reference="C0501023M",
+            match_confidence=0.65,
+            match_method="identifier",
+        )
+        csv_path = _write_csv(
+            tmp_path,
+            [
+                {
+                    "ECRef": "C0501023M",
+                    "RegulatedEntityName": "Conservative and Unionist Party",
+                    "RegulatedEntityType": "Political Party",
+                    "Value": "£1,000.00",
+                    "AcceptedDate": "10/01/2020",
+                    "DonorName": "Same Method Co Ltd",
+                    "DonorStatus": "Company",
+                    "CompanyRegistrationNumber": "00000023",
+                    "ReceivedDate": "05/01/2020",
+                    "RegulatedEntityId": "52",
+                }
+            ],
+        )
+
+        summary = ingest_ec_donations_csv(csv_path)
+
+        attestation.refresh_from_db()
+        assert attestation.match_confidence == 1.0
+        assert attestation.match_method == "identifier"
+        assert summary["attestations_updated"] == 1
+
+
+class TestEcDonationsRegisterContract:
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_ec_donations.yml cannot be resolved (its source_id is absent
+        from the register) WHEN ingest_ec_donations_csv is called THEN it raises
+        RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(ec_donations_module, "SOURCE_ID", "does_not_exist_xyz")
+        csv_path = _write_csv(tmp_path, [])
+
+        with pytest.raises(RegisterError):
+            ingest_ec_donations_csv(csv_path)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN sources/uk_ec_donations.yml cannot be resolved WHEN
+        fetch_ec_donations_csv is called THEN it raises RegisterError before making
+        any HTTP request."""
+        monkeypatch.setattr(ec_donations_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_ec_donations_csv must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(RegisterError):
+            fetch_ec_donations_csv(date(2020, 1, 1), date(2020, 12, 31), tmp_path, client=client)

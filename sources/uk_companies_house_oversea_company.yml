@@ -1,0 +1,42 @@
+source_id: uk_companies_house_oversea_company
+name: UK Companies House — oversea-company branch cross-reference
+jurisdictions: [GB]
+data_class: A1   # organisation-only: a legacy branch registration number cross-referenced
+                  # to its own live UK company number. No natural-person data touched or stored.
+tier: a
+license: "Crown copyright — Companies Act 2006 public register (no reuse restriction stated beyond the standard accurate, non-misleading-reproduction condition)"
+redistribution: open
+legal_basis: >-
+  Companies Act 2006 s.1046+ (oversea companies) / s.1087+ — statutory public register;
+  Companies House states it imposes no rules on how public-register data is used,
+  beyond ordinary data-protection/copyright law applying to the reuser
+access_method: bulk-api
+robots_tos_reviewed: 2026-08-04
+freshness_sla_days: 30
+dpia_cleared: false   # A1, not gated by the A2 DPIA -- default retained for consistency
+connector_kind: graph
+locale: gb
+registry_schemes: [GB-COH]
+identifier_field: >-
+  legacy oversea-company branch registration number (NF/FC/SF-prefixed company_number in
+  staging.Company) -> foreign_company_details.registration_number on the live CH
+  `/company/{legacy_number}` profile -- the same legal entity's own separate UK registration
+rate_limit: "600 requests / 5 minutes (Companies House-documented); self-throttled at ~0.55s/request"
+notes: >-
+  Builds the general, source-wide half of the alias layer uncorrupt.staging.aliases
+  (former company names, from the bulk CSV) could not reach: NF/FC/SF-prefixed
+  identifiers are not a rename/supersession mechanism, they are Companies House's
+  oversea-company branch-registration scheme (see the aliases.py module docstring,
+  point 2, for the finding this settles). The cross-reference field is not present
+  in the bulk CSV -- unlike aliases.py, this connector makes one live API call per
+  branch registration (measured universe: 509 NF + 13,823 FC + 184 SF = 14,516 rows
+  in the 2026-07-01 bulk snapshot, small enough for a bounded full sweep).
+  Implemented under src/uncorrupt/staging/ (uncorrupt.staging.oversea_company_aliases),
+  not src/uncorrupt/graph/, because -- like aliases.py -- it produces a lookup table
+  only (no Entity/Edge graph rows), so it does not follow the graph family's
+  fetch_<x>/ingest_<x> pair convention this README documents. It is still a live,
+  rate-limited external-registry connector making one HTTP call per legacy identifier,
+  so it follows the same ADR-001 D5 register-entry contract as the graph connectors
+  sharing this API (ch_officers.py, ch_appointments.py, overseas_entities.py — see
+  sources/uk_companies_house_officers.yml, sources/uk_roe.yml) rather than skipping
+  it the way the CSV-only staging modules do.

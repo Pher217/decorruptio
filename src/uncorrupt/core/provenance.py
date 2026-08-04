@@ -35,6 +35,15 @@ class ProvenanceRecord:
     connector: str
     connector_version: str
     fx: FxProvenance | None = None
+    # When the SOURCE published or captured this artifact -- e.g. a Wayback
+    # Machine snapshot timestamp -- NEVER when we downloaded it. A live fetch
+    # with no capture date of its own (a REST endpoint reflecting current
+    # state) leaves this None rather than defaulting it to `retrieved_at`:
+    # a bug once populated a historical Wayback capture's evidence with
+    # today's download time, silently destroying its value as pre-award
+    # evidence (see `uncorrupt.staging.raw`, the shared cache helper this
+    # field exists to make that mistake hard to repeat in).
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)

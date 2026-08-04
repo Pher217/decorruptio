@@ -1,6 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Uncorrupt source register entry",
+  "description": "One entry per sources/<source_id>.yml. Shared by both connector families: connector_kind 'procurement' (the OCDS/OCP pipeline) and connector_kind 'graph' (the relationship-recovery layer under src/uncorrupt/graph — one module per source). See sources/README.md for the full country-onboarding contract.",
   "type": "object",
   "required": ["source_id", "name", "jurisdictions", "data_class", "tier",
                "license", "redistribution", "legal_basis", "access_method",
@@ -19,6 +20,35 @@
     "robots_tos_reviewed": {"type": "string", "format": "date"},
     "freshness_sla_days": {"type": "integer", "minimum": 1},
     "dpia_cleared": {"type": "boolean"},
-    "notes": {"type": "string"}
+    "notes": {"type": "string"},
+
+    "connector_kind": {
+      "enum": ["procurement", "graph"],
+      "default": "procurement",
+      "description": "'graph' marks a relationship-recovery connector (src/uncorrupt/graph/<module>.py) and requires locale (unless jurisdictions == [\"GLOBAL\"]), registry_schemes, identifier_field and rate_limit below — enforced by SourceEntry's model validator, not just this schema."
+    },
+    "locale": {
+      "type": "string",
+      "description": "The locales/<code>.yml this connector's data is denominated in (e.g. 'gb'). Required for connector_kind 'graph' unless jurisdictions == [\"GLOBAL\"] (e.g. GLEIF, which has no single locale)."
+    },
+    "registry_schemes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The Entity.registry_scheme values this connector emits (e.g. [\"GB-COH\", \"UK-PARLIAMENT-MEMBER\"]). Required for connector_kind 'graph'."
+    },
+    "identifier_field": {
+      "type": "string",
+      "description": "What the connector resolves/dedupes entities on (e.g. 'lei', 'company_number', 'member_id'). Required for connector_kind 'graph'."
+    },
+    "rate_limit": {
+      "type": "string",
+      "description": "Free-text rate-limit / politeness description (documented limit, or the connector's own self-throttle if none is published). Required for connector_kind 'graph'."
+    }
+  },
+  "if": {
+    "properties": {"connector_kind": {"const": "graph"}}
+  },
+  "then": {
+    "required": ["registry_schemes", "identifier_field", "rate_limit"]
   }
 }

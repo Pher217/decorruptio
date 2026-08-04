@@ -52,7 +52,9 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from django.db import transaction
 
+from uncorrupt.core.provenance import ProvenanceRecord
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
@@ -63,10 +65,65 @@ LORDS_REGISTER_URL = (
 )
 WAYBACK_PREFIX = "https://web.archive.org/web/"
 SOURCE_NAME = "UK House of Lords Register of Interests"
+# sources/uk_lords_interests.yml — connector refuses to run without it (ADR-001 D5)
+SOURCE_ID = "uk_lords_interests"
+CONNECTOR_VERSION = "0.1"
 
 # Longest plausible organisation name. Anything beyond this is a parse
 # artefact from free-text register entries, not a real counterparty.
 _MAX_COUNTERPARTY_NAME = 200
+
+# A comma immediately followed by nothing but a bare legal suffix is part of
+# the organisation's own name (US-convention "X, Inc."), not a role
+# separator — splitting there produced counterparties named literally "Inc."
+# Whole-string match only: "X, Inc. of Delaware" still splits normally.
+_BARE_SUFFIX_RE = re.compile(
+    r"^(?:Inc|Ltd|Limited|LLC|LLP|Corp|Corporation|plc|PLC|SA|AG|NV|BV|KG|SE|"
+    r"ASA|SRL|SpA|GmbH|Co|L\.?P\.?|Pty)\.?$",
+    re.IGNORECASE,
+)
+
+# Legal-form suffixes (UK + common overseas jurisdictions) and institutional
+# nouns that mark free text as an organisation rather than a person or a
+# bare place/property description. Deliberately excludes generic words that
+# could plausibly appear in a person's own name.
+_ORG_MARKERS_RE = re.compile(
+    r"\b(Ltd|Limited|LLP|plc|PLC|CIC|Foundation|Trust|Society|Board|"
+    r"Authority|Group|Association|Charity|University|College|School|"
+    r"Partnership|Holdings|Capital|Fund|Enterprise|Enterprises|"
+    r"Council|Committee|Commission|Institute|Institution|Agency|Bureau|"
+    r"Church|Embassy|Ministry|Chambers|Programme|Federation|Alliance|"
+    r"Network|Forum|Confederation|Systems|Corporation|Corp|Inc|LLC|LP|"
+    r"GmbH|AG|SA|SE|NV|BV|ASA|SRL|SpA|Oy|AB|KG|Ltda|Limitada|"
+    r"Company|Companies)\b",
+    re.IGNORECASE,
+)
+
+# Signals that the candidate text is prose (a sentence fragment or a
+# redaction notice), not an organisation name — e.g. "The member is a
+# shareholder ... full details are held by the Registrar of Lords'
+# Interests". Category-2 entries carrying one of these are genuinely
+# unnamed, not a pattern miss.
+_PROSE_MARKERS = (
+    " is ",
+    " are ",
+    " was ",
+    " were ",
+    " has ",
+    " have ",
+    "full details",
+    "the member",
+    "The member",
+    "registrar",
+    "Registrar",
+    " no shares",
+    " which ",
+    " who ",
+    " whom ",
+    ";",
+    ":",
+)
+_NAME_CONNECTORS = {"the", "a", "an", "and", "of", "for", "in", "at", "&", "to", "on", "with"}
 
 # Categories that name an individual (relative) rather than the member's
 # own public-function interest — excluded per ADR-004 D1.
@@ -108,6 +165,36 @@ class LordsFetchResult:
 def _clean_wayback_url(url: str) -> str:
     """Remove Wayback Machine rewriting from a URL."""
     return re.sub(r"^https://web\.archive\.org/web/\d+/(?:im_|cs_)?(?:https?://)?", "", url)
+
+
+# Wayback timestamps are a date-time prefix of up to 14 digits
+# (YYYYMMDDhhmmss); callers may pass a shorter prefix (e.g. "20201130") and
+# let Wayback resolve to the nearest capture. Longest-first so a full
+# timestamp isn't mistaken for a shorter one.
+_WAYBACK_TS_FORMATS = (
+    (14, "%Y%m%d%H%M%S"),
+    (12, "%Y%m%d%H%M"),
+    (10, "%Y%m%d%H"),
+    (8, "%Y%m%d"),
+    (6, "%Y%m"),
+    (4, "%Y"),
+)
+
+
+def _parse_wayback_timestamp(wayback_timestamp: str) -> datetime | None:
+    """Parse a Wayback Machine timestamp into the capture's UTC instant.
+
+    Returns None if the string doesn't match any recognised Wayback
+    timestamp length/format — callers should fall back to another signal
+    rather than raise, since a malformed timestamp shouldn't crash a run.
+    """
+    for length, fmt in _WAYBACK_TS_FORMATS:
+        if len(wayback_timestamp) == length:
+            try:
+                return datetime.strptime(wayback_timestamp, fmt).replace(tzinfo=UTC)
+            except ValueError:
+                return None
+    return None
 
 
 def _parse_ceased_date(text: str) -> str | None:
@@ -207,66 +294,157 @@ def _parse_interests(container: Tag) -> list[dict[str, Any]]:
     return interests
 
 
-def _extract_counterparty(description: str) -> tuple[str | None, str | None, bool]:
+def _strip_trailing_parens(text: str) -> str:
+    """Strip every consecutive trailing "(...)" annotation, not just the last one.
+
+    "SATMAP Inc (trading as Afiniti) (communications technology)" carries two
+    trailing parentheticals; stripping only the last one left "(trading as
+    Afiniti)" glued onto the name.
+
+    Depth-counted rather than a `\\([^)]*\\)` regex: register text nests
+    parens ("...see category 2(a))"), and a regex that stops at the first
+    ")" fails to match the true trailing group at all on nested text —
+    leaving it un-stripped and full of sentence punctuation.
+    """
+    text = text.rstrip()
+    while text.endswith(")"):
+        depth = 0
+        i = len(text) - 1
+        while i >= 0:
+            if text[i] == ")":
+                depth += 1
+            elif text[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            i -= 1
+        if i < 0 or depth != 0:
+            break
+        text = text[:i].rstrip()
+    return text
+
+
+def _looks_like_entity_name(text: str) -> bool:
+    """Plausibility gate for a candidate with no explicit legal-form marker.
+
+    Used only where the surrounding structure already establishes that a
+    named entity (not a person) is expected — a Category 2 shareholding, or
+    a description that independently mentions "company"/"corporation"/
+    "firm". Requires a short, capitalised, non-prose token sequence: real
+    organisation names in this register are short and Title Case even
+    without a legal suffix ("Halma", "The Terrapin Group", "Barclays");
+    prose fragments ("the member is a shareholder with...") and dates
+    ("18 December 2025") are rejected so this never promotes a sentence
+    fragment or a redaction notice into a fabricated counterparty.
+    """
+    text = text.strip()
+    if not text or len(text) > 100:
+        return False
+    if any(marker in text for marker in _PROSE_MARKERS):
+        return False
+    if not text[0].isalnum():
+        return False
+    words = text.split()
+    if not words or len(words) > 9:
+        return False
+    if words[0][0].islower():
+        return False
+    if any(w.strip(",.-()").lower() in _MONTH_NAMES for w in words):
+        return False
+    significant = [
+        w for w in words if w.lower().strip(",.-'()") not in _NAME_CONNECTORS and w[:1].isalpha()
+    ]
+    if not significant:
+        return False
+    upper_count = sum(1 for w in significant if w[0].isupper())
+    return (upper_count / len(significant)) >= 0.6
+
+
+def _extract_counterparty(
+    description: str, category: str | None = None
+) -> tuple[str | None, str | None, bool]:
     """Extract counterparty name and company number from an interest description.
 
     Lords register entries are free-text like:
         "Chairman, Microlink PC (UK) Ltd (computing and software)"
         "Director, Leadership in Mind Ltd (business activities)"
 
+    ``category`` (e.g. "Category 2: Shareholdings etc. (b)") is optional
+    context, not a requirement — it only widens the plausibility fallback
+    below for the one category where a named-but-unmarked entity is
+    virtually certain (see the Category 2 branch).
+
+    Two defects in the previous, marker-anywhere-in-description approach:
+    trailing parentheticals routinely contain their OWN commas ("Unilever
+    plc (nutrition, hygiene and personal care products)"), so splitting on
+    the first comma in the raw description split mid-parenthetical and
+    silently corrupted the role/organisation boundary — for a family of
+    entries this collapsed several distinct companies onto one fabricated
+    placeholder name built from the shared tail of their description (e.g.
+    five different "Dawn ... Holdings Ltd" companies all resolving to a
+    counterparty literally named "printing)"). Parentheses are now stripped
+    FIRST, and a comma is only treated as a role separator when the text
+    after it isn't itself just the organisation's own legal suffix ("X,
+    Inc.").
+
     Returns (name, company_number, is_private_individual).
     Company numbers are rarely present in Lords entries — most return None.
     """
     company_number = None
-
-    # Try to extract the organisation name — typically after a role and comma
-    # "Chairman, Microlink PC (UK) Ltd (computing and software)"
-    # → "Microlink PC (UK) Ltd"
-    parts = description.split(",", 1)
-    if len(parts) < 2:
-        # No comma — the whole description might be the organisation
-        # e.g. "Sharetego (travel company)"
-        if re.search(r"\b(Ltd|Limited|LLP|plc|CIC)\b", description, re.IGNORECASE):
-            # Extract name before last parenthetical description
-            name = re.split(r"\s*\([^)]*\)\s*$", description)[0].strip()
-            return name, company_number, False
-        # Check for org markers without comma
-        if re.search(
-            r"\b(Ltd|Limited|LLP|plc|CIC|Foundation|Trust|Society|Board|"
-            r"Authority|Group|Association|Charity|University|College)\b",
-            description,
-            re.IGNORECASE,
-        ):
-            name = re.split(r"\s*\([^)]*\)\s*$", description)[0].strip()
-            return name, company_number, False
+    core = _strip_trailing_parens(description)
+    if not core:
         return None, company_number, False
 
-    role = parts[0].strip().lower()
-    rest = parts[1].strip()
+    # A comma is a role/organisation separator UNLESS the text after it is
+    # nothing but a bare legal suffix ("Automatic Data Processing, Inc."),
+    # in which case the comma belongs to the organisation's own name.
+    comma_idx = core.find(",")
+    role: str | None = None
+    candidate = core
+    if comma_idx != -1:
+        after = core[comma_idx + 1 :].strip()
+        if not _BARE_SUFFIX_RE.match(after):
+            role = core[:comma_idx].strip().lower()
+            candidate = after
 
-    # Check if this is a family-related entry
-    if any(marker in role for marker in _FAMILY_MARKERS):
+    if role is not None and any(marker in role for marker in _FAMILY_MARKERS):
         return None, company_number, True
 
-    # Extract organisation name (before the LAST parenthetical description)
-    # "Microlink PC (UK) Ltd (computing and software)" → "Microlink PC (UK) Ltd"
-    name = re.split(r"\s*\([^)]*\)\s*$", rest)[0].strip()
-
-    # Check if it looks like an organisation vs a person
-    org_markers = re.search(
-        r"\b(Ltd|Limited|LLP|plc|CIC|Foundation|Trust|Society|Board|"
-        r"Authority|Group|Association|Charity|University|College|"
-        r"Partnership|Holdings|Capital|Fund|Enterprise)\b",
-        name,
-        re.IGNORECASE,
-    )
-    if not org_markers:
-        # Could be a person name or an institution without markers
-        if re.search(r"\b(company|corporation|firm)\b", description, re.IGNORECASE):
-            return name, company_number, False
+    if not candidate:
         return None, company_number, False
 
-    return name, company_number, False
+    # "Company"/"Companies" in _ORG_MARKERS_RE below is a real legal-form
+    # marker for names like "Walt Disney Company" — but it is also an
+    # ordinary English noun, so an unguarded marker search matches prose
+    # too: "...a property management company; full details are held by the
+    # Registrar..." is not a role/organisation split at all, just a
+    # sentence that happens to contain the word "company". Reject prose
+    # before any marker match, strong or fallback.
+    if any(marker in candidate for marker in _PROSE_MARKERS):
+        return None, company_number, False
+
+    if _ORG_MARKERS_RE.search(candidate):
+        return candidate, company_number, False
+
+    # No explicit legal-form marker on the candidate. Two contexts still
+    # make a named (non-person) entity plausible enough to extract:
+    #  - Category 2 (Shareholdings): the register's own category definition
+    #    means the entry NAMES a body corporate, never a person — you
+    #    cannot hold "shares" in an individual. "Halma", "Barclays",
+    #    "Sharetego" (trading names with no legal suffix) sit here.
+    #  - a "Role, X" entry (comma present) whose description independently
+    #    says "company"/"corporation"/"firm" (mirrors the previous
+    #    with-comma-only fallback, now gated on the candidate itself
+    #    looking like a name rather than blindly returning whatever
+    #    followed the comma).
+    is_shareholding = bool(category) and category.startswith("Category 2")
+    mentions_org_word = role is not None and bool(
+        re.search(r"\b(company|corporation|firm)\b", description, re.IGNORECASE)
+    )
+    if (is_shareholding or mentions_org_word) and _looks_like_entity_name(candidate):
+        return candidate, company_number, False
+
+    return None, company_number, False
 
 
 def _scoped_registry_id(scope: str, name: str) -> str:
@@ -282,6 +460,36 @@ def _scoped_registry_id(scope: str, name: str) -> str:
     return f"{scope[:64]}:{digest}"
 
 
+def _canonical_company_entity(company: Company) -> Entity:
+    """The Companies House node for a company, creating it if absent.
+
+    Mirrors ch_appointments._canonical_company_entity. A plain
+    ``get_or_create(company_number=...)`` raises MultipleObjectsReturned here:
+    GLEIF can hold a distinct Entity for the same company under
+    registry_scheme="GLEIF-LEI" that also carries this company_number —
+    those are legitimately separate claims and must never be merged
+    (ADR-006, duplicate over merge). Resolving on registry_scheme="GB-COH" +
+    registry_id is unique by DB constraint, so this can never be ambiguous.
+    """
+    coh = Entity.objects.filter(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+    ).first()
+    if coh:
+        return coh
+    entity, _ = Entity.objects.get_or_create(
+        entity_type="company",
+        registry_scheme="GB-COH",
+        registry_id=company.company_number,
+        defaults={
+            "name": company.company_name,
+            "company_number": company.company_number,
+        },
+    )
+    return entity
+
+
 def _resolve_counterparty(
     name: str, company_number: str | None, interest_key: str
 ) -> tuple[Entity, float, str, dict[str, Any]] | None:
@@ -294,15 +502,7 @@ def _resolve_counterparty(
         normalised_number = normalise_company_number(company_number)
         company = Company.objects.filter(company_number=normalised_number).first()
         if company:
-            entity, _ = Entity.objects.get_or_create(
-                entity_type="company",
-                company_number=company.company_number,
-                defaults={
-                    "name": company.company_name,
-                    "registry_scheme": "GB-COH",
-                    "registry_id": company.company_number,
-                },
-            )
+            entity = _canonical_company_entity(company)
             return entity, 1.0, "identifier", {}
         entity, _ = Entity.objects.get_or_create(
             entity_type="regulated_entity",
@@ -317,15 +517,7 @@ def _resolve_counterparty(
     match_count = matches.count()
     if match_count == 1:
         company = matches.get()
-        entity, _ = Entity.objects.get_or_create(
-            entity_type="company",
-            company_number=company.company_number,
-            defaults={
-                "name": company.company_name,
-                "registry_scheme": "GB-COH",
-                "registry_id": company.company_number,
-            },
-        )
+        entity = _canonical_company_entity(company)
         return entity, 0.9, "exact_name", {}
     if match_count >= 2:
         return None
@@ -371,6 +563,7 @@ def fetch_lords_register(
 
     Stores each page as ``page_NN.html`` and a provenance JSON sidecar.
     """
+    source = load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -428,12 +621,40 @@ def fetch_lords_register(
         content_hash = hasher.hexdigest()
 
         retrieved_at = datetime.now(UTC)
+        # observed_at is when the SOURCE published/captured this page set --
+        # the Wayback snapshot timestamp -- never today's download time. This
+        # is the multi-page analogue of `uncorrupt.staging.raw`'s shared
+        # cache-with-provenance helper (that helper assumes one payload file;
+        # a Lords register fetch is N page files sharing one provenance
+        # record, so the `ProvenanceRecord` shape is adopted directly here
+        # rather than forcing a single-payload API onto a multi-file
+        # artifact). A live (non-Wayback) fetch has no capture date of its
+        # own and leaves this None; `ingest_lords_register` still falls back
+        # to retrieved_at for that case (unchanged).
+        observed_at = _parse_wayback_timestamp(wayback_timestamp) if wayback_timestamp else None
+        provenance_record = ProvenanceRecord(
+            source_id=source.source_id,
+            source_url=base_url,
+            retrieved_at=retrieved_at,
+            content_hash=content_hash,
+            license=source.license,
+            redistribution=source.redistribution,
+            jurisdiction=source.jurisdictions[0] if source.jurisdictions else "",
+            data_class=source.data_class,
+            tier=source.tier,
+            connector=source.source_id,
+            connector_version=CONNECTOR_VERSION,
+            observed_at=observed_at,
+        )
         provenance = {
             "source": SOURCE_NAME,
-            "source_url": base_url,
+            "source_url": provenance_record.source_url,
             "wayback_timestamp": wayback_timestamp,
-            "retrieved_at": retrieved_at.isoformat(),
-            "content_hash": content_hash,
+            "retrieved_at": provenance_record.retrieved_at.isoformat(),
+            "content_hash": provenance_record.content_hash,
+            "observed_at": (
+                provenance_record.observed_at.isoformat() if provenance_record.observed_at else None
+            ),
             "page_count": len(pages),
             "total_entries": total_entries,
             "pages": pages,
@@ -446,9 +667,9 @@ def fetch_lords_register(
             provenance_path=provenance_path,
             page_count=len(pages),
             total_entries=total_entries,
-            source_url=base_url,
-            retrieved_at=retrieved_at,
-            content_hash=content_hash,
+            source_url=provenance_record.source_url,
+            retrieved_at=provenance_record.retrieved_at,
+            content_hash=provenance_record.content_hash,
             wayback_timestamp=wayback_timestamp,
         )
     finally:
@@ -502,24 +723,42 @@ def ingest_lords_register(
     skipped_private_individual, skipped_no_counterparty, nil_returns,
     total_interests, total_members}.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_lords_interests.yml
     html_dir = Path(html_dir)
     provenance_path = html_dir / "provenance.json"
 
     # Parse observed_at from provenance
-    observed_at: datetime | None = None
+    retrieved_at: datetime | None = None
     snapshot_ref: str | None = None
     if provenance_path.exists():
         prov = json.loads(provenance_path.read_text())
-        observed_at = datetime.fromisoformat(prov["retrieved_at"])
+        retrieved_at = datetime.fromisoformat(prov["retrieved_at"])
         snapshot_ref = prov.get("content_hash")
         if wayback_timestamp is None:
             wayback_timestamp = prov.get("wayback_timestamp")
+
+    # observed_at is when the SOURCE published or was captured, never when we
+    # downloaded it. For a Wayback snapshot that is the capture timestamp, not
+    # today's retrieval time — using retrieved_at here silently destroyed the
+    # historical value of re-ingested snapshots (every snapshot of a
+    # still-registered interest collapsed onto one attestation stamped
+    # today). A live (non-Wayback) fetch has no capture date of its own, so it
+    # keeps falling back to retrieved_at.
+    observed_at = _parse_wayback_timestamp(wayback_timestamp) if wayback_timestamp else None
+    if observed_at is None:
+        if wayback_timestamp:
+            logger.warning(
+                "lords register: unparseable wayback_timestamp %r, falling back to retrieved_at",
+                wayback_timestamp,
+            )
+        observed_at = retrieved_at
 
     matched = 0
     unmatched_counterparty = 0
     skipped_private_individual = 0
     skipped_no_counterparty = 0
     skipped_implausible_name = 0
+    ambiguous_company_number = 0
     nil_returns = 0
     total_interests = 0
     total_members = 0
@@ -527,107 +766,131 @@ def ingest_lords_register(
     # Collect all HTML pages
     page_files = sorted(html_dir.glob("page_*.html"))
 
-    with transaction.atomic():
-        for page_file in page_files:
-            html_content = page_file.read_text(encoding="utf-8")
-            members = _parse_lords_page(html_content)
+    for page_file in page_files:
+        html_content = page_file.read_text(encoding="utf-8")
+        members = _parse_lords_page(html_content)
 
-            for member in members:
-                total_members += 1
-                member_entity = _get_or_create_lord_entity(
-                    member["member_id"],
-                    {
-                        "name": member["name"],
-                        "party": member["party"],
-                        "peer_type": member["peer_type"],
-                    },
-                )
+        for member in members:
+            total_members += 1
+            member_entity = _get_or_create_lord_entity(
+                member["member_id"],
+                {
+                    "name": member["name"],
+                    "party": member["party"],
+                    "peer_type": member["peer_type"],
+                },
+            )
 
-                if not member["interests"]:
-                    nil_returns += 1
+            if not member["interests"]:
+                nil_returns += 1
+                continue
+
+            for interest in member["interests"]:
+                total_interests += 1
+                description = interest["description"]
+                category = interest["category"]
+
+                name, company_number, is_private = _extract_counterparty(description, category)
+
+                # A counterparty "name" longer than this is an extraction
+                # failure, not an organisation — the Lords register is free
+                # text and the extractor sometimes captures a whole sentence.
+                # Creating an Entity from it would both overflow Entity.name
+                # (varchar 500) and pollute the graph with junk nodes, so
+                # skip and count instead. Conservative extraction: prefer
+                # missing a counterparty over inventing one.
+                if name and len(name) > _MAX_COUNTERPARTY_NAME:
+                    skipped_implausible_name += 1
+                    continue
+                if is_private:
+                    skipped_private_individual += 1
+                    continue
+                if not name:
+                    skipped_no_counterparty += 1
                     continue
 
-                for interest in member["interests"]:
-                    total_interests += 1
-                    description = interest["description"]
-                    category = interest["category"]
+                # Bounded at construction: category and counterparty name are free-form
+                # Lords register text. interest_key feeds BOTH registry_id and
+                # Attestation.source_reference (varchar 200), so hash the
+                # variable part rather than embedding it — deterministic, so
+                # re-ingest stays idempotent, and still unique per interest.
+                _key_body = hashlib.sha256(
+                    f"{category}:{_normalise_name(name)}".encode()
+                ).hexdigest()[:32]
+                interest_key = f"{member['member_id']}:{_key_body}"
 
-                    name, company_number, is_private = _extract_counterparty(description)
+                # Commit per interest, not the whole run in one transaction: a
+                # giant transaction over every member/interest holds locks for
+                # the entire ingest and loses everything already processed if
+                # one row (or the process) dies partway through.
+                try:
+                    with transaction.atomic():
+                        resolved = _resolve_counterparty(name, company_number, interest_key)
+                        if resolved is None:
+                            unmatched_counterparty += 1
+                            continue
+                        counterparty_entity, confidence, method, resolve_props = resolved
 
-                    # A counterparty "name" longer than this is an extraction
-                    # failure, not an organisation — the Lords register is free
-                    # text and the extractor sometimes captures a whole sentence.
-                    # Creating an Entity from it would both overflow Entity.name
-                    # (varchar 500) and pollute the graph with junk nodes, so
-                    # skip and count instead. Conservative extraction: prefer
-                    # missing a counterparty over inventing one.
-                    if name and len(name) > _MAX_COUNTERPARTY_NAME:
-                        skipped_implausible_name += 1
-                        continue
-                    if is_private:
-                        skipped_private_individual += 1
-                        continue
-                    if not name:
-                        skipped_no_counterparty += 1
-                        continue
+                        valid_to = interest.get("ceased_date")
 
-                    # Bounded at construction: category and counterparty name are free-form
-                    # Lords register text. interest_key feeds BOTH registry_id and
-                    # Attestation.source_reference (varchar 200), so hash the
-                    # variable part rather than embedding it — deterministic, so
-                    # re-ingest stays idempotent, and still unique per interest.
-                    _key_body = hashlib.sha256(
-                        f"{category}:{_normalise_name(name)}".encode()
-                    ).hexdigest()[:32]
-                    interest_key = f"{member['member_id']}:{_key_body}"
-                    resolved = _resolve_counterparty(name, company_number, interest_key)
-                    if resolved is None:
-                        unmatched_counterparty += 1
-                        continue
-                    counterparty_entity, confidence, method, resolve_props = resolved
-
-                    valid_to = interest.get("ceased_date")
-
-                    # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
-                    edge, _ = Edge.objects.get_or_create(
-                        edge_type="declared_interest",
-                        source_entity=member_entity,
-                        target_entity=counterparty_entity,
-                        valid_from=None,
-                        valid_to=valid_to,
-                        defaults={
-                            "properties": {
-                                "category": category,
-                                "description": description,
-                                **resolve_props,
+                        # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                        edge, _ = Edge.objects.get_or_create(
+                            edge_type="declared_interest",
+                            source_entity=member_entity,
+                            target_entity=counterparty_entity,
+                            valid_from=None,
+                            valid_to=valid_to,
+                            defaults={
+                                "properties": {
+                                    "category": category,
+                                    "description": description,
+                                    **resolve_props,
+                                },
                             },
-                        },
-                    )
+                        )
 
-                    # Attestation = THE EVIDENCE
-                    att_defaults: dict[str, Any] = {
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    }
-                    if observed_at:
-                        att_defaults["observed_at"] = observed_at
-                    if snapshot_ref:
-                        att_defaults["snapshot_ref"] = snapshot_ref
+                        # Attestation = THE EVIDENCE
+                        att_defaults: dict[str, Any] = {
+                            "match_confidence": confidence,
+                            "match_method": method,
+                        }
+                        if observed_at:
+                            att_defaults["observed_at"] = observed_at
+                        if snapshot_ref:
+                            att_defaults["snapshot_ref"] = snapshot_ref
 
-                    source_url = LORDS_REGISTER_URL
-                    if wayback_timestamp:
-                        source_url = f"{WAYBACK_PREFIX}{wayback_timestamp}/{LORDS_REGISTER_URL}"
+                        source_url = LORDS_REGISTER_URL
+                        if wayback_timestamp:
+                            source_url = f"{WAYBACK_PREFIX}{wayback_timestamp}/{LORDS_REGISTER_URL}"
 
-                    Attestation.objects.get_or_create(
-                        edge=edge,
-                        source_name=SOURCE_NAME,
-                        source_reference=interest_key,
-                        defaults={
-                            "source_url": source_url,
-                            **att_defaults,
-                        },
-                    )
-                    matched += 1
+                        # A snapshot identifier on the reference, not just the
+                        # interest: without it, re-ingesting several Wayback
+                        # snapshots of the same still-registered interest
+                        # collapses onto a single Attestation row (get_or_create
+                        # matches on source_reference), destroying the very
+                        # evidence of when each snapshot recorded the interest.
+                        attestation_reference = interest_key
+                        if wayback_timestamp:
+                            attestation_reference = f"{interest_key}:{wayback_timestamp}"
+
+                        Attestation.objects.get_or_create(
+                            edge=edge,
+                            source_name=SOURCE_NAME,
+                            source_reference=attestation_reference,
+                            defaults={
+                                "source_url": source_url,
+                                **att_defaults,
+                            },
+                        )
+                except Entity.MultipleObjectsReturned:
+                    # A company_number can legitimately resolve to 2+ Entity
+                    # rows under different registry schemes (GB-COH,
+                    # GLEIF-LEI — ADR-006 duplicate-over-merge). Count and
+                    # move on rather than losing the whole run to one row.
+                    ambiguous_company_number += 1
+                    continue
+
+                matched += 1
 
     return {
         "matched": matched,
@@ -635,6 +898,7 @@ def ingest_lords_register(
         "skipped_private_individual": skipped_private_individual,
         "skipped_no_counterparty": skipped_no_counterparty,
         "skipped_implausible_name": skipped_implausible_name,
+        "ambiguous_company_number": ambiguous_company_number,
         "nil_returns": nil_returns,
         "total_interests": total_interests,
         "total_members": total_members,

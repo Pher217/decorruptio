@@ -1,0 +1,10 @@
+case_id,person_name,person_registry_id,company_name,company_number,relationship_type,established_by,label_source_url,award_date,relationship_start,excluded_from_retrieval,intermediary_company_number,awardee_confirmed,held_office_at_award,office_holding_start_date
+SYNTH-001,Jane Testperson,,Example Holdings Ltd,1234567,directorship,journalism,https://example.invalid/synthetic-source-1,2021-06-01,2018-01-15,Example Gazette investigation,,yes,yes,2015-01-01
+SYNTH-004,Sam Otherperson,,Example Holdings Ltd,1234567,shareholding,inquiry,https://example.invalid/synthetic-source-4,2021-06-01,2019-02-20,,,yes,yes,2016-01-01
+SYNTH-005,Pat Anotherperson,,Example Holdings Ltd,1234567,directorship,inquiry,https://example.invalid/synthetic-source-5,2021-08-15,2019-05-01,,,yes,yes,2017-01-01
+SYNTH-002,John Placeholder,,Sample Supplies PLC,SC000999,shareholding,judgment,https://example.invalid/synthetic-source-2,2020-03-01,unknown,,,yes,yes,2015-01-01
+SYNTH-003,Ann Fixture,,Demo Traders Ltd,7654321,employment,inquiry,https://example.invalid/synthetic-source-3,2019-01-01,2020-05-01,,,yes,yes,2010-01-01
+SYNTH-006,Kim Sample,,Placeholder Services Ltd,9999999,shareholding,PSC,https://example.invalid/synthetic-source-6,2021-01-10,2019-03-01,,,yes,yes,2015-01-01
+SYNTH-007,Lee Unconfirmed,,Unverified Traders Ltd,1112223,directorship,journalism,https://example.invalid/synthetic-source-7,2021-04-01,2018-06-01,,,no,yes,2015-01-01
+SYNTH-008,Robin Donorlinked,,Confirmed Awardee Ltd,4445556,donation,journalism,https://example.invalid/synthetic-source-8,2021-09-01,2019-11-01,,OC999888,yes,yes,2016-01-01
+SYNTH-009,Sam Notyetelected,,Grant Recipient Ltd,5556667,directorship,inquiry,https://example.invalid/synthetic-source-9,2000-01-01,1997-01-01,,,yes,no,2016-05-01

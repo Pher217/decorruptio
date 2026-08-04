@@ -1,0 +1,177 @@
+"""Freeze-state binding for gate artifacts (spec A2.4.5, ADR-008).
+
+`run_gold_benchmark.py` (owned elsewhere, read-only from here) already
+defines the binding contract a gate report is checked against --
+`GateBinding(code_commit, graph_hash, manifest_hash)` and
+`compute_graph_hash()`/`current_code_commit()`/`compute_manifest_hash()`.
+This module does NOT reimplement any of those: the CLIs in `scripts/
+measure_coverage_gate.py` / `scripts/measure_stratum_gates.py` import them
+directly from `scripts.run_gold_benchmark` so the values this package writes
+are guaranteed identical to what the scorer will independently recompute and
+compare against -- two independent hash implementations that must agree bit
+for bit is a drift risk neither side can afford.
+
+THE ATTESTATION-INCLUSIVE HASH -- the gap this module exists to close.
+`compute_graph_hash()` hashes only `(edge_type, source_entity_id,
+target_entity_id, valid_from)` tuples -- **edges**, never attestations. An
+ingest that adds ONLY `Attestation` rows to edges that already exist changes
+nothing that hash can see. This is not a hypothetical: the Lords Wayback
+snapshot ingest (spec v2.9) added roughly 6,000 attestations against
+already-existing `declared_interest` edges and created zero new edges. A
+coverage or stratum gate measured BEFORE that ingest would still "bind", by
+`GateBinding.matches()`'s own three-field check, to the graph state AFTER
+it -- silently authorising the scorer to treat evidence the gate never
+actually measured as already covered by a passing gate.
+
+This package cannot change `GateBinding.matches()` (out of scope). Instead,
+every gate artifact this package writes ALSO records
+`attestation_inclusive_hash` (`compute_attestation_inclusive_hash()` below),
+and `GateFreezeState.matches_recorded()` -- used by this package's own
+`certificate` module, never by `run_gold_benchmark.py` -- checks every
+field this class carries (five, as of `control_fixtures_hash` below). A
+caller that only trusts `run_gold_benchmark.py`'s own binding check will
+still miss attestation-only drift; a caller that also checks
+`attestation_inclusive_hash` will not. **Flagged, not silently worked
+around**: `run_gold_benchmark.py`'s own binding remains blind to this class
+of drift until that file is amended by whoever owns it.
+
+THE FIXTURE-UNBOUND GAP -- the second gap `control_fixtures_hash` closes.
+An independent review found that none of `code_commit`/`graph_hash`/
+`attestation_inclusive_hash`/`manifest_hash` reflect the CONTENT of the
+external control-battery fixtures (`tests/fixtures/*_controls.json`)
+`uncorrupt.gates.stratum` reads: `code_commit` is `git rev-parse HEAD`,
+which does not change when a tracked fixture is edited in the working tree
+(committed or not). An edited-or-substituted fixture producing a different
+stratum-gate score therefore still satisfies both `GateBinding.matches()`
+and (before this field existed) `GateFreezeState.matches_recorded()`.
+`control_fixtures_hash` -- populated via
+`uncorrupt.gates.stratum.compute_control_fixtures_hash()` by
+`scripts/measure_stratum_gates.py` only (`scripts/measure_coverage_gate.py`
+has no stratum fixtures to bind and leaves it at its `""` default) -- makes
+that content externally visible and auditable. It does not by itself
+PREVENT a manipulated fixture from producing a passing score (see
+`uncorrupt.gates.stratum.MIN_CONTROL_BATTERY_SIZE` for the enforcement
+half); it ensures a manipulated fixture cannot pass unnoticed as
+"unchanged" the way the other four fields would let it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from uncorrupt.graph.models import Attestation
+
+
+def compute_attestation_inclusive_hash() -> str:
+    """Canonical, order-independent hash over every Edge AND every Attestation.
+
+    Same discipline as `run_gold_benchmark.compute_graph_hash` (sha256 over
+    sorted tuples, so insertion order never changes the hash) extended to
+    cover the evidence layer that function cannot see. Attestation rows are
+    hashed on `(edge_id, source_name, source_reference, observed_at,
+    snapshot_ref)` -- the fields that identify *which* evidence exists and
+    what it claims to observe, deliberately excluding `match_confidence` /
+    `match_method` (resolution-quality metadata, not new evidence) and
+    `created_at` (a write-time artifact, not part of what was observed).
+
+    A drift detector, not a cryptographic commitment -- same caveat as
+    `compute_graph_hash`.
+
+    Sorts on the same string serialization that gets hashed, not on the raw
+    tuples -- the identical fix `compute_graph_hash` needed. `observed_at`
+    (281,535 of 704,074 NULL) and `snapshot_ref` (688,540 NULL) are both
+    nullable, so two Attestation rows sharing `(edge_id, source_name,
+    source_reference)` with one NULL and one populated on either field would
+    raise the same `TypeError: '<' not supported between instances of
+    'NoneType' and ...` a raw-tuple sort hit in `compute_graph_hash`. No
+    such pair exists in the graph today, which is why this survived
+    unnoticed -- but it is the same defect class, one function over, sitting
+    inside the same freeze state `compute_graph_hash` is bound into.
+    """
+    from scripts.run_gold_benchmark import compute_graph_hash
+
+    edge_component = compute_graph_hash()
+
+    attestation_rows = Attestation.objects.values_list(
+        "edge_id", "source_name", "source_reference", "observed_at", "snapshot_ref"
+    )
+    serialized_attestation_rows = sorted("|".join(str(x) for x in row) for row in attestation_rows)
+    h = hashlib.sha256()
+    h.update(edge_component.encode("utf-8"))
+    h.update(b"\n")
+    for row in serialized_attestation_rows:
+        h.update(row.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+@dataclass(frozen=True)
+class GateFreezeState:
+    """The full freeze-state a gate artifact is bound to (spec A2.4.5).
+
+    `code_commit`/`graph_hash`/`manifest_hash` are exactly the three fields
+    `run_gold_benchmark.GateBinding` checks -- same names, so
+    `to_binding_dict()` round-trips through that class unchanged.
+    `attestation_inclusive_hash` is the extra field this package's own
+    `certificate` module additionally verifies (see module docstring).
+    `control_fixtures_hash` defaults to `""` (unbound) -- only
+    `scripts/measure_stratum_gates.py` has control-battery fixtures to hash
+    (via `uncorrupt.gates.stratum.compute_control_fixtures_hash()`);
+    `scripts/measure_coverage_gate.py` has none and leaves it at the
+    default, which two coverage-only freeze states will always share --
+    that is correct, not a gap, since coverage measurements do not read a
+    control fixture at all.
+    """
+
+    code_commit: str
+    graph_hash: str
+    attestation_inclusive_hash: str
+    manifest_hash: str
+    measured_at: str
+    control_fixtures_hash: str = ""
+
+    def to_binding_dict(self) -> dict[str, str]:
+        """Fields to merge into any gate JSON this package writes.
+
+        Field names match `run_gold_benchmark.GateBinding.matches()`'s own
+        `data.get(...)` calls exactly (`code_commit`, `graph_hash`,
+        `manifest_hash`) plus the extra `attestation_inclusive_hash`,
+        `control_fixtures_hash`, and a human-auditable `measured_at`
+        timestamp none of `GateBinding` or the scorer read, but every
+        write-back trigger in this project requires ("bind... UTC
+        timestamp"). The two extra fields are inert to `GateBinding.matches
+        ()` (unknown keys, ignored by its `data.get(...)` checks) -- purely
+        additive, never a behaviour change for the scorer.
+        """
+        return {
+            "code_commit": self.code_commit,
+            "graph_hash": self.graph_hash,
+            "attestation_inclusive_hash": self.attestation_inclusive_hash,
+            "manifest_hash": self.manifest_hash,
+            "measured_at": self.measured_at,
+            "control_fixtures_hash": self.control_fixtures_hash,
+        }
+
+    def matches_recorded(self, data: dict) -> bool:
+        """Stricter than `run_gold_benchmark.GateBinding.matches()`: also
+        requires `attestation_inclusive_hash` AND `control_fixtures_hash` to
+        match, so an attestation-only ingest OR an edited/substituted
+        control fixture since this state was recorded is caught even though
+        the scorer's own three-field check would miss both (see module
+        docstring).
+        """
+        return (
+            data.get("code_commit") == self.code_commit
+            and data.get("graph_hash") == self.graph_hash
+            and data.get("attestation_inclusive_hash") == self.attestation_inclusive_hash
+            and data.get("manifest_hash") == self.manifest_hash
+            and data.get("control_fixtures_hash", "") == self.control_fixtures_hash
+        )
+
+
+def utc_now_iso() -> str:
+    """UTC timestamp in the format every frozen-state record in this
+    package uses -- spec A2.4.5 requires one on every frozen state."""
+    return datetime.now(UTC).isoformat()

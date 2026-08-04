@@ -78,21 +78,31 @@ def compute_attestation_inclusive_hash() -> str:
 
     A drift detector, not a cryptographic commitment -- same caveat as
     `compute_graph_hash`.
+
+    Sorts on the same string serialization that gets hashed, not on the raw
+    tuples -- the identical fix `compute_graph_hash` needed. `observed_at`
+    (281,535 of 704,074 NULL) and `snapshot_ref` (688,540 NULL) are both
+    nullable, so two Attestation rows sharing `(edge_id, source_name,
+    source_reference)` with one NULL and one populated on either field would
+    raise the same `TypeError: '<' not supported between instances of
+    'NoneType' and ...` a raw-tuple sort hit in `compute_graph_hash`. No
+    such pair exists in the graph today, which is why this survived
+    unnoticed -- but it is the same defect class, one function over, sitting
+    inside the same freeze state `compute_graph_hash` is bound into.
     """
     from scripts.run_gold_benchmark import compute_graph_hash
 
     edge_component = compute_graph_hash()
 
-    attestation_rows = sorted(
-        Attestation.objects.values_list(
-            "edge_id", "source_name", "source_reference", "observed_at", "snapshot_ref"
-        )
+    attestation_rows = Attestation.objects.values_list(
+        "edge_id", "source_name", "source_reference", "observed_at", "snapshot_ref"
     )
+    serialized_attestation_rows = sorted("|".join(str(x) for x in row) for row in attestation_rows)
     h = hashlib.sha256()
     h.update(edge_component.encode("utf-8"))
     h.update(b"\n")
-    for row in attestation_rows:
-        h.update("|".join(str(x) for x in row).encode("utf-8"))
+    for row in serialized_attestation_rows:
+        h.update(row.encode("utf-8"))
         h.update(b"\n")
     return h.hexdigest()
 

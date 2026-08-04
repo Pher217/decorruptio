@@ -1,13 +1,16 @@
 """Tests for `scripts/emit_no_score_certificate.py`'s own added logic --
 the pieces `uncorrupt.gates.certificate.build_no_score_certificate` does not
 compute: the Companies House structural-ceiling finding, the threshold
-arithmetic table, and the manifest-hash fallback.
+arithmetic table, the manifest-hash fallback, the sealed-cohort statement,
+the Electoral Commission materiality caveat, and the SystemExit refusal when
+every measured stratum unexpectedly passes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,9 +18,12 @@ from scripts.emit_no_score_certificate import (
     GATE_FRACTION,
     _manifest_hash_or_unavailable,
     ch_structural_ceiling,
+    electoral_commission_materiality_note,
+    sealed_cohort_statement,
     threshold_arithmetic_table,
 )
 
+from uncorrupt.gates.stratum import StratumMeasurement
 from uncorrupt.staging.models import Company
 
 
@@ -59,10 +65,14 @@ class TestChStructuralCeiling:
         assert result["total_controls"] == 4
 
     def test_max_achievable_recovered_is_total_minus_structurally_blocked(self, tmp_path):
-        """GIVEN the real 12-row shape -- 2 structurally blocked, 10 not
+        """GIVEN a small 3-control fixture -- 1 control with a Company row, 2
+        without (NF-prefixed, structurally blocked)
         WHEN the structural ceiling is computed
-        THEN max_achievable_recovered is 10 and max_achievable_pct is 83.3,
-        matching spec amendment v2.10's own finding."""
+        THEN max_achievable_recovered is total minus blocked (1) and
+        max_achievable_pct is the correctly rounded 1/3 (33.3%) -- proves the
+        arithmetic, not just the row-classification, is right. (The real
+        12-row shape -- 2 blocked, 10 not, 83.3% -- is covered separately by
+        test_ceiling_fails_the_gate_when_below_90_percent below.)"""
         Company.objects.create(company_number="10041931", company_name="X")
         controls = [{"id": 1, "company_number": "10041931", "company_name": "X"}]
         controls += [
@@ -75,6 +85,74 @@ class TestChStructuralCeiling:
 
         assert result["max_achievable_recovered"] == 1
         assert result["total_controls"] == 3
+        assert result["max_achievable_pct"] == 33.3
+
+    def test_normalises_the_company_number_before_checking_for_a_company_row(self, tmp_path):
+        """GIVEN a control whose company_number is UNPADDED (as an external
+        source might supply it, e.g. "7015428" for Companies House's
+        canonical zero-padded "07015428") and a Company row that exists under
+        the CANONICAL, zero-padded form
+        WHEN the structural ceiling is computed
+        THEN that control is NOT reported structurally blocked -- proves the
+        normalise_company_number call is load-bearing. Without it, an exact
+        string match on "7015428" would miss the real "07015428" Company row
+        and falsely report an ingested company as structurally absent (the
+        other three tests in this class all use already-8-character numbers,
+        so none of them would catch that regression)."""
+        Company.objects.create(company_number="07015428", company_name="Padded Co")
+        fixture = _write_ch_fixture(
+            tmp_path, [{"id": 1, "company_number": "7015428", "company_name": "Padded Co"}]
+        )
+
+        result = ch_structural_ceiling(fixture)
+
+        assert result["structurally_blocked_count"] == 0
+        assert result["max_achievable_recovered"] == 1
+
+    def test_finding_says_clears_not_still_below_when_the_ceiling_passes(self, tmp_path):
+        """GIVEN a fixture where every control has a Company row (no
+        structurally blocked rows -- the ceiling equals the full battery
+        size, a hypothetical future state e.g. after a general NF-alias fix,
+        spec A2.10.3)
+        WHEN the structural ceiling is computed
+        THEN ceiling_passes_gate is True AND `finding` says the ceiling
+        "clears" the gate, never "still below" -- regression test for the
+        exact self-contradiction an independent review caught ("Maximum
+        achievable score is 12/12 (100.0%), still below the 90% gate
+        (PASSES)") when the two halves of that sentence were not derived
+        from the same boolean."""
+        Company.objects.create(company_number="10041931", company_name="X")
+        fixture = _write_ch_fixture(
+            tmp_path, [{"id": 1, "company_number": "10041931", "company_name": "X"}]
+        )
+
+        result = ch_structural_ceiling(fixture)
+
+        assert result["ceiling_passes_gate"] is True
+        assert "clears the 90% gate" in result["finding"]
+        assert "still below" not in result["finding"]
+
+    def test_finding_says_still_below_not_clears_when_the_ceiling_fails(self, tmp_path):
+        """GIVEN a fixture where the ceiling cannot reach the 90% gate (1 of 2
+        controls structurally blocked)
+        WHEN the structural ceiling is computed
+        THEN ceiling_passes_gate is False AND `finding` says the ceiling is
+        "still below" the gate, never "clears" -- the other half of the same
+        regression guard as the test above."""
+        Company.objects.create(company_number="10041931", company_name="X")
+        fixture = _write_ch_fixture(
+            tmp_path,
+            [
+                {"id": 1, "company_number": "10041931", "company_name": "X"},
+                {"id": 2, "company_number": "NF000001", "company_name": "Y"},
+            ],
+        )
+
+        result = ch_structural_ceiling(fixture)
+
+        assert result["ceiling_passes_gate"] is False
+        assert "still below the 90% gate" in result["finding"]
+        assert "clears" not in result["finding"]
 
     def test_ceiling_fails_the_gate_when_below_90_percent(self, tmp_path):
         """GIVEN a 12-control fixture where the maximum achievable recovery is
@@ -173,3 +251,149 @@ class TestManifestHashOrUnavailable:
         result = _manifest_hash_or_unavailable(missing_path)
 
         assert result.startswith("UNAVAILABLE:")
+
+
+class TestSealedCohortStatement:
+    def _ceiling(self, *, passes: bool) -> dict:
+        return {
+            "max_achievable_recovered": 12 if passes else 10,
+            "total_controls": 12,
+            "max_achievable_pct": 100.0 if passes else 83.3,
+            "ceiling_passes_gate": passes,
+        }
+
+    def test_says_cannot_reach_when_the_ceiling_fails(self):
+        """GIVEN a ceiling that cannot reach the gate (today's real
+        Companies House shape) and a certificate whose blockers include the
+        CH stratum
+        WHEN the sealed-cohort statement is composed
+        THEN it says the ceiling "cannot reach" the readiness gate, never
+        "clears" it."""
+        ceiling = self._ceiling(passes=False)
+        certificate = {"blockers": [{"gate": "stratum:ch_officer_appointment"}]}
+
+        statement = sealed_cohort_statement(ceiling, certificate)
+
+        assert "cannot reach the 90% readiness gate" in statement
+        assert "clears" not in statement
+
+    def test_says_clears_when_the_ceiling_passes(self):
+        """GIVEN a ceiling that DOES clear the gate (a hypothetical future
+        state after a general NF-alias fix, spec A2.10.3) but the
+        certificate still has OTHER blockers (Commons, Lords)
+        WHEN the sealed-cohort statement is composed
+        THEN it says the CH ceiling "clears" the gate and does not block
+        scoring by itself -- it must not keep asserting CH "cannot reach"
+        the gate once that stops being true, even though the cohort is
+        still, correctly, not scored because another stratum still fails.
+        This is the direct regression test for the bug an independent
+        review caught by swapping the two NF rows for a resolvable number."""
+        ceiling = self._ceiling(passes=True)
+        certificate = {"blockers": [{"gate": "stratum:commons_declared_interest"}]}
+
+        statement = sealed_cohort_statement(ceiling, certificate)
+
+        assert "clears the 90% readiness gate" in statement
+        assert "cannot reach" not in statement
+        assert "stratum:commons_declared_interest" in statement
+
+    def test_names_every_blocking_gate(self):
+        """GIVEN a certificate with three blockers
+        WHEN the sealed-cohort statement is composed
+        THEN all three gate names appear in the statement -- a reader should
+        never have to cross-reference `blockers` separately to know what
+        blocked scoring."""
+        ceiling = self._ceiling(passes=False)
+        certificate = {
+            "blockers": [
+                {"gate": "stratum:commons_declared_interest"},
+                {"gate": "stratum:lords_declared_interest"},
+                {"gate": "stratum:ch_officer_appointment"},
+            ]
+        }
+
+        statement = sealed_cohort_statement(ceiling, certificate)
+
+        assert "stratum:commons_declared_interest" in statement
+        assert "stratum:lords_declared_interest" in statement
+        assert "stratum:ch_officer_appointment" in statement
+
+
+class TestElectoralCommissionMaterialityNote:
+    def _passing_ec_measurement(self) -> StratumMeasurement:
+        return StratumMeasurement(
+            name="electoral_commission",
+            available=True,
+            retrieval_recovered=11,
+            retrieval_total=12,
+            temporal_recovered=11,
+            temporal_total=12,
+        )
+
+    def test_flags_ec_as_not_material_even_when_passing(self):
+        """GIVEN an Electoral Commission measurement that passed (11/12, the
+        real measured shape)
+        WHEN the materiality note is built
+        THEN in_material_strata is False -- EC is not in
+        run_gold_benchmark.MATERIAL_STRATA regardless of its own score, and
+        the note carries the real recovered/total/passed values."""
+        note = electoral_commission_materiality_note(self._passing_ec_measurement())
+
+        assert note["in_material_strata"] is False
+        assert note["passed"] is True
+        assert note["measured_recovered"] == 11
+        assert note["measured_total"] == 12
+
+    def test_caveat_names_the_one_of_four_vs_zero_of_three_framing(self):
+        """GIVEN a passing EC measurement
+        WHEN the materiality note is built
+        THEN the caveat text explicitly contrasts '1 of 4' against '0 of 3
+        material gates' -- the exact misreading this note exists to
+        prevent."""
+        note = electoral_commission_materiality_note(self._passing_ec_measurement())
+
+        assert "1 of 4" in note["caveat"]
+        assert "0 of 3 material gates" in note["caveat"]
+
+
+@pytest.mark.django_db
+class TestMainRefusesToEmitWhenEveryMeasuredStratumPasses:
+    def test_raises_system_exit_and_writes_nothing(self, tmp_path, monkeypatch):
+        """GIVEN measure_all_strata reports every stratum passing (a
+        hypothetical state that contradicts spec amendment v2.10's own
+        finding that Companies House fails)
+        WHEN main() runs
+        THEN it raises SystemExit naming the refusal, and no output file is
+        written -- this script must never silently disagree with the
+        pre-registered finding by emitting nothing, or emit a certificate
+        claiming success."""
+        import scripts.emit_no_score_certificate as emit_mod
+
+        passing = StratumMeasurement(
+            name="ch_officer_appointment",
+            available=True,
+            retrieval_recovered=12,
+            retrieval_total=12,
+            temporal_recovered=12,
+            temporal_total=12,
+        )
+        monkeypatch.setattr(
+            emit_mod, "measure_all_strata", lambda **kwargs: {"ch_officer_appointment": passing}
+        )
+        out_path = tmp_path / "out.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "emit_no_score_certificate.py",
+                "--out",
+                str(out_path),
+                "--manifest",
+                str(tmp_path / "no_such_manifest.csv"),
+            ],
+        )
+
+        with pytest.raises(SystemExit, match="REFUSING to emit"):
+            emit_mod.main()
+
+        assert not out_path.exists()

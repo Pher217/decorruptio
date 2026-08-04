@@ -64,6 +64,111 @@ class TestAttestationInclusiveHashClosesTheGraphHashGap:
         assert first == second
 
 
+@pytest.mark.django_db
+class TestComputeAttestationInclusiveHashHandlesMixedNoneFields:
+    def test_does_not_raise_when_attestations_share_their_group_key_with_mixed_observed_at(self):
+        """GIVEN two attestations on the same edge sharing (edge_id,
+        source_name, source_reference=None) -- `unique_attestation_per_source_ref`
+        is a PARTIAL unique constraint (`condition=Q(source_reference__isnull
+        =False)`), so it does NOT stop two rows sharing a None
+        source_reference, which is exactly the loophole the coordinator's
+        review flagged -- one with observed_at=None and one with a real
+        datetime, the same shape that made a raw-tuple sort raise TypeError
+        in compute_graph_hash (281,535 of 704,074 real attestations have
+        observed_at=None)
+        WHEN compute_attestation_inclusive_hash is called
+        THEN it returns a hash string instead of raising."""
+        from datetime import UTC, datetime
+
+        person = Entity.objects.create(entity_type="person", name="Someone")
+        company = Entity.objects.create(entity_type="company", name="Somewhere Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        Attestation.objects.create(
+            edge=edge, source_name="Register", source_reference=None, observed_at=None
+        )
+        Attestation.objects.create(
+            edge=edge,
+            source_name="Register",
+            source_reference=None,
+            observed_at=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+
+        result = compute_attestation_inclusive_hash()
+
+        assert isinstance(result, str)
+        assert len(result) == 64
+
+    def test_does_not_raise_when_attestations_share_their_group_key_with_mixed_snapshot_ref(self):
+        """GIVEN two attestations sharing (edge_id, source_name,
+        source_reference=None -- the same partial-constraint loophole as
+        above) and an equal (both-None) observed_at -- so tuple comparison
+        would fall through to the next field -- with one row's
+        snapshot_ref=None and the other a real string (688,540 of 704,074
+        real attestations have snapshot_ref=None; `None < "x"` raises
+        TypeError just as readily as `None < datetime(...)` does)
+        WHEN compute_attestation_inclusive_hash is called
+        THEN it returns a hash string instead of raising -- locks in that
+        the fix covers the whole row, not just the observed_at field the
+        bug report singled out."""
+        person = Entity.objects.create(entity_type="person", name="Someone")
+        company = Entity.objects.create(entity_type="company", name="Somewhere Ltd")
+        edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        Attestation.objects.create(
+            edge=edge, source_name="Register", source_reference=None, snapshot_ref=None
+        )
+        Attestation.objects.create(
+            edge=edge, source_name="Register", source_reference=None, snapshot_ref="abc123"
+        )
+
+        result = compute_attestation_inclusive_hash()
+
+        assert isinstance(result, str)
+        assert len(result) == 64
+
+
+class TestComputeAttestationInclusiveHashIsOrderIndependent:
+    def test_same_hash_from_a_shuffled_queryset(self):
+        """GIVEN the exact same set of attestation rows -- one with
+        observed_at=None, two with real datetimes -- returned by the DB
+        query in two different orders (forward and reversed)
+        WHEN compute_attestation_inclusive_hash is called against each
+        ordering
+        THEN both calls produce the identical hash -- mirrors
+        compute_graph_hash's own order-independence discipline."""
+        from datetime import UTC, datetime
+        from unittest.mock import patch
+
+        rows = [
+            (1, "Register A", "r1", None, None),
+            (1, "Register A", "r1", datetime(2020, 1, 1, tzinfo=UTC), "snap1"),
+            (2, "Register B", "r2", datetime(2019, 5, 5, tzinfo=UTC), None),
+        ]
+
+        with (
+            patch("scripts.run_gold_benchmark.compute_graph_hash", return_value="edgehash"),
+            patch(
+                "uncorrupt.gates.binding.Attestation.objects.values_list",
+                return_value=list(rows),
+            ),
+        ):
+            forward_hash = compute_attestation_inclusive_hash()
+
+        with (
+            patch("scripts.run_gold_benchmark.compute_graph_hash", return_value="edgehash"),
+            patch(
+                "uncorrupt.gates.binding.Attestation.objects.values_list",
+                return_value=list(reversed(rows)),
+            ),
+        ):
+            reversed_hash = compute_attestation_inclusive_hash()
+
+        assert forward_hash == reversed_hash
+
+
 class TestGateFreezeStateMatchesRecorded:
     def _state(self, **overrides) -> GateFreezeState:
         defaults = dict(

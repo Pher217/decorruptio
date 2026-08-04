@@ -6,10 +6,18 @@ Covers the delegation packet's required scenarios:
   `unavailable` and never a silent error
 - a stratum whose runner cannot execute (missing fixture, malformed fixture,
   runner error) reports `unavailable`
-- retrieval and temporal are reported as two distinct figures, never
-  conflated
+- retrieval and temporal are independently evaluated, never conflated
 - Lords temporal never reports a pass, regardless of retrieval numbers
 - the electoral_commission scoring gap is detected, not silently missed
+
+Plus the independent-review findings this file was rewritten to close:
+- a control battery smaller than the pre-registered size (12) can never
+  produce `available=True`, no matter how well its rows score -- an
+  arbitrary 1-row (or empty) `--ch-controls`/`--commons-controls`/
+  `--ec-controls` fixture must never unlock a material stratum
+- `compute_control_fixtures_hash` changes when a fixture's content changes,
+  closing the "the fixture is unbound" gap (code_commit/graph_hash/
+  attestation_inclusive_hash/manifest_hash are all fixture-blind)
 """
 
 from __future__ import annotations
@@ -20,7 +28,9 @@ from datetime import date
 import pytest
 
 from uncorrupt.gates.stratum import (
+    MIN_CONTROL_BATTERY_SIZE,
     StratumMeasurement,
+    compute_control_fixtures_hash,
     donation_edges_are_ungated_in_scorer,
     measure_ch_officer_stratum,
     measure_commons_stratum,
@@ -28,6 +38,63 @@ from uncorrupt.gates.stratum import (
     measure_lords_stratum,
 )
 from uncorrupt.graph.models import Edge, Entity
+
+assert MIN_CONTROL_BATTERY_SIZE == 12, (
+    "these tests hardcode battery sizes around the pre-registered 12-row size -- if this "
+    "constant ever changes, the fixtures below must be resized to match, not silently pass "
+    "against a stale assumption."
+)
+
+
+def _ch_not_found_rows(n: int, offset: int = 900) -> list[dict]:
+    """`n` CH control rows guaranteed not to resolve against any graph entity
+    -- cheap filler to reach MIN_CONTROL_BATTERY_SIZE without creating a real
+    Entity/Edge for every row."""
+    return [
+        {
+            "id": offset + i,
+            "officer_id": f"nonexistent-officer-{offset + i}",
+            "officer_name": f"Nobody {offset + i}",
+            "company_number": f"{80000000 + offset + i:08d}",
+            "company_name": f"Nowhere {offset + i} Ltd",
+            "appointed_on": "2020-01-01",
+        }
+        for i in range(n)
+    ]
+
+
+def _commons_not_found_rows(n: int, offset: int = 900) -> list[dict]:
+    """`n` Commons control rows guaranteed not to resolve."""
+    return [
+        {
+            "id": offset + i,
+            "interest_id": offset + i,
+            "member_id": 900000 + offset + i,
+            "member_name": f"Nobody MP {offset + i}",
+            "organisation_name": f"Nonexistent Org {offset + i} Ltd",
+            "company_number": None,
+            "registration_date": "2020-01-01",
+        }
+        for i in range(n)
+    ]
+
+
+def _ec_not_found_rows(n: int, offset: int = 900) -> list[dict]:
+    """`n` EC control rows guaranteed not to resolve."""
+    return [
+        {
+            "id": offset + i,
+            "ec_ref": f"NONE{offset + i}",
+            "donor_name": f"Nonexistent Donor {offset + i} Ltd",
+            "donor_company_number": f"{70000000 + offset + i:08d}",
+            "recipient_name": f"Nonexistent Party {offset + i}",
+            "recipient_type": "Political Party",
+            "recipient_id": f"nonexistent-{offset + i}",
+            "accepted_date": "01/01/2020",
+            "received_date": "",
+        }
+        for i in range(n)
+    ]
 
 
 class TestStratumMeasurementFailsClosed:
@@ -118,25 +185,18 @@ class TestUnmeasurableStrataAreUnavailable:
         assert "run_ch_controls.py" in result.note
         assert "KeyError" in result.note
 
-
-@pytest.mark.django_db
-class TestWiredStratumRunnersReportRealScores:
-    """Now that CH, Commons, and EC all have a wired scripts/run_*_controls.py
-    runner (mirroring Lords), a stratum with a real fixture and a reachable
-    graph must report the ACTUAL measured score -- available, with whatever
-    passed/failed result that score implies -- never unavailable and never a
-    silently-defaulted zero."""
-
-    def test_ch_officer_stratum_with_a_partial_score_reports_available_and_not_passing(
-        self, tmp_path
-    ):
-        """GIVEN a 2-row CH control fixture where only one row's officer/company/
-        appointment is present in the graph
+    @pytest.mark.django_db
+    def test_a_1_row_fixture_cannot_produce_available_true_even_if_the_row_recovers(self, tmp_path):
+        """GIVEN a control fixture with exactly ONE row, and that one row's
+        officer/company/appointment ARE present in the graph (it would retrieve
+        AND temporal-match if it were allowed to run)
         WHEN the CH officer stratum is measured
-        THEN available is True (the runner executed for real), retrieval is
-        1/2 (below the 90% bar) so passed is False -- a wired stratum with a
-        failing score is reported honestly, not as unavailable and not as an
-        error."""
+        THEN available is still False -- an independent review demonstrated
+        that without this floor, an arbitrary 1-row fixture reports
+        available=True, passed=True even though the real 12-row battery for
+        this same stratum scores 6/12 and FAILS. A battery below
+        MIN_CONTROL_BATTERY_SIZE is an untrusted input, not a passing (or
+        failing) score."""
         officer = Entity.objects.create(
             entity_type="person",
             name="BOWDEN, Matthew Shaun",
@@ -156,7 +216,6 @@ class TestWiredStratumRunnersReportRealScores:
             target_entity=company,
             valid_from=date(2025, 5, 1),
         )
-
         fixture = {
             "controls": [
                 {
@@ -166,92 +225,168 @@ class TestWiredStratumRunnersReportRealScores:
                     "company_number": "02723534",
                     "company_name": "ASTRAZENECA PLC",
                     "appointed_on": "2025-05-01",
-                },
-                {
-                    "id": 2,
-                    "officer_id": "officer-not-in-graph",
-                    "officer_name": "Nobody",
-                    "company_number": "99999999",
-                    "company_name": "Nowhere Ltd",
-                    "appointed_on": "2020-01-01",
-                },
+                }
             ]
         }
+        fixture_path = tmp_path / "ch_temporal_controls.json"
+        fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+        result = measure_ch_officer_stratum(controls_path=fixture_path)
+
+        assert result.available is False
+        assert result.passed is False
+        assert "12" in result.note
+        assert "1-row" in result.note or "1 " in result.note or "battery" in result.note.lower()
+
+    def test_empty_battery_reports_unavailable_not_a_score_shaped_blocker(self, tmp_path):
+        """GIVEN a control fixture with zero rows ({"controls": []}) -- the
+        runner CAN execute against it (no exception), it just measures nothing
+        WHEN the CH officer stratum is measured
+        THEN available is False, never True -- an executed-but-empty battery
+        must never be mistaken for a battery that legitimately passed or
+        legitimately failed; it is below MIN_CONTROL_BATTERY_SIZE like any
+        other undersized fixture."""
+        fixture_path = tmp_path / "ch_temporal_controls.json"
+        fixture_path.write_text(json.dumps({"controls": []}), encoding="utf-8")
+
+        result = measure_ch_officer_stratum(controls_path=fixture_path)
+
+        assert result.available is False
+        assert result.passed is False
+
+
+@pytest.mark.django_db
+class TestWiredStratumRunnersReportRealScores:
+    """Now that CH, Commons, and EC all have a wired scripts/run_*_controls.py
+    runner (mirroring Lords), a stratum with a real, pre-registered-sized (12
+    row) fixture and a reachable graph must report the ACTUAL measured score
+    -- available, with whatever passed/failed result that score implies --
+    never unavailable and never a silently-defaulted zero. Every fixture here
+    is exactly MIN_CONTROL_BATTERY_SIZE (12) rows, matching the real
+    tests/fixtures/*_controls.json battery size -- these are NOT the
+    small/arbitrary fixtures the battery-size floor rejects."""
+
+    def test_ch_officer_stratum_with_a_failing_score_reports_available_and_not_passing(
+        self, tmp_path
+    ):
+        """GIVEN a 12-row CH control fixture where only 5 rows' officer/company/
+        appointment are present in the graph
+        WHEN the CH officer stratum is measured
+        THEN available is True (the runner executed for real, against a
+        battery at the pre-registered size), retrieval is 5/12 (below the 90%
+        bar) so passed is False -- a wired stratum with a failing score is
+        reported honestly, not as unavailable and not as an error."""
+        recovered_rows = []
+        for i in range(5):
+            officer = Entity.objects.create(
+                entity_type="person",
+                name=f"Officer {i}",
+                registry_scheme="GB-COH-OFFICER",
+                registry_id=f"officer-{i}",
+            )
+            company_number = f"{10000000 + i:08d}"
+            company = Entity.objects.create(
+                entity_type="company",
+                name=f"Company {i}",
+                registry_scheme="GB-COH",
+                registry_id=company_number,
+                company_number=company_number,
+            )
+            Edge.objects.create(
+                edge_type="officer_of",
+                source_entity=officer,
+                target_entity=company,
+                valid_from=date(2025, 5, 1),
+            )
+            recovered_rows.append(
+                {
+                    "id": i,
+                    "officer_id": f"officer-{i}",
+                    "officer_name": f"Officer {i}",
+                    "company_number": company_number,
+                    "company_name": f"Company {i}",
+                    "appointed_on": "2025-05-01",
+                }
+            )
+        fixture = {"controls": recovered_rows + _ch_not_found_rows(7)}
         fixture_path = tmp_path / "ch_temporal_controls.json"
         fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
         result = measure_ch_officer_stratum(controls_path=fixture_path)
 
         assert result.available is True
-        assert result.retrieval_recovered == 1
-        assert result.retrieval_total == 2
+        assert result.retrieval_recovered == 5
+        assert result.retrieval_total == 12
         assert result.passed is False
 
-    def test_retrieval_and_temporal_are_reported_as_distinct_figures(self, tmp_path):
-        """GIVEN the same 1-of-2-recovered CH fixture as above, where the one
-        recovered control's date also matches
+    def test_retrieval_and_temporal_are_independently_evaluated(self, tmp_path):
+        """GIVEN a 12-row CH control fixture where 11 rows retrieve (>=90%,
+        retrieval PASSES) but only 9 of those 11 carry a correctly-dated edge
+        (<90% of 12, temporal FAILS)
         WHEN the CH officer stratum is measured
-        THEN temporal_total is scoped to the RETRIEVED subset (1), not the raw
-        control-battery size (2) -- retrieval_total and temporal_total are
-        genuinely different numbers, proving the two figures are never
-        conflated."""
-        officer = Entity.objects.create(
-            entity_type="person",
-            name="BOWDEN, Matthew Shaun",
-            registry_scheme="GB-COH-OFFICER",
-            registry_id="officer-1",
-        )
-        company = Entity.objects.create(
-            entity_type="company",
-            name="ASTRAZENECA PLC",
-            registry_scheme="GB-COH",
-            registry_id="02723534",
-            company_number="02723534",
-        )
-        Edge.objects.create(
-            edge_type="officer_of",
-            source_entity=officer,
-            target_entity=company,
-            valid_from=date(2025, 5, 1),
-        )
-        fixture = {
-            "controls": [
+        THEN retrieval_passed is True, temporal_passed is False, and
+        retrieval_total == temporal_total (both the SAME raw battery size,
+        never rescaled) -- proving retrieval and temporal are independently
+        computed outcomes, not that they use different denominators. This is
+        the corrected form of the earlier (exploitable) design: an
+        independent review showed rescaling temporal_total to the retrieved
+        subset let a worse retrieval shrink the temporal denominator and
+        flip a genuine FAIL into a PASS."""
+        rows = []
+        for i in range(11):
+            officer = Entity.objects.create(
+                entity_type="person",
+                name=f"Officer {i}",
+                registry_scheme="GB-COH-OFFICER",
+                registry_id=f"officer-{i}",
+            )
+            company_number = f"{20000000 + i:08d}"
+            company = Entity.objects.create(
+                entity_type="company",
+                name=f"Company {i}",
+                registry_scheme="GB-COH",
+                registry_id=company_number,
+                company_number=company_number,
+            )
+            # First 9 rows: edge dated EXACTLY as the fixture claims (temporal match).
+            # Last 2 of the 11: edge dated differently (retrieved, temporal mismatch).
+            edge_valid_from = date(2025, 5, 1) if i < 9 else date(2019, 1, 1)
+            Edge.objects.create(
+                edge_type="officer_of",
+                source_entity=officer,
+                target_entity=company,
+                valid_from=edge_valid_from,
+            )
+            rows.append(
                 {
-                    "id": 1,
-                    "officer_id": "officer-1",
-                    "officer_name": "BOWDEN, Matthew Shaun",
-                    "company_number": "02723534",
-                    "company_name": "ASTRAZENECA PLC",
+                    "id": i,
+                    "officer_id": f"officer-{i}",
+                    "officer_name": f"Officer {i}",
+                    "company_number": company_number,
+                    "company_name": f"Company {i}",
                     "appointed_on": "2025-05-01",
-                },
-                {
-                    "id": 2,
-                    "officer_id": "officer-not-in-graph",
-                    "officer_name": "Nobody",
-                    "company_number": "99999999",
-                    "company_name": "Nowhere Ltd",
-                    "appointed_on": "2020-01-01",
-                },
-            ]
-        }
+                }
+            )
+        fixture = {"controls": rows + _ch_not_found_rows(1)}
         fixture_path = tmp_path / "ch_temporal_controls.json"
         fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
         result = measure_ch_officer_stratum(controls_path=fixture_path)
 
-        assert result.retrieval_total == 2
-        assert result.temporal_total == 1
-        assert result.retrieval_total != result.temporal_total
-        assert result.temporal_recovered == 1
-        assert result.temporal_passed is True
-        assert result.retrieval_passed is False
+        assert result.retrieval_recovered == 11
+        assert result.retrieval_total == 12
+        assert result.retrieval_passed is True
+        assert result.temporal_recovered == 9
+        assert result.temporal_total == 12
+        assert result.temporal_total == result.retrieval_total  # same raw battery size, shared
+        assert result.temporal_passed is False
         assert result.passed is False  # available AND retrieval_passed AND temporal_passed
 
     def test_commons_stratum_with_wired_runner_reports_a_real_recovered_score(self, tmp_path):
-        """GIVEN a 1-row Commons control fixture whose member/organisation/edge
-        ARE present in the graph
+        """GIVEN a 12-row Commons control fixture where one row's member/
+        organisation/edge ARE present in the graph and 11 are not
         WHEN the Commons stratum is measured
-        THEN available is True and retrieval is 1/1 -- scripts/run_commons_controls
+        THEN available is True and retrieval is 1/12 -- scripts/run_commons_controls
         .py is the correct runner wired for this stratum, not a copy-paste of
         another stratum's runner."""
         member = Entity.objects.create(
@@ -274,19 +409,16 @@ class TestWiredStratumRunnersReportRealScores:
             valid_from=date(2026, 1, 29),
         )
 
-        fixture = {
-            "controls": [
-                {
-                    "id": 1,
-                    "interest_id": 5336,
-                    "member_id": 4088,
-                    "member_name": "Ms Stella Creasy",
-                    "organisation_name": "Guardian News And Media",
-                    "company_number": None,
-                    "registration_date": "2026-01-29",
-                }
-            ]
+        recovered_row = {
+            "id": 1,
+            "interest_id": 5336,
+            "member_id": 4088,
+            "member_name": "Ms Stella Creasy",
+            "organisation_name": "Guardian News And Media",
+            "company_number": None,
+            "registration_date": "2026-01-29",
         }
+        fixture = {"controls": [recovered_row] + _commons_not_found_rows(11)}
         fixture_path = tmp_path / "commons_retrieval_controls.json"
         fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
@@ -294,15 +426,15 @@ class TestWiredStratumRunnersReportRealScores:
 
         assert result.available is True
         assert result.retrieval_recovered == 1
-        assert result.retrieval_total == 1
+        assert result.retrieval_total == 12
 
     def test_electoral_commission_stratum_with_wired_runner_reports_a_real_recovered_score(
         self, tmp_path
     ):
-        """GIVEN a 1-row EC control fixture whose donor/recipient/edge ARE
-        present in the graph
+        """GIVEN a 12-row EC control fixture where one row's donor/recipient/
+        edge ARE present in the graph and 11 are not
         WHEN the electoral_commission stratum is measured
-        THEN available is True and retrieval is 1/1 -- scripts/run_ec_controls.py
+        THEN available is True and retrieval is 1/12 -- scripts/run_ec_controls.py
         is the correct runner wired for this stratum."""
         donor = Entity.objects.create(
             entity_type="company",
@@ -324,21 +456,18 @@ class TestWiredStratumRunnersReportRealScores:
             valid_from=date(2019, 2, 8),
         )
 
-        fixture = {
-            "controls": [
-                {
-                    "id": 1,
-                    "ec_ref": "C0404021",
-                    "donor_name": "Auvian Limited",
-                    "donor_company_number": "4853169",
-                    "recipient_name": "Liberal Democrats",
-                    "recipient_type": "Political Party",
-                    "recipient_id": "90",
-                    "accepted_date": "10/03/2019",
-                    "received_date": "08/02/2019",
-                }
-            ]
+        recovered_row = {
+            "id": 1,
+            "ec_ref": "C0404021",
+            "donor_name": "Auvian Limited",
+            "donor_company_number": "4853169",
+            "recipient_name": "Liberal Democrats",
+            "recipient_type": "Political Party",
+            "recipient_id": "90",
+            "accepted_date": "10/03/2019",
+            "received_date": "08/02/2019",
         }
+        fixture = {"controls": [recovered_row] + _ec_not_found_rows(11)}
         fixture_path = tmp_path / "ec_retrieval_controls.json"
         fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
@@ -346,7 +475,94 @@ class TestWiredStratumRunnersReportRealScores:
 
         assert result.available is True
         assert result.retrieval_recovered == 1
-        assert result.retrieval_total == 1
+        assert result.retrieval_total == 12
+
+
+class TestComputeControlFixturesHash:
+    """Closes the "the fixture is unbound" gap: code_commit/graph_hash/
+    attestation_inclusive_hash/manifest_hash all leave a control fixture free
+    to be edited (or substituted) without changing any of them --
+    compute_control_fixtures_hash is what GateFreezeState.control_fixtures_hash
+    (uncorrupt.gates.binding) binds to instead."""
+
+    def _write(self, path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+
+    def test_hash_changes_when_a_fixture_is_edited(self, tmp_path):
+        """GIVEN two otherwise-identical fixture sets differing in the content of
+        just one file
+        WHEN compute_control_fixtures_hash is computed for each
+        THEN the hashes differ -- an edited-but-uncommitted fixture is
+        detectable even though it changes no git commit."""
+        ch_path = tmp_path / "ch.json"
+        self._write(ch_path, json.dumps({"controls": [{"id": 1}]}))
+        commons_path = tmp_path / "commons.json"
+        self._write(commons_path, json.dumps({"controls": []}))
+
+        before = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=ch_path,
+            commons_controls_path=commons_path,
+            ec_controls_path=None,
+        )
+
+        self._write(ch_path, json.dumps({"controls": [{"id": 1, "tampered": True}]}))
+
+        after = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=ch_path,
+            commons_controls_path=commons_path,
+            ec_controls_path=None,
+        )
+
+        assert before != after
+
+    def test_hash_is_stable_for_unchanged_fixtures(self, tmp_path):
+        """GIVEN the same fixture paths and content, computed twice
+        WHEN compute_control_fixtures_hash is called each time
+        THEN the two hashes are identical -- a real, reproducible content
+        hash, not a timestamp or random value."""
+        ch_path = tmp_path / "ch.json"
+        self._write(ch_path, json.dumps({"controls": [{"id": 1}]}))
+
+        first = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=ch_path,
+            commons_controls_path=None,
+            ec_controls_path=None,
+        )
+        second = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=ch_path,
+            commons_controls_path=None,
+            ec_controls_path=None,
+        )
+
+        assert first == second
+
+    def test_a_missing_fixture_hashes_differently_than_none(self, tmp_path):
+        """GIVEN one call where a control path is None (not configured) and
+        another where it points at a file that does not exist (configured but
+        missing)
+        WHEN compute_control_fixtures_hash is computed for each
+        THEN the two hashes differ -- "not configured" and "configured but
+        missing" must never silently collide to the same value."""
+        missing_path = tmp_path / "does_not_exist.json"
+
+        with_none = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=None,
+            commons_controls_path=None,
+            ec_controls_path=None,
+        )
+        with_missing_path = compute_control_fixtures_hash(
+            lords_controls_path=None,
+            ch_controls_path=missing_path,
+            commons_controls_path=None,
+            ec_controls_path=None,
+        )
+
+        assert with_none != with_missing_path
 
 
 @pytest.mark.django_db

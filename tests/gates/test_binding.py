@@ -76,9 +76,10 @@ class TestGateFreezeStateMatchesRecorded:
         defaults.update(overrides)
         return GateFreezeState(**defaults)
 
-    def test_matches_when_all_four_fields_agree(self):
+    def test_matches_when_all_five_fields_agree(self):
         """GIVEN a freeze state and a recorded dict with identical
-        code_commit/graph_hash/attestation_inclusive_hash/manifest_hash
+        code_commit/graph_hash/attestation_inclusive_hash/manifest_hash/
+        control_fixtures_hash
         WHEN matches_recorded is checked
         THEN it is True."""
         state = self._state()
@@ -107,3 +108,30 @@ class TestGateFreezeStateMatchesRecorded:
         recorded["graph_hash"] = "a-different-hash"
 
         assert state.matches_recorded(recorded) is False
+
+    def test_does_not_match_when_control_fixtures_hash_differs(self):
+        """GIVEN a recorded dict whose control_fixtures_hash differs from the
+        current state (a control-battery fixture was edited or substituted since
+        this state was recorded -- an edit that changes NONE of code_commit/
+        graph_hash/attestation_inclusive_hash/manifest_hash, since none of those
+        four reflect fixture content)
+        WHEN matches_recorded is checked
+        THEN it is False -- this is the extra check that closes the
+        "fixture is unbound" gap (see binding.py module docstring)."""
+        state = self._state(control_fixtures_hash="fixtures-v1")
+        recorded = state.to_binding_dict()
+        recorded["control_fixtures_hash"] = "fixtures-v2-tampered"
+
+        assert state.matches_recorded(recorded) is False
+
+    def test_control_fixtures_hash_defaults_to_empty_and_still_matches(self):
+        """GIVEN a freeze state built with no control_fixtures_hash override (the
+        coverage-gate script's own case -- it has no stratum fixtures to hash)
+        WHEN matches_recorded is checked against its own recorded dict
+        THEN it is True -- the shared "" default is a legitimate match for a
+        producer that never reads a control fixture, not a silently-passing
+        placeholder."""
+        state = self._state()
+
+        assert state.control_fixtures_hash == ""
+        assert state.matches_recorded(state.to_binding_dict()) is True

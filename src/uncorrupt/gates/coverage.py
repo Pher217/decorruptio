@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,13 @@ from uncorrupt.graph.parliament_interests import SOURCE_NAME as COMMONS_SOURCE_N
 
 DEFAULT_CH_OUTPUT_DIR = "experiments/ch_officers"
 DEFAULT_COMMONS_TAKE = 1
+# scripts/ingest_parliament_interests.py's own DEFAULT_OUTPUT_DIR +
+# fetch_parliament_interests's fixed provenance filename -- where the LIVE
+# ingest that populated `ingested` below wrote down which RegisteredFrom/
+# RegisteredTo window (if any) it actually fetched.
+DEFAULT_COMMONS_INGEST_PROVENANCE_PATH = (
+    "experiments/parliament_interests/parliament_interests.provenance.json"
+)
 LORDS_MEMBER_REGISTRY_SCHEME = "UK-PARLIAMENT-MEMBER"
 
 
@@ -216,7 +224,10 @@ def measure_ch_officer_coverage(
 # ---------------------------------------------------------------------------
 
 
-def _commons_totals_query_params() -> dict[str, Any]:
+def _commons_totals_query_params(
+    registered_from: date | None = None,
+    registered_to: date | None = None,
+) -> dict[str, Any]:
     """The exact query shape `fetch_parliament_interests` issues (minus
     pagination) -- the single source of truth both `fetch_commons_total_results`
     and `measure_commons_coverage`'s provenance note read, so the two can never
@@ -232,20 +243,39 @@ def _commons_totals_query_params() -> dict[str, Any]:
     mismatch (4,057 vs. the real 3,415 corpus) previously went unnoticed for
     hours. Never drop this parameter here without also confirming the fetch
     no longer sends it.
+
+    `registered_from`/`registered_to` mirror `fetch_parliament_interests`'s
+    OWN optional date-window params, added the same way it adds them
+    (ISO date strings, only when not `None`) -- a second, independently
+    discovered axis on which the denominator can silently stop being
+    apples-to-apples with the fetch: `ExpandChildInterests` alone is not
+    sufficient if the actual ingest was date-windowed and this query is not.
+    See `measure_commons_coverage`'s `ingest_provenance_path` for how the
+    caller is expected to supply these rather than guessing.
     """
-    return {
+    params: dict[str, Any] = {
         "Take": DEFAULT_COMMONS_TAKE,
         "SortOrder": "PublishingDateDescending",
         "ExpandChildInterests": "true",
     }
+    if registered_from is not None:
+        params["RegisteredFrom"] = registered_from.isoformat()
+    if registered_to is not None:
+        params["RegisteredTo"] = registered_to.isoformat()
+    return params
 
 
-def fetch_commons_total_results(client: httpx.Client | None = None, max_retries: int = 5) -> int:
+def fetch_commons_total_results(
+    client: httpx.Client | None = None,
+    max_retries: int = 5,
+    registered_from: date | None = None,
+    registered_to: date | None = None,
+) -> int:
     """Live `totalResults` from the Commons Interests API, queried with the
-    SAME shape (`ExpandChildInterests=true`) the real fetch always sends
-    (packet: "the interests API reports totalResults" -- but see
-    `_commons_totals_query_params`'s docstring for why the query shape must
-    match, not just the endpoint).
+    SAME shape (`ExpandChildInterests=true`, plus the same date window when
+    given) the real fetch actually used (packet: "the interests API reports
+    totalResults" -- but see `_commons_totals_query_params`'s docstring for
+    why the query shape must match, not just the endpoint).
 
     A single `Take=1` request reads only the pagination envelope, never the
     corpus itself (that remains `parliament_interests.py`'s job). This
@@ -260,7 +290,10 @@ def fetch_commons_total_results(client: httpx.Client | None = None, max_retries:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
-        url = httpx.URL(INTERESTS_API_BASE, params=_commons_totals_query_params())
+        params = _commons_totals_query_params(
+            registered_from=registered_from, registered_to=registered_to
+        )
+        url = httpx.URL(INTERESTS_API_BASE, params=params)
         payload = _fetch_json_with_backoff(client, url, max_retries)
     finally:
         if owns_client:
@@ -274,9 +307,81 @@ def fetch_commons_total_results(client: httpx.Client | None = None, max_retries:
     return total
 
 
+def _read_commons_ingest_date_window(
+    provenance_path: str | Path | None,
+) -> tuple[date | None, date | None, str]:
+    """Best-effort read of the ACTUAL `RegisteredFrom`/`RegisteredTo` window
+    the currently-ingested Commons dump was fetched with, from
+    `fetch_parliament_interests`'s own `parliament_interests.provenance.json`
+    -- so the coverage denominator can be windowed to match what was
+    actually fetchable, rather than silently assuming an unwindowed fetch
+    (the same "read the fetch's own query shape" principle the
+    `ExpandChildInterests` fix above applied one axis up, per an independent
+    review: an ingest run with `--registered-from 2019-01-01
+    --registered-to 2021-12-31` produces `item_count: 130`, but an unwindowed
+    `totalResults` denominator (3,415, the full corpus) is not apples-to-
+    apples with what that windowed fetch could ever have reached).
+
+    Returns `(registered_from, registered_to, description)` -- `description`
+    is always populated, on every path (found, not found, or unwindowed),
+    so the caller can record an honest `known_limits` entry regardless of
+    which branch fired; this function never silently succeeds or fails.
+    """
+    if provenance_path is None:
+        return (
+            None,
+            None,
+            "no ingest provenance path supplied -- denominator queried UNWINDOWED. If the "
+            "live ingest was date-windowed, this denominator is not apples-to-apples with "
+            "what was actually fetched (flagged, not resolved).",
+        )
+    path = Path(provenance_path)
+    if not path.exists():
+        return (
+            None,
+            None,
+            f"no ingest provenance file found at {path} -- denominator queried UNWINDOWED. If "
+            "the live ingest was date-windowed, this denominator is not apples-to-apples with "
+            "what was actually fetched (flagged, not resolved).",
+        )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    window = data.get("registered_range") or {}
+    from_raw, to_raw = window.get("from"), window.get("to")
+    if from_raw is None and to_raw is None:
+        return (
+            None,
+            None,
+            f"ingest provenance at {path} recorded an UNWINDOWED fetch (no RegisteredFrom/"
+            "RegisteredTo) -- denominator queried unwindowed to match.",
+        )
+    return (
+        date.fromisoformat(from_raw) if from_raw else None,
+        date.fromisoformat(to_raw) if to_raw else None,
+        f"ingest provenance at {path} recorded RegisteredFrom={from_raw}/RegisteredTo={to_raw} "
+        "-- denominator queried with the SAME window, so it is apples-to-apples with what the "
+        "live ingest actually fetched.",
+    )
+
+
+_COMMONS_UNEXPANDED_GAP_LIMIT = (
+    "the ExpandChildInterests=true total used here as the denominator (3,415, verified live "
+    "2026-08-04) is ~640 records SMALLER than the same query without that flag (4,057) -- "
+    "parliament_interests.py's own module docstring calls this gap 'unexplained', and it "
+    "cannot be attributed to parent/child collapsing alone (the live corpus held only ONE "
+    "interest with children at capture time, which could not itself produce a 640-record "
+    "swing). A smaller denominator flatters the reported coverage percentage. This module "
+    "keeps ExpandChildInterests=true because that is the query shape the real fetch actually "
+    "issues (the fix this module exists for) -- reverting to 4,057 would reintroduce that "
+    "defect, comparing ingested records against a total the fetch can never reach. If the "
+    "gap instead reflects records NOT reachable via ExpandChildInterests=true, THIS "
+    "denominator understates the true corpus -- flagged here, not resolved."
+)
+
+
 def measure_commons_coverage(
     total_results: int | None = None,
     client: httpx.Client | None = None,
+    ingest_provenance_path: str | Path | None = DEFAULT_COMMONS_INGEST_PROVENANCE_PATH,
 ) -> CoverageMeasurement:
     """UK Parliament (Commons) register ingest completeness (spec A2.4.2;
     packet: "the interests API reports totalResults; last measured 130 of
@@ -285,6 +390,19 @@ def measure_commons_coverage(
     `total_results`: pass explicitly to skip the live network call (tests,
     offline runs, or pinning a specific prior reading); omitted, this
     performs one live request via `fetch_commons_total_results`.
+
+    `ingest_provenance_path`: where to look for the CURRENT ingest's own
+    `parliament_interests.provenance.json` (written by
+    `fetch_parliament_interests`) so the live `totalResults` query can be
+    windowed to the SAME `RegisteredFrom`/`RegisteredTo` the ingest actually
+    used, rather than silently assuming an unwindowed fetch -- see
+    `_read_commons_ingest_date_window`'s docstring for the defect class this
+    closes (an independent review found the real ingest that produced the
+    live `ingested` count ran windowed `2019-01-01..2021-12-31`, while this
+    denominator was reading the full unwindowed corpus). Pass `None` to
+    skip the provenance read outright (documented, not silently assumed).
+    Ignored when `total_results` is given explicitly -- no live query is
+    made at all in that branch.
 
     `ingested` is `Attestation.objects.filter(source_name=COMMONS_SOURCE_NAME
     ).count()`: `parliament_interests.ingest_parliament_interests_json`
@@ -304,16 +422,27 @@ def measure_commons_coverage(
     of the ratio was obtained (generalising the fix for the query-shape
     mismatch above: a coverage ratio is meaningless if its two halves came
     from incomparable queries, so both must always be traceable, not just
-    the denominator).
+    the denominator). The ExpandChildInterests permissiveness gap (see
+    `_COMMONS_UNEXPANDED_GAP_LIMIT`) is recorded in `known_limits` on every
+    live measurement, not just when things look wrong.
     """
+    known_limits: list[str] = []
     if total_results is None:
-        total_results = fetch_commons_total_results(client=client)
+        registered_from, registered_to, window_note = _read_commons_ingest_date_window(
+            ingest_provenance_path
+        )
+        total_results = fetch_commons_total_results(
+            client=client, registered_from=registered_from, registered_to=registered_to
+        )
         total_source = (
             f"live query, same shape as fetch_parliament_interests: params="
-            f"{_commons_totals_query_params()} -- ExpandChildInterests=true matches what the "
-            "real fetch always sends, so this total is apples-to-apples with what `ingested` "
-            "can ever reach (see _commons_totals_query_params's docstring)."
+            f"{_commons_totals_query_params(registered_from, registered_to)} -- "
+            "ExpandChildInterests=true matches what the real fetch always sends, so this "
+            "total is apples-to-apples with what `ingested` can ever reach (see "
+            f"_commons_totals_query_params's docstring). {window_note}"
         )
+        known_limits.append(window_note)
+        known_limits.append(_COMMONS_UNEXPANDED_GAP_LIMIT)
     else:
         total_source = (
             f"explicitly provided by the caller (total_results={total_results}) -- no live "
@@ -324,16 +453,18 @@ def measure_commons_coverage(
     ingested = Attestation.objects.filter(source_name=COMMONS_SOURCE_NAME).count()
     not_attempted = total_results - ingested
 
+    known_limits.append(
+        "no per-record fetch-failure evidence is persisted by parliament_interests.py -- "
+        "every non-ingested record is counted as not_attempted, never explicitly_failed."
+    )
+
     return CoverageMeasurement(
         name="commons_register",
         ingested=ingested,
         explicitly_failed=0,
         not_attempted=not_attempted,
         total=total_results,
-        known_limits=(
-            "no per-record fetch-failure evidence is persisted by parliament_interests.py -- "
-            "every non-ingested record is counted as not_attempted, never explicitly_failed.",
-        ),
+        known_limits=tuple(known_limits),
         extra={
             "total_source": total_source,
             "ingested_source": (

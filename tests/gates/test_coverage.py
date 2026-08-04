@@ -5,14 +5,18 @@ Covers the delegation packet's required scenarios:
 - a valid zero-officer response is not counted as a fetch failure
 - an explicitly-failed record is distinguished from one never attempted
 - the Commons denominator is read with the SAME query shape the fetch
-  actually issues (ExpandChildInterests=true), and the measurement records
-  which query produced each half of the ratio
+  actually issues (ExpandChildInterests=true AND the ingest's own date
+  window), and the measurement records which query produced each half of
+  the ratio
+- the ExpandChildInterests permissiveness gap (3,415 vs. 4,057, unexplained
+  per parliament_interests.py) is disclosed on every live measurement
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -20,6 +24,7 @@ import pytest
 
 from uncorrupt.gates.coverage import (
     CoverageMeasurement,
+    _read_commons_ingest_date_window,
     fetch_commons_total_results,
     measure_ch_officer_coverage,
     measure_commons_coverage,
@@ -322,20 +327,21 @@ class TestCommonsDenominatorMatchesTheFetchQueryShape:
 
     @pytest.mark.django_db
     def test_measure_commons_coverage_records_which_live_query_produced_the_total(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
-        """GIVEN a live (mocked) totalResults fetch
+        """GIVEN a live (mocked) totalResults fetch and no ingest provenance file
+        at the configured path
         WHEN Commons coverage is measured with no total_results override
         THEN extra['total_source'] records that the total came from a live
         query including ExpandChildInterests=true -- so a future reader can
         verify the two halves of the ratio are comparable, not just trust it."""
 
-        def fake_fetch(client=None, max_retries=5):
+        def fake_fetch(client=None, max_retries=5, registered_from=None, registered_to=None):
             return 3415
 
         monkeypatch.setattr("uncorrupt.gates.coverage.fetch_commons_total_results", fake_fetch)
 
-        result = measure_commons_coverage()
+        result = measure_commons_coverage(ingest_provenance_path=tmp_path / "missing.json")
 
         assert result.total == 3415
         assert "ExpandChildInterests" in result.extra["total_source"]
@@ -362,6 +368,150 @@ class TestCommonsDenominatorMatchesTheFetchQueryShape:
         result = measure_commons_coverage(total_results=10)
 
         assert "Attestation" in result.extra["ingested_source"]
+
+    @pytest.mark.django_db
+    def test_live_measurement_documents_the_unexplained_expand_child_interests_gap(
+        self, monkeypatch, tmp_path
+    ):
+        """GIVEN a live (mocked) measurement
+        WHEN Commons coverage is measured with no total_results override
+        THEN known_limits documents the ~640-record gap between the
+        ExpandChildInterests=true total used here and the unexpanded total --
+        a smaller denominator flatters coverage, and parliament_interests.py's
+        own docstring calls the gap unexplained; this must be disclosed on
+        every live measurement, not discovered by accident."""
+
+        def fake_fetch(client=None, max_retries=5, registered_from=None, registered_to=None):
+            return 3415
+
+        monkeypatch.setattr("uncorrupt.gates.coverage.fetch_commons_total_results", fake_fetch)
+
+        result = measure_commons_coverage(ingest_provenance_path=tmp_path / "missing.json")
+
+        assert any("4,057" in limit and "unexplained" in limit for limit in result.known_limits)
+
+    @pytest.mark.django_db
+    def test_explicit_override_does_not_claim_the_gap_disclosure(self):
+        """GIVEN total_results is passed explicitly (offline path, no live query)
+        WHEN Commons coverage is measured
+        THEN known_limits does NOT include the live-only ExpandChildInterests
+        gap disclosure -- that disclosure describes a live query this call
+        never made, and asserting it unconditionally would be misleading."""
+        result = measure_commons_coverage(total_results=10)
+
+        assert not any("4,057" in limit for limit in result.known_limits)
+
+
+class TestCommonsDenominatorReadsTheIngestsOwnDateWindow:
+    """Second independent-review follow-up: closing ExpandChildInterests alone
+    left the DATE-WINDOW axis open -- a live ingest run with
+    --registered-from/--registered-to fetches a windowed subset, but an
+    unwindowed totalResults denominator silently assumes the whole corpus is
+    comparable. _read_commons_ingest_date_window reads the ingest's own
+    provenance.json instead of assuming default fetch parameters."""
+
+    def test_no_provenance_path_configured_reports_unwindowed_and_says_so(self):
+        """GIVEN provenance_path=None (not configured at all)
+        WHEN the date window is read
+        THEN both dates are None and the description explains the denominator
+        was queried UNWINDOWED -- documented, not silently assumed comparable."""
+        registered_from, registered_to, description = _read_commons_ingest_date_window(None)
+
+        assert registered_from is None
+        assert registered_to is None
+        assert "unwindowed" in description.lower()
+
+    def test_missing_provenance_file_reports_unwindowed_and_says_so(self, tmp_path):
+        """GIVEN a provenance_path that does not exist on disk
+        WHEN the date window is read
+        THEN both dates are None and the description names the missing path."""
+        missing_path = tmp_path / "parliament_interests.provenance.json"
+
+        registered_from, registered_to, description = _read_commons_ingest_date_window(missing_path)
+
+        assert registered_from is None
+        assert registered_to is None
+        assert str(missing_path) in description
+        assert "unwindowed" in description.lower()
+
+    def test_windowed_provenance_is_read_and_applied(self, tmp_path):
+        """GIVEN a provenance.json recording a real RegisteredFrom/RegisteredTo
+        window (mirrors fetch_parliament_interests's own written format)
+        WHEN the date window is read
+        THEN the exact from/to dates are returned, and the description confirms
+        the denominator will be queried with the SAME window."""
+        provenance_path = tmp_path / "parliament_interests.provenance.json"
+        provenance_path.write_text(
+            json.dumps(
+                {
+                    "registered_range": {"from": "2019-01-01", "to": "2021-12-31"},
+                    "item_count": 130,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        registered_from, registered_to, description = _read_commons_ingest_date_window(
+            provenance_path
+        )
+
+        assert registered_from == date(2019, 1, 1)
+        assert registered_to == date(2021, 12, 31)
+        assert "2019-01-01" in description
+        assert "2021-12-31" in description
+
+    def test_unwindowed_provenance_is_read_as_unwindowed(self, tmp_path):
+        """GIVEN a provenance.json recording a fetch with no date window at all
+        (registered_range.from/to both null -- fetch_parliament_interests's own
+        format when neither --registered-from nor --registered-to was passed)
+        WHEN the date window is read
+        THEN both dates are None, and the description distinguishes this from
+        the "no provenance found" case -- it explicitly confirms the recorded
+        fetch WAS unwindowed, not merely that provenance is missing."""
+        provenance_path = tmp_path / "parliament_interests.provenance.json"
+        provenance_path.write_text(
+            json.dumps({"registered_range": {"from": None, "to": None}, "item_count": 3415}),
+            encoding="utf-8",
+        )
+
+        registered_from, registered_to, description = _read_commons_ingest_date_window(
+            provenance_path
+        )
+
+        assert registered_from is None
+        assert registered_to is None
+        assert "recorded an unwindowed fetch" in description.lower()
+
+    @pytest.mark.django_db
+    def test_measure_commons_coverage_windows_the_live_query_when_provenance_exists(
+        self, monkeypatch, tmp_path
+    ):
+        """GIVEN an ingest provenance file recording a windowed fetch, and a live
+        totalResults call that records what window it was actually called with
+        WHEN Commons coverage is measured with no total_results override
+        THEN fetch_commons_total_results is called with the SAME registered_from
+        /registered_to the provenance recorded -- the denominator is windowed
+        to match the actual ingest, not silently left unwindowed."""
+        provenance_path = tmp_path / "parliament_interests.provenance.json"
+        provenance_path.write_text(
+            json.dumps({"registered_range": {"from": "2019-01-01", "to": "2021-12-31"}}),
+            encoding="utf-8",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_fetch(client=None, max_retries=5, registered_from=None, registered_to=None):
+            captured["registered_from"] = registered_from
+            captured["registered_to"] = registered_to
+            return 200
+
+        monkeypatch.setattr("uncorrupt.gates.coverage.fetch_commons_total_results", fake_fetch)
+
+        result = measure_commons_coverage(ingest_provenance_path=provenance_path)
+
+        assert captured["registered_from"] == date(2019, 1, 1)
+        assert captured["registered_to"] == date(2021, 12, 31)
+        assert result.total == 200
+        assert any("2019-01-01" in limit for limit in result.known_limits)
 
 
 # ---------------------------------------------------------------------------

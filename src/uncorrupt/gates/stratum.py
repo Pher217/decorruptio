@@ -27,16 +27,50 @@ execute but measures a real, low score reports `available=True` with
 
 Retrieval and temporal are reported as two DISTINCT figures, never
 conflated (mirrors each runner's own module docstring): `temporal_total` is
-deliberately rescaled to the RETRIEVED subset only (`retrieval_recovered`),
-not the raw control-battery size -- a control that was never retrieved can
-never carry a temporal outcome (`run_*_controls.py`'s own
-`TEMPORAL_NOT_APPLICABLE` status), so counting it against the temporal
-denominator would silently understate a source whose problem is retrieval,
-already reported separately. Lords is the sole structural exception: the
-register publishes no interest start dates at all, so `measure_lords_stratum`
-leaves `temporal_recovered`/`temporal_total` permanently `None` (see that
-function's own docstring) -- `temporal_passed` can never flip to `True` for
-Lords regardless of retrieval performance.
+the runner's own raw battery size (`result["temporal_total"]`, always equal
+to `n`/`retrieval_total`) -- NOT rescaled to the retrieved subset. An
+earlier version of this module rescaled `temporal_total` to
+`retrieval_recovered`, which created a perverse gradient an independent
+review demonstrated by mutation: corrupting a single already-matching date
+in a real 12-row fixture shifted the reported ratio from 11/11 to 10/11
+(still >=90%, still PASS) instead of the runner's own honest 10/12 (<90%,
+FAIL) -- worse retrieval SHRANK the temporal denominator and made temporal
+easier to pass, exactly backwards. Sharing the denominator with retrieval
+closes that: a control that fails to retrieve can never earn a temporal
+credit (`run_*_controls.py`'s own `TEMPORAL_NOT_APPLICABLE` status already
+guarantees `temporal_recovered` cannot exceed `retrieval_recovered`), and it
+correctly costs the temporal ratio too, not just retrieval's. Lords is the
+sole structural exception: the register publishes no interest start dates
+at all, so `measure_lords_stratum` leaves `temporal_recovered`/
+`temporal_total` permanently `None` (see that function's own docstring) --
+`temporal_passed` can never flip to `True` for Lords regardless of
+retrieval performance.
+
+`_measure_wired_stratum` also refuses `available=True` for any control
+battery smaller than `MIN_CONTROL_BATTERY_SIZE` (12, the pre-registered
+size of every real fixture in this repository) -- without this floor, the
+same independent review demonstrated that pointing `--ch-controls` (or
+`--commons-controls`/`--ec-controls`, all free CLI paths in
+`scripts/measure_stratum_gates.py`) at an arbitrary 1-row fixture where that
+one row happens to resolve reports `available=True, passed=True`, even
+though the real 12-row battery for that same stratum scores 6/12 and FAILS.
+Both `ch_officer_appointment` and `commons_declared_interest` are in
+`run_gold_benchmark.MATERIAL_STRATA`, gating both REFUTED
+(`all_strata_pass`) and CONFIRMED/PARTIAL (`passes_stratum_gates`) --
+before this module existed, both were hard-coded `available=False`, so no
+fixture at all could unlock them; the floor restores an equivalent
+guarantee now that a fixture path is caller-controlled.
+
+Because `GateFreezeState` (`uncorrupt.gates.binding`) binds `code_commit`/
+`graph_hash`/`attestation_inclusive_hash`/`manifest_hash` -- never the
+control fixture's own content -- an edited-but-uncommitted fixture changes
+none of those and still satisfies both `GateBinding.matches()` (the
+scorer's own check) and `GateFreezeState.matches_recorded()` (this
+package's stricter one). `compute_control_fixtures_hash()` below closes
+that visibility gap: `scripts/measure_stratum_gates.py` folds its result
+into `GateFreezeState.control_fixtures_hash`, so an artifact records
+exactly which fixture bytes produced its numbers, auditable independently
+of `MIN_CONTROL_BATTERY_SIZE`'s size-based enforcement.
 
 Electoral Commission is measured and reported here even though it is NOT
 one of `run_gold_benchmark.MATERIAL_STRATA` -- see
@@ -46,12 +80,20 @@ and cannot be closed from this package alone.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 CONTROLS_PASS_FRACTION = 0.9  # matches run_gold_benchmark.CONTROLS_PASS_FRACTION deliberately
+
+# The pre-registered size of every real control-battery fixture in this
+# repository (Lords/CH/Commons/EC all ship exactly 12 rows). A wired stratum
+# refuses `available=True` below this floor -- see module docstring's
+# "refuses available=True for any control battery smaller than
+# MIN_CONTROL_BATTERY_SIZE" section for the exploit this closes.
+MIN_CONTROL_BATTERY_SIZE = 12
 
 DEFAULT_LORDS_CONTROLS_PATH = "tests/fixtures/lords_retrieval_controls.json"
 DEFAULT_CH_CONTROLS_PATH = "tests/fixtures/ch_temporal_controls.json"
@@ -179,16 +221,22 @@ def _measure_wired_stratum(
         or any other runner error. The exception is captured into `note`
         for diagnosis, never swallowed silently.
 
-    Once the runner DOES execute, `available=True` unconditionally -- a low
-    or zero score is a real, informative measurement (`passed=False`), not
-    a reason to report unavailable (mirrors `measure_lords_stratum`'s own
-    precedent: `available=True` regardless of the retrieval count).
+    Once the runner DOES execute against a battery at least
+    `MIN_CONTROL_BATTERY_SIZE` rows, `available=True` unconditionally -- a
+    low or zero score is a real, informative measurement (`passed=False`),
+    not a reason to report unavailable (mirrors `measure_lords_stratum`'s
+    own precedent: `available=True` regardless of the retrieval count). A
+    battery SMALLER than that floor also reports unavailable -- an
+    executed-but-undersized battery is not a passing (or failing) score,
+    it is an untrusted input (see module docstring for the exploit this
+    closes: an arbitrary 1-row `--ch-controls` fixture could otherwise
+    report `available=True, passed=True`).
 
-    `temporal_total` is deliberately RESCALED to `retrieval_recovered` (the
-    retrieved subset only), not the runner's raw `n` -- see module
-    docstring's "Retrieval and temporal are reported as two DISTINCT
-    figures" section for why a not-retrieved control must never count
-    against the temporal denominator.
+    `temporal_total` is the runner's own raw `result["temporal_total"]`
+    (always `n`, the same as `retrieval_total`), never rescaled -- see
+    module docstring's "Retrieval and temporal are reported as two DISTINCT
+    figures" section for the perverse-gradient exploit rescaling to
+    `retrieval_recovered` created.
     """
     if controls_path is None:
         return StratumMeasurement(name=name, available=False, note=note_when_missing)
@@ -200,6 +248,7 @@ def _measure_wired_stratum(
             note=f"{note_when_missing} (looked for a fixture at {path}, not found).",
         )
     try:
+        fixture_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         result = run_controls_fn(controls_path=path)
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design, see docstring above
         return StratumMeasurement(
@@ -209,12 +258,33 @@ def _measure_wired_stratum(
                 f"{runner_label} raised {exc!r} while running the control battery at {path} -- "
                 "reported unavailable, never a silent zero and never passing (ADR-008)."
             ),
+            extra={"fixture_path": str(path)},
         )
 
     retrieval_recovered = result["retrieval_recovered"]
     retrieval_total = result["retrieval_total"]
     temporal_recovered = result["temporal_recovered"]
-    temporal_total = retrieval_recovered
+    temporal_total = result["temporal_total"]
+    battery_extra = {
+        **{key: result[key] for key in ("n", "not_found", "unresolved") if key in result},
+        "fixture_path": str(path),
+        "fixture_sha256": fixture_sha256,
+        "battery_size": retrieval_total,
+    }
+
+    if retrieval_total < MIN_CONTROL_BATTERY_SIZE:
+        return StratumMeasurement(
+            name=name,
+            available=False,
+            note=(
+                f"{runner_label} ran against a {retrieval_total}-row control battery at "
+                f"{path}, below the pre-registered {MIN_CONTROL_BATTERY_SIZE}-row battery "
+                "size -- refusing available=True for an arbitrarily small or substituted "
+                "fixture (a small battery can trivially clear the >=9/10 bar; only the "
+                "pre-registered battery size is trusted, ADR-008)."
+            ),
+            extra=battery_extra,
+        )
 
     return StratumMeasurement(
         name=name,
@@ -225,11 +295,10 @@ def _measure_wired_stratum(
         temporal_total=temporal_total,
         note=(
             f"retrieval + temporal measured live via {runner_label} against fixture {path} "
-            f"({retrieval_total} controls). temporal_total is scaled to the retrieved subset "
-            f"({retrieval_recovered}) -- a control that was never retrieved cannot carry a "
-            "temporal outcome (see module docstring)."
+            f"({retrieval_total} controls, sha256={fixture_sha256[:12]}...). temporal_total "
+            "is the runner's own raw battery size, never rescaled (see module docstring)."
         ),
-        extra={key: result[key] for key in ("n", "not_found", "unresolved") if key in result},
+        extra=battery_extra,
     )
 
 
@@ -346,6 +415,41 @@ def donation_edges_are_ungated_in_scorer() -> bool:
     from scripts.run_gold_benchmark import MATERIAL_STRATA
 
     return STRATUM_ELECTORAL_COMMISSION not in MATERIAL_STRATA
+
+
+def compute_control_fixtures_hash(
+    lords_controls_path: str | Path | None = DEFAULT_LORDS_CONTROLS_PATH,
+    ch_controls_path: str | Path | None = DEFAULT_CH_CONTROLS_PATH,
+    commons_controls_path: str | Path | None = DEFAULT_COMMONS_CONTROLS_PATH,
+    ec_controls_path: str | Path | None = DEFAULT_EC_CONTROLS_PATH,
+) -> str:
+    """sha256 over the CONTENT of every control-battery fixture this module
+    was invoked with, in a fixed order -- so `GateFreezeState.control_fixtures
+    _hash` (`uncorrupt.gates.binding`) can bind a stratum-gate artifact to
+    exactly which fixture BYTES produced its numbers (module docstring's
+    "the fixture is unbound" gap). Every path argument feeds the hash the
+    same way `_measure_wired_stratum` reads it: missing (`None`) or a
+    nonexistent file each hash to their own distinct marker, so a fixture
+    silently going missing changes this hash exactly as much as a fixture
+    silently being edited does -- neither can pass unnoticed as "no change".
+    """
+    h = hashlib.sha256()
+    for path in (
+        lords_controls_path,
+        ch_controls_path,
+        commons_controls_path,
+        ec_controls_path,
+    ):
+        if path is None:
+            h.update(b"<none>\n")
+            continue
+        p = Path(path)
+        if not p.exists():
+            h.update(f"<missing:{p}>\n".encode())
+            continue
+        h.update(p.read_bytes())
+        h.update(b"\n")
+    return h.hexdigest()
 
 
 def measure_all_strata(

@@ -735,29 +735,57 @@ def resolve_cross_register_identities(
                         stats["edges_created"] += 1
                         continue
                     existing = persisted_attestations.get(edge_id)
-                    if existing is not None and (
+                    # `existing is None` here means the edge is already
+                    # persisted but carries no attestation from this
+                    # resolver's source (live count: 0) -- the real-write
+                    # branch below would silently add one via
+                    # `Attestation.objects.create(...)` with no trace in
+                    # `stats` at all. Counting it here keeps the dry run's
+                    # preview honest about everything a real run would
+                    # write, not just corrections to an attestation that
+                    # already existed.
+                    if existing is None or (
                         existing.match_confidence != confidence or existing.match_method != tier
                     ):
                         stats["attestations_updated"] += 1
                 continue
 
             for officer, _op in matched:
+                # `get_or_create`'s `defaults` are silently discarded once a
+                # row exists -- the same defect class fixed below for the
+                # Attestation confidence (see its comment): `edge.properties`
+                # is derived fresh from `tier`/`member.name`/`officer.name`
+                # on every run, but only ever WRITTEN on the run that first
+                # created the edge. Verified live: after an attestation is
+                # corrected from surname_title_only to
+                # surname_title_territorial, `edge.properties["match_tier"]`
+                # still reads the superseded `surname_title_only` --
+                # `compute_graph_hash` covers only `(edge_type, source,
+                # target, valid_from)`, never `properties`, so repairing this
+                # does not move the graph hash. Nothing publishes
+                # `properties` today (the MCP tool layer never serialises
+                # it), so this is not a currently-published claim, but it is
+                # the surface an auditor would check the published
+                # confidence against, so it must not silently disagree with
+                # the attestation that actually backs it.
+                desired_properties = {
+                    "match_tier": tier,
+                    "parliament_name": member.name,
+                    "officer_name": officer.name,
+                }
                 edge, created = Edge.objects.get_or_create(
                     edge_type="same_as",
                     source_entity=member,
                     target_entity=officer,
                     valid_from=None,
                     valid_to=None,
-                    defaults={
-                        "properties": {
-                            "match_tier": tier,
-                            "parliament_name": member.name,
-                            "officer_name": officer.name,
-                        }
-                    },
+                    defaults={"properties": desired_properties},
                 )
                 if created:
                     stats["edges_created"] += 1
+                elif edge.properties != desired_properties:
+                    edge.properties = desired_properties
+                    edge.save(update_fields=["properties"])
 
                 # `get_or_create`'s `defaults` are silently discarded once a
                 # row exists -- the exact bug class Phase 2.5 fixed for the
@@ -769,19 +797,46 @@ def resolve_cross_register_identities(
                 # 0.60 tier). Bring the persisted confidence/method to match
                 # this run's decision -- in either direction, a corrected
                 # upgrade or a corrected downgrade -- but only when it
-                # actually changed: `observed_at` is transaction time, when
-                # THIS determination was made (Attestation docstring), and
-                # bumping it on every re-run, even a no-op one, would erase
-                # "when did we first settle on this claim" for the common
-                # case where nothing changed. Updating in place (rather than
-                # writing a second, distinct observation) is deliberate: this
-                # is not new real-world evidence arriving at a new date --
-                # like a fresh Wayback register snapshot would be (see
-                # register_snapshots.py) -- it is the same fixed input names
-                # re-scored by improved logic, so there is nothing bitemporal
-                # to preserve by keeping the superseded row around. Nothing
-                # currently reads `Attestation.created_at` for history either
-                # (`auto_now_add`, untouched by this update).
+                # actually changed.
+                #
+                # `observed_at` is deliberately left UNTOUCHED by this
+                # correction, even though it is transaction time -- when the
+                # source recorded the claim (Attestation docstring). This
+                # resolver's own attestations are read by
+                # `uncorrupt.gates.binding.compute_attestation_inclusive_hash`,
+                # which hashes every attestation on `(edge_id, source_name,
+                # source_reference, observed_at, snapshot_ref)` -- fields
+                # that identify WHICH evidence exists -- and its own
+                # docstring deliberately EXCLUDES `match_confidence` /
+                # `match_method` from that hash as "resolution-quality
+                # metadata, not new evidence". Bumping `observed_at` on a
+                # confidence-only correction would route exactly that
+                # excluded class of change into a hash meant to be blind to
+                # it, moving a sealed gate certificate's binding hash for a
+                # run that changed no evidence -- unbinding
+                # `GateFreezeState.matches_recorded()` from a certificate it
+                # should still match. It also buys nothing: no other reader
+                # depends on `observed_at` for a resolver-written `same_as`
+                # attestation -- `edge_evidence_level` and
+                # `snapshot_evidence_pages` (register_snapshots.py) both
+                # require `snapshot_ref` to be set, which these attestations
+                # never are, and `path_evidence_level` excludes `same_as`
+                # edges from temporal evidence entirely.
+                #
+                # Updating in place (rather than writing a second, distinct
+                # observation) is deliberate: this is not new real-world
+                # evidence arriving at a new date -- like a fresh Wayback
+                # register snapshot would be (see register_snapshots.py) --
+                # it is the same fixed input names re-scored by improved
+                # logic, so there is nothing bitemporal to preserve by
+                # keeping the superseded row around. What IS lost is the
+                # record that a stale confidence was PUBLISHED about a named
+                # person until this run corrected it -- `created_at`
+                # (`auto_now_add`, untouched here) still preserves
+                # first-appearance, but recovering "what did we publish, and
+                # until when" needs an append-only correction log, not a
+                # second attestation row on this edge -- out of scope for
+                # this fix.
                 existing_attestation = persisted_attestations.get(edge.id)
                 if existing_attestation is None:
                     Attestation.objects.create(
@@ -798,10 +853,7 @@ def resolve_cross_register_identities(
                 ):
                     existing_attestation.match_confidence = confidence
                     existing_attestation.match_method = tier
-                    existing_attestation.observed_at = observed_at
-                    existing_attestation.save(
-                        update_fields=["match_confidence", "match_method", "observed_at"]
-                    )
+                    existing_attestation.save(update_fields=["match_confidence", "match_method"])
                     stats["attestations_updated"] += 1
 
     logger.info(

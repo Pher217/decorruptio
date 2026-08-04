@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from uncorrupt.gates.binding import compute_attestation_inclusive_hash
 from uncorrupt.graph.identity_resolution import (
     CONFIDENCE_TERRITORIAL,
     CONFIDENCE_TITLE_ONLY,
@@ -581,8 +582,22 @@ def _make_same_as_edge(
     would have written it in an earlier run, for reconciliation fixtures.
     `source_reference` mirrors the resolver's own `f"{registry_id}:{registry_id}"`
     key -- without it, this fixture does not actually reproduce a real
-    earlier-run row (see the staleness-fix commit that added it)."""
-    edge = Edge.objects.create(edge_type="same_as", source_entity=member, target_entity=officer)
+    earlier-run row (see the staleness-fix commit that added it). `properties`
+    mirrors the resolver's own `match_tier`/`parliament_name`/`officer_name`
+    shape for the same reason -- production always writes it on create, so a
+    fixture leaving it at the model default `{}` is structurally blind to any
+    defect in how a later run corrects it (see the `Edge.properties`
+    staleness fix)."""
+    edge = Edge.objects.create(
+        edge_type="same_as",
+        source_entity=member,
+        target_entity=officer,
+        properties={
+            "match_tier": match_method,
+            "parliament_name": member.name,
+            "officer_name": officer.name,
+        },
+    )
     Attestation.objects.create(
         edge=edge,
         source_name="Cross-register name match",
@@ -735,9 +750,10 @@ class TestAttestationConfidenceStaleness:
         confirms the territorial designation and computes
         surname_title_territorial / 0.85 for this same pair
         THEN the persisted attestation is corrected in place to the current
-        confidence and method, `observed_at` advances to reflect this run's
-        determination, and no second attestation is created (updated, not
-        duplicated)."""
+        confidence and method, `observed_at` is left EXACTLY unchanged (a
+        resolution-quality correction, not new evidence -- see the
+        attestation-inclusive binding hash comment in identity_resolution.py),
+        and no second attestation is created (updated, not duplicated)."""
         rising = _make_member("mp-1", "Lord Howard of Rising")
         _make_member("mp-2", "Lord Howard of Lympne")
         officer = _make_officer(
@@ -759,7 +775,7 @@ class TestAttestationConfidenceStaleness:
         attestation = Attestation.objects.get(edge=stale_edge)
         assert attestation.match_confidence == CONFIDENCE_TERRITORIAL
         assert attestation.match_method == "surname_title_territorial"
-        assert attestation.observed_at > stale_observed_at
+        assert attestation.observed_at == stale_observed_at
 
     def test_attestation_whose_tier_is_unchanged_is_not_rewritten(self):
         """GIVEN a `same_as` edge already persisted with an attestation that
@@ -872,6 +888,115 @@ class TestAttestationConfidenceStaleness:
         assert attestation.match_confidence == CONFIDENCE_TITLE_ONLY
         assert attestation.match_method == "surname_title_only"
         assert attestation.observed_at == stale_observed_at
+
+    def test_a_confidence_correction_does_not_move_the_attestation_inclusive_hash(self):
+        """GIVEN a stale attestation the current run will correct (an
+        upgrade, exercising the real save() branch this fix touches) --
+        and `uncorrupt.gates.binding.compute_attestation_inclusive_hash`,
+        the hash a sealed gate certificate's `GateFreezeState` is bound to,
+        taken before the run
+        WHEN identities are resolved and the same hash is taken again
+        THEN it is EXACTLY unchanged. `compute_attestation_inclusive_hash`
+        hashes `(edge_id, source_name, source_reference, observed_at,
+        snapshot_ref)` and deliberately excludes `match_confidence` /
+        `match_method` as "resolution-quality metadata, not new evidence"
+        (binding.py docstring) -- a correction that touches only those two
+        fields must never move it, or a resolution-quality re-score would
+        silently unbind every sealed certificate recorded before it ran."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        _make_member("mp-2", "Lord Howard of Lympne")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        _make_same_as_edge(
+            rising,
+            officer,
+            match_confidence=CONFIDENCE_TITLE_ONLY,
+            match_method="surname_title_only",
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        hash_before = compute_attestation_inclusive_hash()
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["attestations_updated"] == 1
+        assert compute_attestation_inclusive_hash() == hash_before
+
+    def test_edge_properties_match_tier_is_corrected_alongside_the_attestation(self):
+        """GIVEN a `same_as` edge whose persisted `properties["match_tier"]`
+        was written by an earlier, weaker-tier run (surname_title_only) --
+        exactly what `Edge.objects.get_or_create(..., defaults={...})`
+        leaves behind, since defaults are silently discarded once the edge
+        row exists (the same defect class as the attestation-confidence fix,
+        one statement above it in identity_resolution.py)
+        WHEN identities are resolved under logic that now confirms the
+        territorial designation for this same pair
+        THEN `edge.properties["match_tier"]` is corrected to the current
+        tier -- not left disagreeing with the attestation that now backs
+        it."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        _make_member("mp-2", "Lord Howard of Lympne")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        stale_edge = _make_same_as_edge(
+            rising,
+            officer,
+            match_confidence=CONFIDENCE_TITLE_ONLY,
+            match_method="surname_title_only",
+        )
+        assert stale_edge.properties["match_tier"] == "surname_title_only"
+
+        resolve_cross_register_identities()
+
+        stale_edge.refresh_from_db()
+        assert stale_edge.properties["match_tier"] == "surname_title_territorial"
+
+    def test_edge_properties_match_tier_is_corrected_on_a_downgrade_too(self):
+        """GIVEN a `same_as` edge whose persisted `properties["match_tier"]`
+        was written by an earlier run at the STRONGER territorial tier, for
+        a pair the current logic now resolves only to the weaker
+        uncontested tier
+        WHEN identities are resolved
+        THEN `edge.properties["match_tier"]` is corrected DOWN too -- a fix
+        that only ever raises the persisted tier (never lowers it) would
+        leave a stronger-than-supported claim on `properties`, the exact
+        fail-open shape the attestation-confidence fix above was written to
+        avoid."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        edge = _make_same_as_edge(
+            member,
+            officer,
+            match_confidence=CONFIDENCE_TERRITORIAL,
+            match_method="surname_title_territorial",
+        )
+        assert edge.properties["match_tier"] == "surname_title_territorial"
+
+        resolve_cross_register_identities()
+
+        edge.refresh_from_db()
+        assert edge.properties["match_tier"] == "surname_title_only"
+
+    def test_dry_run_counts_an_already_persisted_edge_with_no_attestation_yet(self):
+        """GIVEN a `same_as` edge already persisted for a pair the current
+        run also proposes, but carrying NO attestation from this resolver's
+        source at all (live count: 0, but reachable -- e.g. a row a
+        previous partial write left behind) -- so a real run's
+        `existing_attestation is None` branch would silently CREATE one
+        WHEN identities are resolved with dry_run=True
+        THEN `attestations_updated` still counts it, not just edges the dry
+        run would newly create outright -- a dry run that reports 0 here
+        while a real run silently writes a brand new confidence row would
+        hide exactly the kind of change this dry run exists to preview."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        edge = Edge.objects.create(edge_type="same_as", source_entity=member, target_entity=officer)
+
+        stats = resolve_cross_register_identities(dry_run=True)
+
+        assert stats["attestations_updated"] == 1
+        assert not Attestation.objects.filter(edge=edge).exists()
 
 
 @pytest.mark.django_db

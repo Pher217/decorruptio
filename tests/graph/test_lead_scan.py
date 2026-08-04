@@ -542,6 +542,41 @@ class TestMinIdentityConfidenceAndTier:
         assert path_row["min_identity_confidence"] == 0.60
         assert path_row["same_as_tier"] == "zzz_created_first"
 
+    def test_only_same_as_edges_contribute_to_the_tier_search(self):
+        """GIVEN a path whose officer_of edge happens to carry the exact
+        same confidence value (0.60) as its same_as bridge, but a
+        DIFFERENT, lower edge id (created first), WHEN scanned THEN
+        same_as_tier still reports the same_as bridge's own method label --
+        proving the tier search is scoped to same_as edges only, not to
+        every edge on the path."""
+        company = _company_entity("00000001", "ACME LTD")
+        member = _member("Lord Example", "1001")
+        officer = _officer("EXAMPLE, Lord")
+        officer_of_edge = Edge.objects.create(
+            edge_type="officer_of",
+            source_entity=officer,
+            target_entity=company,
+            valid_from=date(2015, 1, 1),
+        )
+        Attestation.objects.create(
+            edge=officer_of_edge,
+            source_name="Companies House",
+            match_confidence=0.60,
+            match_method="identifier",
+        )
+        same_as_edge = _same_as(member, officer, 0.60, "surname_title_only")
+        assert officer_of_edge.id < same_as_edge.id
+        member_ids = {member.id}
+
+        candidates = {"00000001": date(2020, 1, 1)}
+        resolved = {"00000001": company}
+        adj = lead_scan.build_adjacency()
+
+        rows = scan(adj, candidates, resolved, member_ids, {member.id: member}, max_hops=2)
+
+        path_row = rows[0]["pre_award_paths"][0]
+        assert path_row["same_as_tier"] == "surname_title_only"
+
 
 @pytest.mark.django_db
 class TestDeterminism:
@@ -614,6 +649,34 @@ class TestArtifactCaveats:
         for key in walk_keys(report):
             assert "score" not in key.lower()
             assert "verdict" not in key.lower()
+
+
+@pytest.mark.django_db
+class TestMemberEntityIds:
+    def test_returns_only_uk_parliament_members(self):
+        """GIVEN a UK-PARLIAMENT-MEMBER person and an unrelated
+        GB-COH-OFFICER person WHEN member_entity_ids runs THEN only the
+        parliament member's id is returned."""
+        member = _member("Lord Example", "1001")
+        _officer("EXAMPLE, Lord")
+
+        ids = member_entity_ids()
+
+        assert ids == {member.id}
+
+    def test_excludes_non_person_entities_even_with_the_member_registry_scheme(self):
+        """GIVEN a non-person entity that happens to carry the
+        UK-PARLIAMENT-MEMBER registry scheme WHEN member_entity_ids runs
+        THEN it is excluded -- the entity_type filter is not redundant with
+        the registry_scheme filter."""
+        member = _member("Lord Example", "1001")
+        Entity.objects.create(
+            entity_type="company", name="Not A Person", registry_scheme="UK-PARLIAMENT-MEMBER"
+        )
+
+        ids = member_entity_ids()
+
+        assert ids == {member.id}
 
 
 @pytest.mark.django_db

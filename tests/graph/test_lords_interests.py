@@ -710,6 +710,52 @@ class TestLordsInterestsIngest:
         assert summary["matched"] == 0
         assert summary["total_members"] == 2
 
+    def test_source_name_matches_module_constant_on_every_ingest_path(self, tmp_path):
+        """GIVEN two ingests of live-crawl HTML -- one with no Wayback timestamp
+        in provenance, one with a Wayback timestamp -- WHEN ingest_lords_register
+        writes each Attestation THEN source_name is the module's SOURCE_NAME
+        constant on both paths, never a second, independently-derived literal.
+
+        Regression guard for the class of defect where a constant is used on
+        one code path and a hand-typed literal drifts on another (commit
+        a8355c0, "two real source defects"): ingest_lords_register has exactly
+        one Attestation write site, and this pins both of its provenance
+        branches (plain live fetch vs. a wayback_timestamp-bearing fetch) to
+        that single constant so the split cannot silently recur here.
+        """
+        from uncorrupt.staging.companies_house import _normalise_name
+
+        Company.objects.create(
+            company_number="01234567",
+            company_name="Microlink PC (UK) Ltd",
+            normalised_name=_normalise_name("Microlink PC (UK) Ltd"),
+        )
+        _write_page(tmp_path, 1, SAMPLE_HTML)
+        _write_provenance(tmp_path, wayback_timestamp=None)
+
+        ingest_lords_register(tmp_path)
+
+        live_attestations = Attestation.objects.filter(edge__source_entity__registry_id="3898")
+        assert live_attestations.exists()
+        for att in live_attestations:
+            assert att.source_name == lords_interests_module.SOURCE_NAME
+
+        # Second ingest, into a separate directory, exercises the
+        # wayback_timestamp-bearing branch (attestation_reference gains a
+        # ":<timestamp>" suffix, source_url is rewritten to the Wayback URL)
+        # without source_name drifting off the same constant.
+        wayback_dir = tmp_path / "wayback"
+        wayback_dir.mkdir()
+        _write_page(wayback_dir, 1, SAMPLE_HTML_SHAREHOLDING)
+        _write_provenance(wayback_dir, wayback_timestamp="20220101")
+
+        ingest_lords_register(wayback_dir)
+
+        wayback_attestations = Attestation.objects.filter(edge__source_entity__registry_id="4330")
+        assert wayback_attestations.exists()
+        for att in wayback_attestations:
+            assert att.source_name == lords_interests_module.SOURCE_NAME
+
 
 class TestLordsInterestsFetchProvenance:
     def test_wayback_fetch_records_observed_at_as_the_capture_date(self, tmp_path):

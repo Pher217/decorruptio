@@ -174,3 +174,151 @@ def test_resolve_supplier_disambiguates_gb_coh_and_gleif_duplicate():
     resolved = resolve_supplier("EDGE FOUNDATION", ch_cache={})
 
     assert resolved == gb_coh
+
+
+@pytest.mark.django_db
+def test_resolve_supplier_by_company_number_prefers_gb_coh_over_gleif_twins():
+    """GIVEN a company number held by two GLEIF-LEI Entities (created first,
+    so they hold the lowest database ids) and one GB-COH Entity (created
+    last) -- mirroring the real "SC214564" case, where GLEIF cross-links a
+    UK company's LEI record with its Companies House twin's company_number
+    WHEN resolve_supplier is given that company_number
+    THEN it returns the GB-COH Entity, not either GLEIF-LEI twin -- a plain
+    `.first()` on `company_number=cn` implicitly orders by id and would have
+    returned the first-created (GLEIF) row, and `officer_of` edges only
+    attach to the GB-COH node, so returning a GLEIF twin silently yields a
+    company with no officers."""
+    from scripts.phase_c_paths import resolve_supplier
+
+    Entity.objects.create(
+        entity_type="company",
+        name="N F U OF SCOTLAND",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI0000000000000NFU1",
+        company_number="SC214564",
+    )
+    Entity.objects.create(
+        entity_type="company",
+        name="NFU SCOTLAND",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI0000000000000NFU2",
+        company_number="SC214564",
+    )
+    gb_coh = Entity.objects.create(
+        entity_type="company",
+        name="NFU SCOTLAND",
+        registry_scheme="GB-COH",
+        registry_id="SC214564",
+        company_number="SC214564",
+    )
+
+    resolved = resolve_supplier("NFU SCOTLAND", ch_cache={}, company_number="SC214564")
+
+    assert resolved == gb_coh
+
+
+@pytest.mark.django_db
+def test_resolve_supplier_via_cache_company_number_is_deterministic_across_calls():
+    """GIVEN a company number sourced from the Companies House name cache
+    (not the cohort CSV's own company_number column) that is held by both a
+    GLEIF-LEI Entity (created first, lowest id) and a GB-COH Entity (created
+    second)
+    WHEN resolve_supplier is called five times with the same input
+    THEN every call returns the same GB-COH Entity -- the cache-sourced
+    lookup shares the GB-COH-preferring resolution, not a second, separately
+    broken `.first()`."""
+    from scripts.phase_c_paths import resolve_supplier
+
+    Entity.objects.create(
+        entity_type="company",
+        name="EXAMPLE GLEIF TWIN",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI0000000000000EX01",
+        company_number="00998877",
+    )
+    gb_coh = Entity.objects.create(
+        entity_type="company",
+        name="EXAMPLE LIMITED",
+        registry_scheme="GB-COH",
+        registry_id="00998877",
+        company_number="00998877",
+    )
+    ch_cache = {"EXAMPLE LIMITED": {"company_number": "00998877"}}
+
+    results = [resolve_supplier("EXAMPLE LIMITED", ch_cache) for _ in range(5)]
+
+    assert results == [gb_coh] * 5
+
+
+@pytest.mark.django_db
+def test_resolve_supplier_two_genuine_namesakes_yield_no_match():
+    """GIVEN two distinct real companies (different registry_id, different
+    company_number) that share an exact normalised name, both GB-COH so
+    prefer_companies_house cannot break the tie
+    WHEN resolve_supplier is asked to resolve that name
+    THEN it returns None -- the uniqueness guard still refuses to guess when
+    genuine ambiguity remains after GB-COH preference."""
+    from scripts.phase_c_paths import resolve_supplier
+
+    Entity.objects.create(
+        entity_type="company",
+        name="TWIN TRADING LIMITED",
+        registry_scheme="GB-COH",
+        registry_id="11112222",
+        company_number="11112222",
+    )
+    Entity.objects.create(
+        entity_type="company",
+        name="TWIN TRADING LIMITED",
+        registry_scheme="GB-COH",
+        registry_id="33334444",
+        company_number="33334444",
+    )
+
+    resolved = resolve_supplier("TWIN TRADING LIMITED", ch_cache={})
+
+    assert resolved is None
+
+
+@pytest.mark.django_db
+def test_resolve_supplier_capped_window_cannot_prove_uniqueness():
+    """GIVEN 201 companies whose name contains the same 15-character search
+    prefix: one genuine exact-name namesake created first (lowest id, so it
+    falls inside an unordered 200-row window), 199 filler companies that
+    match the substring but not the exact name, and a second genuine
+    exact-name namesake created last (highest id, so it falls outside an
+    unordered 200-row window)
+    WHEN resolve_supplier resolves that name
+    THEN it returns None -- a window that had to be capped can never be
+    trusted to prove uniqueness. Before the fix, the second namesake's
+    exclusion from the window was invisible to the guard, which saw a single
+    candidate and returned it as if it were unique."""
+    from scripts.phase_c_paths import resolve_supplier
+
+    target_name = "CAPWATCH INDUSTRIES LIMITED"
+    Entity.objects.create(
+        entity_type="company",
+        name=target_name,
+        registry_scheme="GB-COH",
+        registry_id="55550001",
+        company_number="55550001",
+    )
+    for i in range(199):
+        Entity.objects.create(
+            entity_type="company",
+            name=f"CAPWATCH INDUSTRIES FILLER {i} LIMITED",
+            registry_scheme="GB-COH",
+            registry_id=f"5555{i + 1000}",
+            company_number=f"5555{i + 1000}",
+        )
+    Entity.objects.create(
+        entity_type="company",
+        name=target_name,
+        registry_scheme="GB-COH",
+        registry_id="55559999",
+        company_number="55559999",
+    )
+
+    resolved = resolve_supplier(target_name, ch_cache={})
+
+    assert resolved is None

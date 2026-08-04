@@ -654,20 +654,83 @@ def edge_evidence_level(edge: Edge, award_date: date) -> EvidenceLevel:
     return EvidenceLevel.ATEMPORAL_CORROBORATION
 
 
-def path_evidence_level(path: Sequence[Edge], award_date: date) -> EvidenceLevel:
+def path_evidence_level(path: Sequence[Edge], award_date: date) -> EvidenceLevel | None:
     """The weakest evidence level among a path's temporally-meaningful edges.
 
     `same_as` edges assert identity, not a relationship in time — they carry
     no temporal claim to weaken and are excluded, mirroring
     `phase_c_paths.find_paths`' treatment of `same_as` as a zero-cost hop
-    exempt from the date test.
+    exempt from the date test. That exclusion is correct and must stay: an
+    identity assertion cannot weaken a temporal level it never contributed
+    to.
+
+    Returns `None` — explicitly, never an `EvidenceLevel` member — when the
+    path has NO temporally-meaningful edge at all (empty path, or every edge
+    on it is `same_as`). This used to return `EvidenceLevel.EVENT_DATED`
+    (level 1, the STRONGEST level) for that case, on the theory that "no
+    temporal edge on the path" means "nothing to weaken it" — but that is
+    fail-open: it asserts affirmative event-dated support that does not
+    exist, in a codebase whose architecture (ADR-008) is fail-closed
+    everywhere else. `None` is the honest representation of "no temporal
+    claim was made"; `EvidenceLevel` has no member for that, and inventing
+    one would misrepresent it as either evidence (weak or strong) or as
+    `NO_TRACE` (which specifically means "no path was found at all" — see
+    `relationship_evidence_level`), neither of which is true here: a path
+    WAS found, it just says nothing about timing. `relationship_evidence_level`
+    is the only caller and is written to handle `None` explicitly (see its
+    docstring for how); any new caller must do the same rather than compare
+    the result to an `EvidenceLevel` directly.
     """
     levels = [edge_evidence_level(edge, award_date) for edge in path if edge.edge_type != "same_as"]
     if not levels:
-        # A path made entirely of same_as identity hops carries no temporal
-        # claim at all — nothing on it can weaken the result.
-        return EvidenceLevel.EVENT_DATED
+        return None
     return max(levels)
+
+
+def path_min_identity_confidence(path: Sequence[Edge]) -> float | None:
+    """The weakest `same_as` identity-bridge confidence on a path.
+
+    STRICTLY POST-HOC, EXPLORATORY, NON-GATING DIAGNOSTIC METADATA. This
+    value must NEVER alter inclusion, scoring, path selection, any gate, the
+    sealed cohort, or the verdict — it may only be *reported* alongside a
+    path's evidence level. No consumer of this project currently reads
+    `Attestation.match_confidence` on a `same_as` edge for any gating
+    purpose (`gates/binding.py` deliberately excludes it — see its ADR-008
+    docstring); this function must not become the first.
+
+    The `same_as` confidence values it reads (0.60 "surname + peerage title
+    only" / 0.85 forename- or territorial-designation-verified — see
+    `identity_resolution.py`'s `CONFIDENCE_*` constants) are UNCALIBRATED
+    estimates, not probabilities. Hand-verification found 15 of 21 checked
+    cross-register identity paths were namesake collisions — two different
+    real humans sharing a name — at BOTH tiers: at 0.85, one match paired an
+    MP born 1986 with a 2002 directorship (age 15, impossible), and two
+    others carried the wrong middle name. Never read this value as "the
+    probability this identity match is correct." Reporting it fixes
+    OBSERVABILITY — a path bridged by a coin-flip identity guess no longer
+    reports identical strength to one bridged by a registry identifier — it
+    does NOT fix VALIDITY. Displaying this number does not make any
+    person-level claim on the path defensible.
+
+    Returns `None` when the path uses no identity bridge at all (no
+    `same_as` edge on it), and also when a `same_as` edge is present but
+    carries no confidence-bearing attestation — both mean "nothing to warn
+    on" to a caller and are deliberately not distinguished in the return
+    value.
+    """
+    same_as_edges = [edge for edge in path if edge.edge_type == "same_as"]
+    if not same_as_edges:
+        return None
+
+    confidences = [
+        confidence
+        for edge in same_as_edges
+        for confidence in edge.attestations.values_list("match_confidence", flat=True)
+    ]
+    if not confidences:
+        return None
+
+    return min(confidences)
 
 
 def find_all_paths(
@@ -728,11 +791,37 @@ def relationship_evidence_level(
     pre-award-observed or event-dated, the relationship is admissible at
     that level, even if other paths between the same two entities are
     weaker. No path at all is NO_TRACE, never a "refuted" level.
+
+    A path can carry NO temporal evidence at all — `path_evidence_level`
+    returns `None` for a path made entirely of `same_as` identity hops (see
+    its docstring). Such paths are excluded from the min-reduction: they say
+    nothing about timing, so they must never be compared against — or win
+    over — a path that does. If every path found is like this, there is no
+    real `EvidenceLevel` member for "a structural path exists but asserts no
+    temporal claim." This function's only consumer
+    (`scripts/measure_temporal_lift.py`) always needs a concrete
+    `EvidenceLevel` back (it calls `int(level)` / `level.name`
+    unconditionally), so — unlike `path_evidence_level`, whose only caller is
+    this function and can be given the explicit `None` — this function
+    cannot return `None` and falls back to `EvidenceLevel.ATEMPORAL_CORROBORATION`:
+    the same floor `edge_evidence_level` already uses for "this exists, but
+    corroboration/timing is unclear" (its docstring: "never returns anything
+    weaker than ATEMPORAL_CORROBORATION for an edge that exists"). This is
+    deliberately NOT `NO_TRACE` — that level means "no path was found at
+    all" (the branch immediately below), and a real path here WAS found, so
+    reporting `NO_TRACE` would be its own false claim. It is also never a
+    dated level (`EVENT_DATED`/`PRE_AWARD_OBSERVED`), which no path here
+    earned.
     """
     paths = find_all_paths(start_ids, goal_id, adj, max_hops)
     if not paths:
         return EvidenceLevel.NO_TRACE
-    return min(path_evidence_level(p, award_date) for p in paths)
+    levels = [
+        level for level in (path_evidence_level(p, award_date) for p in paths) if level is not None
+    ]
+    if not levels:
+        return EvidenceLevel.ATEMPORAL_CORROBORATION
+    return min(levels)
 
 
 # ---------------------------------------------------------------------------

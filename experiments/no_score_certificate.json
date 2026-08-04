@@ -1,13 +1,13 @@
 {
   "no_score": true,
   "certificate_version": 1,
-  "issued_at": "2026-08-04T03:21:57.003421+00:00",
+  "issued_at": "2026-08-04T04:03:40.220687+00:00",
   "freeze_state": {
-    "code_commit": "e6200aa901ea7a81cbc67076f4e606033bb06a92",
+    "code_commit": "47aa2d3e3b03fc4e7a660ff75499b227d743d7a0",
     "graph_hash": "2a913ebc475294382c931271b2ddd2539d821e7bec410d11353bcd50b5a0ca6e",
     "attestation_inclusive_hash": "c7642f0ff085bf68297f9dbee205c975550342bf9106ff127bde82662aee5465",
     "manifest_hash": "UNAVAILABLE: no file at data/gold_manifest.csv in this environment. Cohort identity for this certificate is independently checkable anyway -- see `sealed_cohort` below, which publishes all 20 company numbers inline against spec 'SEALED COHORT v2' -- recorded explicitly here rather than omitted or fabricated (ADR-008).",
-    "measured_at": "2026-08-04T03:21:50.437738+00:00",
+    "measured_at": "2026-08-04T04:03:33.373642+00:00",
     "control_fixtures_hash": "175db04d4563e4d1acc856e7f0107d658f083553e596e3a6816aa3bad4936e73"
   },
   "blockers": [
@@ -43,10 +43,24 @@
         "temporal_total": 12,
         "note": "retrieval + temporal measured live via scripts/run_ch_controls.py against fixture tests/fixtures/ch_temporal_controls.json (12 controls, sha256=bf13333548d6...). temporal_total is the runner's own raw battery size, never rescaled (see module docstring)."
       }
+    },
+    {
+      "gate": "coverage:companies_house_officer_roster",
+      "reason": "UNMEASURED: no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2).",
+      "detail": {
+        "status": "UNMEASURED"
+      }
+    },
+    {
+      "gate": "coverage:commons_register",
+      "reason": "UNMEASURED: no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2).",
+      "detail": {
+        "status": "UNMEASURED"
+      }
     }
   ],
   "adr": "ADR-008-fail-closed-measurement-boundary",
-  "note": "This certificate exists so 'we did not score' is auditable rather than discretionary (ADR-008). Every gate named in `blockers` independently blocks scoring -- fixing one does not imply the others are also fixed. This certificate measures only the four material/extra STRATUM gates (spec A2.4.3) -- Companies House, Commons, Lords, Electoral Commission. It does NOT include the separate coverage-gate family (spec A2.4.2: supplier-universe / Commons-universe ingest completeness, produced by scripts/measure_coverage_gate.py) -- a hypothetical future run where all three material strata pass would still need that script's own certificate to rule out a coverage-gate failure before scoring; this artifact alone emitting no certificate is not the same claim as 'ready to score'.",
+  "note": "This certificate exists so 'we did not score' is auditable rather than discretionary (ADR-008). Every gate named in `blockers` independently blocks scoring -- fixing one does not imply the others are also fixed. This certificate also covers the coverage-gate family (spec A2.4.2: supplier-universe / Commons-universe ingest completeness, produced by scripts/measure_coverage_gate.py) as a first-class, machine-readable part of `blockers` -- it is never silently absent. As measured this run: companies_house_officer_roster: UNMEASURED (no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2).); commons_register: UNMEASURED (no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2).). An UNMEASURED family blocks scoring exactly like a FAIL: unknown is never treated as passing (ADR-008).",
   "strata_measured": {
     "commons_declared_interest": {
       "available": true,
@@ -218,7 +232,7 @@
       "SC179860"
     ],
     "scored": false,
-    "statement": "The sealed 20-case gold cohort (spec 'SEALED COHORT v2', selection salt 'decorruptio-gold-cohort-v1:') was NOT scored and remains unspent. The pre-registered stop rule (spec amendment v2.10) fired before any gold row was evaluated: the Companies House control battery's structural ceiling (10/12 = 83.3%) cannot reach the 90% readiness gate under any amount of further ingestion. As measured, 3 gate(s) currently block scoring (stratum:commons_declared_interest, stratum:lords_declared_interest, stratum:ch_officer_appointment); see `blockers` for the exact recovered/total score behind each -- scoring proceeds only once every material stratum passes both retrieval and temporal (spec A2.4.4)."
+    "statement": "The sealed 20-case gold cohort (spec 'SEALED COHORT v2', selection salt 'decorruptio-gold-cohort-v1:') was NOT scored and remains unspent. The pre-registered stop rule (spec amendment v2.10) fired before any gold row was evaluated: the Companies House control battery's structural ceiling (10/12 = 83.3%) cannot reach the 90% readiness gate under any amount of further ingestion. As measured, 5 gate(s) currently block scoring (stratum:commons_declared_interest, stratum:lords_declared_interest, stratum:ch_officer_appointment, coverage:companies_house_officer_roster, coverage:commons_register); see `blockers` for the exact recovered/total score behind each -- scoring proceeds only once every material stratum passes both retrieval and temporal (spec A2.4.4)."
   },
   "electoral_commission_materiality": {
     "in_material_strata": false,
@@ -226,6 +240,11 @@
     "measured_total": 12,
     "passed": true,
     "caveat": "Electoral Commission scored 11/12 today, but is NOT one of run_gold_benchmark.MATERIAL_STRATA -- it neither gates scoring nor could rescue a failing material stratum. `strata_measured` alone reads as '1 of 4 strata passing'; the materially correct framing is '0 of 3 material gates passing'. A mixed path (one officer_of edge plus one donation edge) can currently qualify for CONFIRMED/PARTIAL through the Companies House gate alone, with the donation edge's own evidence completely unvalidated by any control -- the sealed cohort contains cases in exactly this position (12597000, 08126173). See uncorrupt.gates.stratum.donation_edges_are_ungated_in_scorer."
+  },
+  "coverage_gate_measured": {},
+  "coverage_gate_unmeasured": {
+    "companies_house_officer_roster": "no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2).",
+    "commons_register": "no coverage-gate report at experiments/coverage_gate.json -- scripts/measure_coverage_gate.py has not been run against this environment (spec A2.4.2)."
   },
   "verdict": "NO SCORE -- INSTRUMENT-LIMITED"
 }

@@ -20,7 +20,7 @@ This script does not reimplement measurement. It reuses, unmodified:
     `run_ch_controls.py` / `run_commons_controls.py` /
     `run_lords_controls.py` / `run_ec_controls.py`, wired there)
   * `uncorrupt.gates.certificate.build_no_score_certificate` /
-    `write_no_score_certificate`
+    `write_no_score_certificate` / `assert_all_required_families_accounted_for`
 
 What this script adds, because the generic certificate builder does not
 compute them: the Companies House structural-ceiling finding (which control
@@ -40,10 +40,22 @@ dishonest as one that hides the failures -- and an
 MATERIAL gates, not 1-of-4, since Electoral Commission is not in
 `run_gold_benchmark.MATERIAL_STRATA` and cannot gate or rescue scoring.
 
-This certificate covers only the four STRATUM gates (spec A2.4.3), never the
-separate coverage-gate family (spec A2.4.2,
-`scripts/measure_coverage_gate.py`) -- flagged explicitly in the certificate
-`note`, not silently out of scope.
+This certificate also covers the coverage-gate family (spec A2.4.2:
+supplier-universe / Commons-universe ingest completeness,
+`scripts/measure_coverage_gate.py`) as a first-class, machine-readable part
+of `blockers` -- fixing an earlier defect where that family was named only
+in prose. `_load_coverage_gate_measurements` looks for a prior
+`measure_coverage_gate.py` run's `experiments/coverage_gate.json` (reusing
+its `strict_gate` block, never re-measuring) that is BOUND to this
+certificate's own freeze state (same code_commit/graph_hash/manifest_hash);
+if none exists, is stale, or is missing an expected family, that family is
+recorded UNMEASURED -- which `build_no_score_certificate` treats as an
+unconditional blocker, never a silent omission (ADR-008: unknown is not the
+same claim as passing). `assert_all_required_families_accounted_for` is the
+structural guarantee that this script can never compute a verdict while a
+required family -- stratum or coverage -- was neither measured, marked
+UNMEASURED, nor confirmed passing; see its docstring in
+`uncorrupt.gates.certificate`.
 
 `--manifest` is used only to bind `manifest_hash` -- it is NEVER read to
 select, score, or otherwise touch the sealed gold cohort (cohort identity
@@ -88,9 +100,11 @@ from uncorrupt.gates.binding import (  # noqa: E402
     utc_now_iso,
 )
 from uncorrupt.gates.certificate import (  # noqa: E402
+    assert_all_required_families_accounted_for,
     build_no_score_certificate,
     write_no_score_certificate,
 )
+from uncorrupt.gates.coverage import CoverageMeasurement  # noqa: E402
 from uncorrupt.gates.stratum import (  # noqa: E402
     DEFAULT_CH_CONTROLS_PATH,
     DEFAULT_COMMONS_CONTROLS_PATH,
@@ -113,6 +127,15 @@ from uncorrupt.staging.models import Company  # noqa: E402
 GATE_FRACTION = 0.9
 
 DEFAULT_OUT_PATH = "experiments/no_score_certificate.json"
+
+# The two coverage-gate families spec A2.4.2 / `run_gold_benchmark.CoverageGate`
+# actually gate on (`supplier_universe_covered`/`commons_universe_covered`).
+# Lords snapshot coverage is deliberately excluded -- `CoverageGate` has no
+# field for it at all (see `uncorrupt.gates.coverage`'s module docstring);
+# it is informational only and never gates or blocks scoring.
+REQUIRED_COVERAGE_FAMILIES = ("companies_house_officer_roster", "commons_register")
+
+DEFAULT_COVERAGE_GATE_REPORT_PATH = "experiments/coverage_gate.json"
 
 
 def _manifest_hash_or_unavailable(manifest_path: Path) -> str:
@@ -323,6 +346,109 @@ def electoral_commission_materiality_note(ec_measurement: StratumMeasurement) ->
     }
 
 
+def _load_coverage_gate_measurements(
+    report_path: Path, freeze_state: GateFreezeState
+) -> tuple[dict[str, CoverageMeasurement], dict[str, str]]:
+    """Load spec A2.4.2's coverage-gate family from a prior
+    `scripts/measure_coverage_gate.py` run, if one exists and is BOUND to
+    the same code/graph/manifest state this certificate is being emitted
+    for.
+
+    Reuses the `strict_gate` block `measure_coverage_gate.py` already
+    writes -- reconstructing `CoverageMeasurement` from its own recorded
+    counts, never re-measuring (this script has no coverage-measurement
+    logic of its own).
+
+    Returns `(measured, unmeasured_reasons)`. A required family
+    (`REQUIRED_COVERAGE_FAMILIES`) lands in `unmeasured_reasons` -- never
+    silently omitted -- when: no report file exists at all, the report's
+    own binding (code_commit/graph_hash/manifest_hash -- the same three
+    fields `run_gold_benchmark.GateBinding` checks) does not match this
+    certificate's freeze state, or the report exists and is bound but does
+    not carry that family's `strict_gate` entry. A stale coverage
+    measurement -- one bound to a different code/graph/manifest state -- is
+    treated as unmeasured for THIS certificate, never silently trusted
+    (spec A2.4.5).
+    """
+    if not report_path.exists():
+        reason = (
+            f"no coverage-gate report at {report_path} -- scripts/measure_coverage_gate.py "
+            "has not been run against this environment (spec A2.4.2)."
+        )
+        return {}, dict.fromkeys(REQUIRED_COVERAGE_FAMILIES, reason)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    bound = (
+        report.get("code_commit") == freeze_state.code_commit
+        and report.get("graph_hash") == freeze_state.graph_hash
+        and report.get("manifest_hash") == freeze_state.manifest_hash
+    )
+    if not bound:
+        reason = (
+            f"coverage-gate report at {report_path} is bound to a different code/graph/"
+            f"manifest state (code_commit={report.get('code_commit')!r}, "
+            f"graph_hash={report.get('graph_hash')!r}) than this certificate "
+            f"(code_commit={freeze_state.code_commit!r}, graph_hash={freeze_state.graph_hash!r}) "
+            "-- a stale coverage measurement is never trusted for a different state (spec "
+            "A2.4.5)."
+        )
+        return {}, dict.fromkeys(REQUIRED_COVERAGE_FAMILIES, reason)
+
+    strict_gate = report.get("strict_gate", {})
+    measured: dict[str, CoverageMeasurement] = {}
+    unmeasured: dict[str, str] = {}
+    for name in REQUIRED_COVERAGE_FAMILIES:
+        entry = strict_gate.get(name)
+        if entry is None:
+            unmeasured[name] = (
+                f"coverage-gate report at {report_path} is bound to this state but carries no "
+                f"'{name}' entry in its strict_gate block."
+            )
+            continue
+        measured[name] = CoverageMeasurement(
+            name=name,
+            ingested=entry["ingested"],
+            explicitly_failed=entry["explicitly_failed"],
+            not_attempted=entry["not_attempted"],
+            total=entry["total"],
+            failure_manifest=tuple(entry.get("failure_manifest_sample", ())),
+            known_limits=tuple(entry.get("known_limits", ())),
+            extra=entry.get("extra", {}),
+        )
+    return measured, unmeasured
+
+
+def coverage_gate_note(
+    coverage_measurements: dict[str, CoverageMeasurement], unmeasured_coverage: dict[str, str]
+) -> str:
+    """Compose the certificate note's coverage-gate-family sentence from
+    what was actually loaded/measured THIS run, never a fixed claim -- a
+    certificate whose prose says a family is "not included" while its own
+    `blockers` names a `coverage:*` entry (or vice versa) would be exactly
+    the prose/data disagreement an independent review already caught once
+    in this file (see `ch_structural_ceiling`'s docstring for the earlier
+    instance of that defect class).
+    """
+    parts = []
+    for name in REQUIRED_COVERAGE_FAMILIES:
+        if name in unmeasured_coverage:
+            parts.append(f"{name}: UNMEASURED ({unmeasured_coverage[name]})")
+        else:
+            m = coverage_measurements[name]
+            parts.append(
+                f"{name}: {m.accounted_for}/{m.total} accounted for -- "
+                f"{'PASS' if m.passed else 'FAIL'}"
+            )
+    return (
+        " This certificate also covers the coverage-gate family (spec A2.4.2: "
+        "supplier-universe / Commons-universe ingest completeness, produced by "
+        "scripts/measure_coverage_gate.py) as a first-class, machine-readable part of "
+        "`blockers` -- it is never silently absent. As measured this run: "
+        f"{'; '.join(parts)}. An UNMEASURED family blocks scoring exactly like a FAIL: "
+        "unknown is never treated as passing (ADR-008)."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -334,6 +460,7 @@ def main() -> None:
     parser.add_argument("--ec-controls", default=DEFAULT_EC_CONTROLS_PATH)
     parser.add_argument("--max-hops", type=int, default=2)
     parser.add_argument("--out", default=DEFAULT_OUT_PATH)
+    parser.add_argument("--coverage-gate-report", default=DEFAULT_COVERAGE_GATE_REPORT_PATH)
     args = parser.parse_args()
 
     print("=== NO-SCORE CERTIFICATE EMISSION (ADR-008, spec amendment v2.10) ===")
@@ -372,19 +499,63 @@ def main() -> None:
     ceiling = ch_structural_ceiling(args.ch_controls)
     print(f"\n--- Companies House structural ceiling ---\n{ceiling['finding']}")
 
-    certificate = build_no_score_certificate(freeze_state, stratum_measurements=strata)
-    if certificate is None:
+    stratum_certificate = build_no_score_certificate(freeze_state, stratum_measurements=strata)
+    if stratum_certificate is None:
         # Every measured stratum passed -- there is genuinely nothing to
         # certify as no-score. Refuse rather than silently doing nothing:
         # a caller expecting NO SCORE here (spec v2.10 says CH fails) needs
         # to know its inputs disagree with the pre-registered finding, not
-        # get a silent no-op.
+        # get a silent no-op. This check is deliberately STRATUM-ONLY: an
+        # UNMEASURED coverage-gate family below would also make the
+        # combined certificate non-None, which must never mask this
+        # specific refusal (a stratum-passing state disagreeing with spec
+        # v2.10) behind an unrelated coverage blocker.
         raise SystemExit(
             "REFUSING to emit a no-score certificate: every measured stratum passed. This "
             "contradicts spec amendment v2.10 (CH 7/12 measured, below the 90% gate) -- check "
             "--ch-controls/--commons-controls/--lords-controls/--ec-controls point at the real "
             "fixtures and the graph has not changed since v2.10 was written."
         )
+
+    print("\n--- coverage-gate family (spec A2.4.2) ---")
+    coverage_measurements, unmeasured_coverage = _load_coverage_gate_measurements(
+        Path(args.coverage_gate_report), freeze_state
+    )
+    for name, reason in unmeasured_coverage.items():
+        print(f"coverage:{name}: UNMEASURED -- {reason}")
+    for name, m in coverage_measurements.items():
+        print(
+            f"coverage:{name}: {m.accounted_for}/{m.total} accounted for -- "
+            f"{'PASS' if m.passed else 'FAIL'}"
+        )
+
+    certificate = build_no_score_certificate(
+        freeze_state,
+        stratum_measurements=strata,
+        coverage_measurements=coverage_measurements,
+        unmeasured_families={
+            f"coverage:{name}": reason for name, reason in unmeasured_coverage.items()
+        },
+    )
+    # Structural guarantee (closes the fail-closed hole this script used to
+    # have): refuse to proceed unless EVERY required family -- all four
+    # strata plus both required coverage families -- was explicitly
+    # measured-and-failed, measured-and-passed, or marked UNMEASURED. Given
+    # `stratum_certificate` above already proved at least one stratum
+    # blocker exists, `certificate` here is never `None`; this assertion is
+    # the enforcement point, not a redundant check -- a future edit that
+    # forgets to pass one of these inputs trips it immediately.
+    assert_all_required_families_accounted_for(
+        required_gate_names=(
+            {f"stratum:{name}" for name in strata}
+            | {f"coverage:{name}" for name in REQUIRED_COVERAGE_FAMILIES}
+        ),
+        certificate=certificate,
+        passed_families=(
+            {f"stratum:{name}" for name, m in strata.items() if m.available and m.passed}
+            | {f"coverage:{name}" for name, m in coverage_measurements.items() if m.passed}
+        ),
+    )
 
     certificate["strata_measured"] = {
         name: {
@@ -416,21 +587,25 @@ def main() -> None:
     certificate["electoral_commission_materiality"] = electoral_commission_materiality_note(
         strata["electoral_commission"]
     )
-    # This certificate covers only the four STRATUM gates (spec A2.4.3).
-    # Appended, not replacing build_no_score_certificate's own note: a
-    # future run where all three material strata pass would emit NO
-    # certificate from this script at all, which is not the same claim as
-    # "ready to score" -- the separate coverage-gate family (spec A2.4.2,
-    # scripts/measure_coverage_gate.py) still has to be checked.
-    certificate["note"] += (
-        " This certificate measures only the four material/extra STRATUM gates (spec A2.4.3) "
-        "-- Companies House, Commons, Lords, Electoral Commission. It does NOT include the "
-        "separate coverage-gate family (spec A2.4.2: supplier-universe / Commons-universe "
-        "ingest completeness, produced by scripts/measure_coverage_gate.py) -- a hypothetical "
-        "future run where all three material strata pass would still need that script's own "
-        "certificate to rule out a coverage-gate failure before scoring; this artifact alone "
-        "emitting no certificate is not the same claim as 'ready to score'."
-    )
+    certificate["coverage_gate_measured"] = {
+        name: {
+            "ingested": m.ingested,
+            "explicitly_failed": m.explicitly_failed,
+            "not_attempted": m.not_attempted,
+            "total": m.total,
+            "passed": m.passed,
+        }
+        for name, m in coverage_measurements.items()
+    }
+    certificate["coverage_gate_unmeasured"] = dict(unmeasured_coverage)
+    # Appended, not replacing build_no_score_certificate's own note --
+    # DERIVED from what was actually loaded/measured this run
+    # (coverage_gate_note), never a fixed claim. This replaces a prior
+    # version of this sentence that hard-coded "does NOT include" the
+    # coverage-gate family regardless of what `blockers` actually
+    # contained -- exactly the prose/data disagreement this file's own
+    # `ch_structural_ceiling` docstring already names as a defect class.
+    certificate["note"] += coverage_gate_note(coverage_measurements, unmeasured_coverage)
     certificate["verdict"] = "NO SCORE -- INSTRUMENT-LIMITED"
 
     cert_path = write_no_score_certificate(args.out, certificate)

@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from uncorrupt.gates.binding import GateFreezeState
-from uncorrupt.gates.certificate import build_no_score_certificate, write_no_score_certificate
+from uncorrupt.gates.certificate import (
+    assert_all_required_families_accounted_for,
+    build_no_score_certificate,
+    write_no_score_certificate,
+)
 from uncorrupt.gates.coverage import CoverageMeasurement
 from uncorrupt.gates.stratum import StratumMeasurement
 
@@ -206,6 +212,161 @@ class TestBuildNoScoreCertificate:
         certificate = build_no_score_certificate(_freeze_state())
 
         assert certificate is None
+
+    def test_an_unmeasured_coverage_gate_appears_in_blockers(self):
+        """GIVEN a caller declares "coverage:companies_house_officer_roster"
+        as a required family it did NOT measure this run
+        WHEN a no-score certificate is built
+        THEN that exact gate is named in `blockers`, with a reason that
+        says UNMEASURED -- unknown must never be silently read as passing
+        (ADR-008), the defect this certificate's coverage-gate hole
+        actually was."""
+        certificate = build_no_score_certificate(
+            _freeze_state(),
+            unmeasured_families={
+                "coverage:companies_house_officer_roster": (
+                    "no coverage-gate report found in this environment"
+                )
+            },
+        )
+
+        assert certificate is not None
+        gates_named = [b["gate"] for b in certificate["blockers"]]
+        assert "coverage:companies_house_officer_roster" in gates_named
+        blocker = next(
+            b
+            for b in certificate["blockers"]
+            if b["gate"] == "coverage:companies_house_officer_roster"
+        )
+        assert blocker["reason"].startswith("UNMEASURED:")
+        assert blocker["detail"]["status"] == "UNMEASURED"
+
+    def test_unmeasured_and_failing_families_are_both_named_independently(self):
+        """GIVEN one failing stratum gate and one unmeasured coverage family
+        WHEN a no-score certificate is built
+        THEN both are named as independent blockers, distinguishable by
+        their reason text (a measured shortfall vs. an unmeasured family)."""
+        strata = {"ch_officer_appointment": StratumMeasurement(name="ch_officer_appointment")}
+
+        certificate = build_no_score_certificate(
+            _freeze_state(),
+            stratum_measurements=strata,
+            unmeasured_families={"coverage:commons_register": "not run this environment"},
+        )
+
+        gates_named = {b["gate"] for b in certificate["blockers"]}
+        assert gates_named == {"stratum:ch_officer_appointment", "coverage:commons_register"}
+        stratum_blocker = next(
+            b for b in certificate["blockers"] if b["gate"] == "stratum:ch_officer_appointment"
+        )
+        coverage_blocker = next(
+            b for b in certificate["blockers"] if b["gate"] == "coverage:commons_register"
+        )
+        assert not stratum_blocker["reason"].startswith("UNMEASURED:")
+        assert coverage_blocker["reason"].startswith("UNMEASURED:")
+
+    def test_declaring_an_unmeasured_family_with_everything_else_passing_still_blocks(self):
+        """GIVEN a passing coverage measurement and a passing stratum, but ONE
+        additional family declared unmeasured
+        WHEN a no-score certificate is built
+        THEN the result is NOT None -- a certificate can never end up with
+        empty `blockers` while some required family was left unevaluated,
+        even if every family that WAS measured passed."""
+        coverage = {
+            "x": CoverageMeasurement(
+                name="x", ingested=10, explicitly_failed=0, not_attempted=0, total=10
+            )
+        }
+        strata = {
+            "y": StratumMeasurement(
+                name="y",
+                available=True,
+                retrieval_recovered=9,
+                retrieval_total=10,
+                temporal_recovered=9,
+                temporal_total=10,
+            )
+        }
+
+        certificate = build_no_score_certificate(
+            _freeze_state(),
+            coverage_measurements=coverage,
+            stratum_measurements=strata,
+            unmeasured_families={"coverage:commons_register": "not run"},
+        )
+
+        assert certificate is not None
+        assert certificate["no_score"] is True
+        gates_named = {b["gate"] for b in certificate["blockers"]}
+        assert gates_named == {"coverage:commons_register"}
+
+
+class TestAssertAllRequiredFamiliesAccountedFor:
+    def test_raises_when_a_required_family_is_neither_blocked_nor_passed(self):
+        """GIVEN a certificate whose blockers name only one of two required
+        families, and no `passed_families` supplied for the other
+        WHEN the structural guarantee is checked
+        THEN it raises ValueError naming the missing family -- a verdict
+        must never be computed while a required gate family was simply
+        never evaluated."""
+        certificate = {"blockers": [{"gate": "coverage:companies_house_officer_roster"}]}
+
+        with pytest.raises(ValueError, match="coverage:commons_register"):
+            assert_all_required_families_accounted_for(
+                required_gate_names={
+                    "coverage:companies_house_officer_roster",
+                    "coverage:commons_register",
+                },
+                certificate=certificate,
+            )
+
+    def test_does_not_raise_when_every_required_family_is_a_named_blocker(self):
+        """GIVEN a certificate whose blockers name every required family
+        WHEN the structural guarantee is checked
+        THEN it does not raise."""
+        certificate = {
+            "blockers": [
+                {"gate": "stratum:ch_officer_appointment"},
+                {"gate": "coverage:commons_register"},
+            ]
+        }
+
+        assert_all_required_families_accounted_for(
+            required_gate_names={"stratum:ch_officer_appointment", "coverage:commons_register"},
+            certificate=certificate,
+        )
+
+    def test_does_not_raise_when_certificate_is_none_and_every_family_passed(self):
+        """GIVEN `certificate=None` (build_no_score_certificate's contract: no
+        blockers at all) and every required family is explicitly listed in
+        `passed_families`
+        WHEN the structural guarantee is checked
+        THEN it does not raise -- an empty-blockers certificate is a
+        legitimate "ready" state only when every family is accounted for as
+        an explicit pass."""
+        assert_all_required_families_accounted_for(
+            required_gate_names={"coverage:companies_house_officer_roster"},
+            certificate=None,
+            passed_families={"coverage:companies_house_officer_roster"},
+        )
+
+    def test_raises_when_certificate_is_none_but_a_required_family_was_never_measured(self):
+        """GIVEN `certificate=None` and `passed_families` does NOT list every
+        required family
+        WHEN the structural guarantee is checked
+        THEN it raises -- `certificate=None` alone never proves every
+        family was actually evaluated; this is the exact scenario the
+        certificate's coverage-gate hole represents: no blockers, but a
+        required family that was simply never checked."""
+        with pytest.raises(ValueError, match="coverage:commons_register"):
+            assert_all_required_families_accounted_for(
+                required_gate_names={
+                    "coverage:companies_house_officer_roster",
+                    "coverage:commons_register",
+                },
+                certificate=None,
+                passed_families={"coverage:companies_house_officer_roster"},
+            )
 
 
 class TestWriteNoScoreCertificate:

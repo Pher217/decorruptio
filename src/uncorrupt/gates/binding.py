@@ -27,12 +27,32 @@ This package cannot change `GateBinding.matches()` (out of scope). Instead,
 every gate artifact this package writes ALSO records
 `attestation_inclusive_hash` (`compute_attestation_inclusive_hash()` below),
 and `GateFreezeState.matches_recorded()` -- used by this package's own
-`certificate` module, never by `run_gold_benchmark.py` -- checks all four
-fields, not three. A caller that only trusts `run_gold_benchmark.py`'s own
-binding check will still miss attestation-only drift; a caller that also
-checks `attestation_inclusive_hash` will not. **Flagged, not silently
-worked around**: `run_gold_benchmark.py`'s own binding remains blind to this
-class of drift until that file is amended by whoever owns it.
+`certificate` module, never by `run_gold_benchmark.py` -- checks every
+field this class carries (five, as of `control_fixtures_hash` below). A
+caller that only trusts `run_gold_benchmark.py`'s own binding check will
+still miss attestation-only drift; a caller that also checks
+`attestation_inclusive_hash` will not. **Flagged, not silently worked
+around**: `run_gold_benchmark.py`'s own binding remains blind to this class
+of drift until that file is amended by whoever owns it.
+
+THE FIXTURE-UNBOUND GAP -- the second gap `control_fixtures_hash` closes.
+An independent review found that none of `code_commit`/`graph_hash`/
+`attestation_inclusive_hash`/`manifest_hash` reflect the CONTENT of the
+external control-battery fixtures (`tests/fixtures/*_controls.json`)
+`uncorrupt.gates.stratum` reads: `code_commit` is `git rev-parse HEAD`,
+which does not change when a tracked fixture is edited in the working tree
+(committed or not). An edited-or-substituted fixture producing a different
+stratum-gate score therefore still satisfies both `GateBinding.matches()`
+and (before this field existed) `GateFreezeState.matches_recorded()`.
+`control_fixtures_hash` -- populated via
+`uncorrupt.gates.stratum.compute_control_fixtures_hash()` by
+`scripts/measure_stratum_gates.py` only (`scripts/measure_coverage_gate.py`
+has no stratum fixtures to bind and leaves it at its `""` default) -- makes
+that content externally visible and auditable. It does not by itself
+PREVENT a manipulated fixture from producing a passing score (see
+`uncorrupt.gates.stratum.MIN_CONTROL_BATTERY_SIZE` for the enforcement
+half); it ensures a manipulated fixture cannot pass unnoticed as
+"unchanged" the way the other four fields would let it.
 """
 
 from __future__ import annotations
@@ -86,6 +106,13 @@ class GateFreezeState:
     `to_binding_dict()` round-trips through that class unchanged.
     `attestation_inclusive_hash` is the extra field this package's own
     `certificate` module additionally verifies (see module docstring).
+    `control_fixtures_hash` defaults to `""` (unbound) -- only
+    `scripts/measure_stratum_gates.py` has control-battery fixtures to hash
+    (via `uncorrupt.gates.stratum.compute_control_fixtures_hash()`);
+    `scripts/measure_coverage_gate.py` has none and leaves it at the
+    default, which two coverage-only freeze states will always share --
+    that is correct, not a gap, since coverage measurements do not read a
+    control fixture at all.
     """
 
     code_commit: str
@@ -93,16 +120,20 @@ class GateFreezeState:
     attestation_inclusive_hash: str
     manifest_hash: str
     measured_at: str
+    control_fixtures_hash: str = ""
 
     def to_binding_dict(self) -> dict[str, str]:
         """Fields to merge into any gate JSON this package writes.
 
         Field names match `run_gold_benchmark.GateBinding.matches()`'s own
         `data.get(...)` calls exactly (`code_commit`, `graph_hash`,
-        `manifest_hash`) plus the extra `attestation_inclusive_hash` and a
-        human-auditable `measured_at` timestamp neither `GateBinding` nor
-        the scorer reads, but every write-back trigger in this project
-        requires ("bind... UTC timestamp").
+        `manifest_hash`) plus the extra `attestation_inclusive_hash`,
+        `control_fixtures_hash`, and a human-auditable `measured_at`
+        timestamp none of `GateBinding` or the scorer read, but every
+        write-back trigger in this project requires ("bind... UTC
+        timestamp"). The two extra fields are inert to `GateBinding.matches
+        ()` (unknown keys, ignored by its `data.get(...)` checks) -- purely
+        additive, never a behaviour change for the scorer.
         """
         return {
             "code_commit": self.code_commit,
@@ -110,19 +141,23 @@ class GateFreezeState:
             "attestation_inclusive_hash": self.attestation_inclusive_hash,
             "manifest_hash": self.manifest_hash,
             "measured_at": self.measured_at,
+            "control_fixtures_hash": self.control_fixtures_hash,
         }
 
     def matches_recorded(self, data: dict) -> bool:
         """Stricter than `run_gold_benchmark.GateBinding.matches()`: also
-        requires `attestation_inclusive_hash` to match, so an attestation-
-        only ingest since this state was recorded is caught even though the
-        scorer's own three-field check would miss it (see module docstring).
+        requires `attestation_inclusive_hash` AND `control_fixtures_hash` to
+        match, so an attestation-only ingest OR an edited/substituted
+        control fixture since this state was recorded is caught even though
+        the scorer's own three-field check would miss both (see module
+        docstring).
         """
         return (
             data.get("code_commit") == self.code_commit
             and data.get("graph_hash") == self.graph_hash
             and data.get("attestation_inclusive_hash") == self.attestation_inclusive_hash
             and data.get("manifest_hash") == self.manifest_hash
+            and data.get("control_fixtures_hash", "") == self.control_fixtures_hash
         )
 
 

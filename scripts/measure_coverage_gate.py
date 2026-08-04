@@ -70,6 +70,7 @@ from uncorrupt.gates.certificate import (  # noqa: E402
 )
 from uncorrupt.gates.coverage import (  # noqa: E402
     DEFAULT_CH_OUTPUT_DIR,
+    DEFAULT_COMMONS_INGEST_PROVENANCE_PATH,
     CoverageMeasurement,
     measure_ch_officer_coverage,
     measure_commons_coverage,
@@ -99,6 +100,15 @@ def main() -> None:
         default=None,
         help="skip the live Commons Interests API call and use this totalResults value "
         "instead (offline runs, or pinning a prior reading).",
+    )
+    parser.add_argument(
+        "--commons-provenance",
+        default=DEFAULT_COMMONS_INGEST_PROVENANCE_PATH,
+        help="path to the Commons ingest's own parliament_interests.provenance.json (written "
+        "by fetch_parliament_interests) -- if it records a RegisteredFrom/RegisteredTo window, "
+        "the live totalResults denominator query is windowed to match, instead of silently "
+        "assuming an unwindowed fetch. Pass an empty string to skip the read outright (still "
+        "documented in known_limits, never silent). Ignored with --commons-total-override.",
     )
     parser.add_argument(
         "--lords-snapshot-dir",
@@ -135,7 +145,7 @@ def main() -> None:
         commons = measure_commons_coverage(total_results=args.commons_total_override)
     else:
         print("querying live Commons Interests API for totalResults...")
-        commons = measure_commons_coverage()
+        commons = measure_commons_coverage(ingest_provenance_path=args.commons_provenance or None)
     _print_measurement("commons_register", commons)
 
     lords_members = lords_interests = None
@@ -180,6 +190,7 @@ def main() -> None:
                 "not_attempted": commons.not_attempted,
                 "total": commons.total,
                 "known_limits": list(commons.known_limits),
+                "extra": commons.extra,
             },
         },
     }

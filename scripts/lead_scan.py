@@ -1,12 +1,14 @@
 """lead_scan.py -- a reproducible, committed two-hop investigative-lead funnel.
 
-`findings.md` SS6 publishes a funnel (13,258 candidate awardee companies -> 2,912
-resolved to a graph Entity -> 165 with any 2-hop path -> 96 pre-award, 135
-paths) and one named investigative lead derived from it. No committed script
-produces those numbers: a repo-wide search (`scripts/`, `experiments/`,
-`.consult/`, `git log --all`) turns up nothing beyond `phase_c_paths.py` itself
-(a different, smaller 52-row VIP-lane cohort test) -- see `findings.md` SS4.29.
-The driver was a one-off, run once and never committed.
+The vault note `02 Projects/Ideas/Decorruptio/findings.md` SS6 publishes a
+funnel (13,258 candidate awardee companies -> 2,912 resolved to a graph
+Entity -> 165 with any 2-hop path -> 96 pre-award, 135 paths) and one named
+investigative lead derived from it. That note lives in the Obsidian vault,
+not this repository. No committed script produces those numbers: a
+repo-wide search (`scripts/`, `experiments/`, `.consult/`, `git log --all`)
+turns up nothing beyond `phase_c_paths.py` itself (a different, smaller
+52-row VIP-lane cohort test) -- see `findings.md` SS4.29 in that same vault
+note. The driver was a one-off, run once and never committed.
 
 THIS SCRIPT DOES NOT REPRODUCE THAT FUNNEL. It establishes a new, independently
 reproducible baseline going forward, using the exact traversal primitives
@@ -25,40 +27,59 @@ time auditable, METHOD.
 Method, deliberately mirroring `findings.md` SS6.1's own description so the
 question being asked stays the same even though the driver code does not:
 
-  1. candidates  -- distinct `SupplierResolution.company_number` for
-     `source_id="uk_contracts_finder"`. The sealed cohort is NOT excluded here
-     (SS6.1 excluded 23 sealed-cohort numbers) -- excluding it would require
+  1. candidates  -- distinct, NORMALISED `SupplierResolution.company_number`
+     for `source_id="uk_contracts_finder"` (see `build_candidates`'s
+     docstring for why normalisation is needed to avoid double-counting one
+     company under two spellings). The sealed cohort is NOT excluded here
+     (SS6.1 excluded 20 sealed-cohort numbers) -- excluding it would require
      reading `SEALED_COHORT_V2_COMPANY_NUMBERS` (`scripts/run_gold_benchmark.py`)
      as an input, which this script's scope forbids: it is exploratory
      analysis, not a scorer, and must never touch the sealed cohort, the
-     gates, or anything resembling a score or verdict.
+     gates, or anything resembling a score or verdict. See
+     `SEALED_COHORT_OVERLAP_NOTE` for the measured, benign overlap this
+     deviation produces.
   2. resolved     -- candidates that resolve to a graph `Entity` by
      `company_number` ALONE (registry-ID-only; see `resolve_candidates`'s
      docstring for why the name-fallback tier of `resolve_supplier` is
-     deliberately not engaged here).
-  3. any_2hop_path -- resolved candidates with at least one path (dated or
-     not) within `max_hops` of any `UK-PARLIAMENT-MEMBER` entity.
+     deliberately not engaged here). As of this writing, candidates only
+     cover suppliers that already have a `SupplierResolution` row at all --
+     55.0% of real awardee supplier names do not (see `stage1_context` in
+     the emitted report), so `resolved` is a fraction of a fraction; do not
+     read `resolved / candidates` as visibility into the full awardee
+     population.
+  3. any_path_within_max_hops -- resolved candidates with at least one path
+     (dated or not) within `max_hops` of any `UK-PARLIAMENT-MEMBER` entity.
+     Named generically, not "any_2hop_path", because `max_hops` is a CLI
+     argument: the key and the caveat text both describe whatever hop budget
+     the run actually used (see `INVESTIGATIVE_LEAD_CAVEAT_TEMPLATE`).
   4. pre_award    -- resolved candidates with at least one path whose dated
-     edges all precede that company's own earliest resolved award date.
+     edges all precede that company's own earliest resolved award date. A
+     resolved candidate whose only path(s) are fully dated but NOT before
+     that cutoff is `dated_post_award`, not `undated_only` -- see `scan`'s
+     docstring for why conflating the two would hide a real negative finding
+     behind a "no data" label.
 
 Resolution failures are reported, never silently dropped: a candidate whose
 `company_number` never resolves is `unresolved`, distinct from a resolved
 candidate with no path (`no_path`), distinct again from a resolved candidate
 with a path but no known award date to test pre-award admissibility against
-(`path_no_award_date`) -- conflating any of these would let poor matching or
-missing data masquerade as a negative finding.
+(`path_no_award_date`), distinct again from a resolved candidate whose only
+path(s) are dated but fall on or after the award (`dated_post_award`) --
+conflating any of these would let poor matching or missing data masquerade
+as a negative finding, or a real negative masquerade as missing data.
 
 Every person named in the output is described strictly by what the underlying
-registers factually attest. A recovered two-hop path is an investigative lead
-for a human, never an allegation (ADR-000). `same_as` identity-bridge
-confidences are uncalibrated match-method labels, not probabilities --
-hand-verification of a prior scan found 15 of 21 checked cross-register
-identity paths were namesake collisions at BOTH confidence tiers, including an
-MP whose matched appointment would have made him 15 years old. See
-`NOT_HISTORICAL_FUNNEL_STATEMENT`, `INVESTIGATIVE_LEAD_CAVEAT` and
-`CONFIDENCE_CAVEAT` below -- all three are written into the emitted JSON
-artifact itself, not just this docstring, so a reader of the JSON in isolation
-cannot mistake it for the historical figures or an accusation.
+registers factually attest. A recovered path within the run's hop budget is
+an investigative lead for a human, never an allegation (ADR-000). `same_as`
+identity-bridge confidences are uncalibrated match-method labels, not
+probabilities -- hand-verification of a prior scan found 15 of 21 checked
+cross-register identity paths were namesake collisions at BOTH confidence
+tiers, including an MP whose matched appointment would have made him 15
+years old. See `NOT_HISTORICAL_FUNNEL_STATEMENT`,
+`INVESTIGATIVE_LEAD_CAVEAT_TEMPLATE` and `CONFIDENCE_CAVEAT` below -- all
+three are written into the emitted JSON artifact itself, not just this
+docstring, so a reader of the JSON in isolation cannot mistake it for the
+historical figures or an accusation.
 
 Read-only by design: every DB access below is a `.filter`/`.values_list`
 query; nothing in this module writes to the graph, applies a migration,
@@ -78,9 +99,18 @@ Deterministic and re-runnable: candidates are iterated in sorted
 their edge-id tuple before being capped/reported, so the DB's own (unordered)
 row-scan order for `Edge.objects.all()` inside `build_adjacency` can never
 change which paths get reported or in what order, even though it is not
-itself modified here. `UK-PARLIAMENT-MEMBER` start ids are threaded through as
-a Python `set[int]`, whose iteration order for a fixed set of ints is stable
-across runs in CPython (int hashing is not randomised, unlike str/bytes).
+itself modified here. `UK-PARLIAMENT-MEMBER` start ids are threaded through
+as a Python `set[int]`. CPython does not randomise `int` hashing the way it
+randomises `str`/`bytes` (`hash(n) == n` for small non-negative ints), but
+that does NOT make a `set[int]`'s iteration order insertion-order-independent
+-- it only means the order is *reproducible* across runs, not that it is
+*sorted* or *insertion-order-agnostic*. Two ids that collide in the same hash
+bucket (e.g. 1 and 9, which both land on slot 1 of an 8-slot table -- `1 % 8
+== 9 % 8 == 1`) iterate in INSERTION order, not numeric order: `{1, 9}`
+iterates `[1, 9]` but `{9, 1}` iterates `[9, 1]`. The explicit
+`sorted(reportable_pre_award, key=_sort_key)` call in `scan` is what actually
+makes the reported path order deterministic and edge-id-ascending; the set's
+own hash-driven order is not to be relied on for that.
 
 Usage:
     PYTHONPATH=.:src python scripts/lead_scan.py
@@ -100,7 +130,12 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
-from scripts.phase_c_paths import build_adjacency, find_paths, resolve_supplier  # noqa: E402
+from scripts.phase_c_paths import (  # noqa: E402
+    build_adjacency,
+    find_paths,
+    normalise_company_number,
+    resolve_supplier,
+)
 
 from uncorrupt.graph.models import Edge, Entity  # noqa: E402
 from uncorrupt.graph.register_snapshots import path_min_identity_confidence  # noqa: E402
@@ -112,31 +147,75 @@ MEMBER_REGISTRY_SCHEME = "UK-PARLIAMENT-MEMBER"
 DEFAULT_MAX_HOPS = 2
 DEFAULT_OUT = "experiments/lead_scan.json"
 
-NOT_HISTORICAL_FUNNEL_STATEMENT = (
-    "This is a NEW, independently reproducible baseline, NOT a reproduction of "
-    "findings.md SS6's published 13,258 / 2,912 / 165 / 96 / 135 funnel. That "
-    "funnel's driver script was never committed to this repo (confirmed absent "
-    "via grep across scripts/, experiments/, .consult/, and `git log --all` -- "
-    "findings.md SS4.29) and cannot be reproduced, diffed, or audited against "
-    "this one. A later reconstruction using this same registry-ID-only "
-    "resolution method resolved approximately 93% of company-number candidates "
-    "to a graph Entity where the originally published figure was approximately "
-    "22%; that discrepancy could not be explained because the original driver "
-    "no longer exists, and a stale-graph explanation was directly ruled out "
-    "(entity and edge counts confirmed identical throughout). Do not compare "
-    "this script's funnel numbers against the historical ones as if they "
-    "measured the same run -- they ask the same question with a different, "
-    "this time auditable, method."
+_FINDINGS_MD_CITATION = (
+    "the vault note `02 Projects/Ideas/Decorruptio/findings.md` (not present in "
+    "this repository -- it lives in the Obsidian vault, not the code repo)"
 )
 
-INVESTIGATIVE_LEAD_CAVEAT = (
-    "A recovered two-hop path is an investigative lead for a human, never an "
-    "allegation (ADR-000). Every person named below is described strictly by "
-    "what the underlying registers factually attest -- a same_as identity "
-    "bridge, an officer_of appointment, a declared interest, or a donation -- "
-    "never by any conclusion this script draws. This script is exploratory "
-    "analysis, not a scorer: it does not read the sealed cohort, and it does "
-    "not emit a score or a verdict."
+NOT_HISTORICAL_FUNNEL_STATEMENT = (
+    "This is a NEW, independently reproducible baseline, NOT a reproduction of "
+    f"{_FINDINGS_MD_CITATION} SS6's published 13,258 / 2,912 / 165 / 96 / 135 "
+    "funnel. That funnel's driver script was never committed to this repo "
+    "(confirmed absent via grep across scripts/, experiments/, .consult/, and "
+    f"`git log --all` -- {_FINDINGS_MD_CITATION} SS4.29) and cannot be "
+    "reproduced, diffed, or audited against this one. A later reconstruction "
+    "using this same registry-ID-only resolution method resolved approximately "
+    "93% of company-number candidates to a graph Entity where the originally "
+    "published figure was approximately 22%; that discrepancy could not be "
+    "explained because the original driver no longer exists, and a stale-graph "
+    "explanation was directly ruled out (entity and edge counts confirmed "
+    "identical throughout). Do not compare this script's funnel numbers "
+    "against the historical ones as if they measured the same run -- they ask "
+    "the same question with a different, this time auditable, method."
+)
+
+# {max_hops} is filled in with the actual value the run used -- see
+# `_investigative_lead_caveat` below. A previous version of this text
+# hardcoded "two-hop", which stayed on screen and in the emitted JSON even
+# when `--max-hops` was run at a different value: a company reachable only
+# via a 3-hop path (4 edges: 1 same_as + 3 real relationship edges) would be
+# published under the funnel key `any_2hop_path` and the caveat "A recovered
+# two-hop path is an investigative lead" while `max_hops: 3` sat right next
+# to it in the same artifact -- self-contradicting about a named person.
+INVESTIGATIVE_LEAD_CAVEAT_TEMPLATE = (
+    "A recovered path of at most {max_hops} hop(s) is an investigative lead "
+    "for a human, never an allegation (ADR-000). Every person named below is "
+    "described strictly by what the underlying registers factually attest -- "
+    "a same_as identity bridge, an officer_of appointment, a declared "
+    "interest, or a donation -- never by any conclusion this script draws. "
+    "This script is exploratory analysis, not a scorer: it does not read the "
+    "sealed cohort, and it does not emit a score or a verdict."
+)
+
+
+def _investigative_lead_caveat(max_hops: int) -> str:
+    """The investigative-lead caveat, worded for the hop budget actually used.
+
+    Keeps the caveat text and the `any_path_within_max_hops` funnel key
+    truthful for any `--max-hops` value, not just the default of 2 --
+    see the template's comment above for the contradiction this closes.
+    """
+    return INVESTIGATIVE_LEAD_CAVEAT_TEMPLATE.format(max_hops=max_hops)
+
+
+# Deliberately NOT excluded from `candidates` -- see `build_candidates`'s
+# docstring for why. Measured against the live graph: of the 20 numbers in
+# `SEALED_COHORT_V2_COMPANY_NUMBERS` (`scripts/run_gold_benchmark.py`), 6
+# resolve and appear as rows in this script's own output, and 0 of those 6
+# land in `pre_award` (all 6 are `no_path`). Benign as measured, but stated
+# here so a reader of the artifact knows sealed-benchmark company numbers can
+# appear among its rows -- this script does not import or read the sealed
+# cohort at runtime to produce this figure; it is a hardcoded, one-time,
+# manually verified fact, consistent with this module's invariant that it
+# must never touch the sealed cohort, the gates, or anything score-shaped.
+SEALED_COHORT_OVERLAP_NOTE = (
+    "This script does NOT exclude the sealed benchmark cohort from its "
+    "candidate set (a documented deviation from findings.md SS6.1, which "
+    "excluded 20 sealed-cohort company numbers). As measured against the "
+    "graph this caveat was written against: 6 of the 20 sealed-cohort company "
+    "numbers resolve and appear as rows below, and 0 of those 6 are "
+    "'pre_award' (all 6 are 'no_path') -- benign as measured, but a reader "
+    "should know sealed-benchmark company numbers can appear among these rows."
 )
 
 CONFIDENCE_CAVEAT = (
@@ -155,7 +234,7 @@ CONFIDENCE_CAVEAT = (
 
 
 def build_candidates() -> dict[str, date | None]:
-    """distinct `SupplierResolution.company_number` -> earliest resolved award date, or `None`.
+    """distinct NORMALISED `SupplierResolution.company_number` -> earliest award date, or None.
 
     Mirrors `findings.md` SS6.1's own definition of the candidate set: distinct
     `SupplierResolution.company_number` for `source_id="uk_contracts_finder"`.
@@ -163,19 +242,35 @@ def build_candidates() -> dict[str, date | None]:
     docstring for why (excluding it would require reading it as an input,
     which this script's scope forbids).
 
+    Company numbers are normalised (`phase_c_paths.normalise_company_number`)
+    BEFORE they become candidate keys, not just at resolution time. Upstream
+    staging stores the raw `supplier_id` on a Companies House miss and the
+    normalised spelling on a hit (e.g. `"4125764"` vs `"04125764"` for the
+    same real company), so two different strings can name one company. A
+    company that shows up under both spellings must collapse to ONE
+    candidate here -- otherwise it is counted twice in `candidates`, and if
+    both spellings ever resolve, the same person and company would be
+    emitted as two separate pre-award leads. This script does not touch the
+    upstream staging table; it only normalises its own candidate key.
+
     A candidate's cutoff is the EARLIEST `Award.award_date` among every
     `supplier_name` that resolved to its `company_number` (more than one
-    supplier-name string can resolve to the same company). `None` means no
-    dated award was found for this candidate at all -- reported honestly via
-    the `path_no_award_date` status downstream, never silently defaulted to a
-    permissive or restrictive date.
+    supplier-name string can resolve to the same company, now including
+    different-spelling company-number strings that normalise to the same
+    one). `None` means no dated award was found for this candidate at all --
+    reported honestly via the `path_no_award_date` status downstream, never
+    silently defaulted to a permissive or restrictive date.
     """
-    supplier_to_company: dict[str, str] = dict(
+    raw_pairs = (
         SupplierResolution.objects.filter(source_id=SOURCE_ID)
         .exclude(company_number__isnull=True)
         .exclude(company_number="")
         .values_list("supplier_name", "company_number")
     )
+    supplier_to_company: dict[str, str] = {
+        supplier_name: normalise_company_number(company_number)
+        for supplier_name, company_number in raw_pairs
+    }
 
     cutoffs: dict[str, date] = {}
     awards = (
@@ -272,7 +367,25 @@ def _sort_key(path: list[Edge]) -> tuple[int, ...]:
     return tuple(edge.id for edge in path)
 
 
-def _serialize_pre_award_path(
+def _path_fully_dated(path: list[Edge]) -> bool:
+    """Does every real (non-`same_as`) edge on this path carry a `valid_from`?
+
+    `find_paths` returns a path in its `undated` bucket whenever it is NOT
+    admissible pre-award -- either because some real edge has no date at all,
+    OR because every real edge IS dated but on or after the cutoff. Those are
+    different facts: the first is missing data, the second is a dated
+    relationship that happens to have started after the award (dispositive
+    evidence about timing, not an absence of evidence). This distinguishes
+    them so `scan` can report the second case as `dated_post_award` instead
+    of folding it into `undated_only`. A path with no real edges at all
+    (same_as-only, which cannot occur since a path always ends on a
+    non-same_as edge into the company) is treated as not fully dated.
+    """
+    real_edges = [edge for edge in path if edge.edge_type != "same_as"]
+    return bool(real_edges) and all(edge.valid_from is not None for edge in real_edges)
+
+
+def _serialize_path(
     path: list[Edge],
     member_ids: set[int],
     members_by_id: dict[int, Entity],
@@ -300,10 +413,12 @@ def _unresolved_row(company_number: str) -> dict[str, Any]:
         "company_entity": None,
         "status": "unresolved",
         "award_cutoff": None,
-        "any_2hop_path": False,
+        "any_path_within_max_hops": False,
         "n_pre_award_paths": 0,
+        "n_dated_post_award_paths": 0,
         "n_undated_paths": None,
         "pre_award_paths": [],
+        "dated_post_award_paths": [],
     }
 
 
@@ -320,8 +435,20 @@ def scan(
     One `find_paths` call per resolved candidate, exactly as
     `findings.md` SS6.1 describes running it. When a candidate's award cutoff
     is unknown, `date.max` is used ONLY to test structural path existence
-    (`any_2hop_path`) -- the resulting paths are never reported as
+    (`any_path_within_max_hops`) -- the resulting paths are never reported as
     `pre_award`, since there is no real cutoff to test them against.
+
+    Status vocabulary (mutually exclusive, see module docstring):
+    `unresolved` (handled by `_unresolved_row`, before this branch) /
+    `no_path` / `undated_only` / `dated_post_award` / `path_no_award_date` /
+    `pre_award`. `undated_only` vs `dated_post_award` is the one distinction
+    computed here rather than read straight off `find_paths`: `find_paths`'
+    own `undated` bucket mixes "some real edge has no date at all" with
+    "every real edge is dated but on or after the cutoff" -- see
+    `_path_fully_dated`. Only the first is genuinely `undated_only`; the
+    second is dispositive-negative evidence (the relationship is dated, and
+    it started after the award) and is reported as `dated_post_award`
+    instead, never silently folded into "no data".
     """
     rows: list[dict[str, Any]] = []
     for company_number in sorted(candidates):
@@ -336,20 +463,25 @@ def scan(
         )
         any_path_found = bool(pre_award or undated)
 
+        reportable_pre_award: list[list[Edge]] = []
+        reportable_dated_post_award: list[list[Edge]] = []
         if cutoff is None:
             status = "path_no_award_date" if any_path_found else "no_path"
-            reportable_pre_award: list[list[Edge]] = []
         elif pre_award:
             status = "pre_award"
             reportable_pre_award = pre_award
         elif undated:
-            status = "undated_only"
-            reportable_pre_award = []
+            fully_dated = [p for p in undated if _path_fully_dated(p)]
+            if fully_dated:
+                status = "dated_post_award"
+                reportable_dated_post_award = fully_dated
+            else:
+                status = "undated_only"
         else:
             status = "no_path"
-            reportable_pre_award = []
 
         sorted_pre_award = sorted(reportable_pre_award, key=_sort_key)
+        sorted_dated_post_award = sorted(reportable_dated_post_award, key=_sort_key)
         rows.append(
             {
                 "company_number": company_number,
@@ -357,12 +489,16 @@ def scan(
                 "company_entity": entity.name,
                 "status": status,
                 "award_cutoff": cutoff.isoformat() if cutoff else None,
-                "any_2hop_path": any_path_found,
+                "any_path_within_max_hops": any_path_found,
                 "n_pre_award_paths": len(sorted_pre_award),
+                "n_dated_post_award_paths": len(sorted_dated_post_award),
                 "n_undated_paths": len(undated) if cutoff is not None else None,
                 "pre_award_paths": [
-                    _serialize_pre_award_path(p, member_ids, members_by_id, entity)
-                    for p in sorted_pre_award
+                    _serialize_path(p, member_ids, members_by_id, entity) for p in sorted_pre_award
+                ],
+                "dated_post_award_paths": [
+                    _serialize_path(p, member_ids, members_by_id, entity)
+                    for p in sorted_dated_post_award
                 ],
             }
         )
@@ -371,17 +507,20 @@ def scan(
 
 def compute_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
     """Aggregate row statuses into the funnel. Every resolved row lands in
-    exactly one of `no_path` / `undated_only` / `path_no_award_date` /
-    `pre_award_companies` -- see `scan`'s status assignment -- so those four
-    always sum to `resolved`, and `resolved + unresolved == candidates`.
+    exactly one of `no_path` / `undated_only` / `dated_post_award` /
+    `path_no_award_date` / `pre_award_companies` -- see `scan`'s status
+    assignment -- so those five always sum to `resolved`, and
+    `resolved + unresolved == candidates`.
     """
     funnel = {
         "candidates": len(rows),
         "resolved": 0,
         "unresolved": 0,
-        "any_2hop_path": 0,
+        "any_path_within_max_hops": 0,
         "no_path": 0,
         "undated_only": 0,
+        "dated_post_award_companies": 0,
+        "dated_post_award_paths_total": 0,
         "path_no_award_date": 0,
         "pre_award_companies": 0,
         "pre_award_paths_total": 0,
@@ -391,11 +530,14 @@ def compute_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
             funnel["unresolved"] += 1
             continue
         funnel["resolved"] += 1
-        if row["any_2hop_path"]:
-            funnel["any_2hop_path"] += 1
+        if row["any_path_within_max_hops"]:
+            funnel["any_path_within_max_hops"] += 1
         if row["status"] == "pre_award":
             funnel["pre_award_companies"] += 1
             funnel["pre_award_paths_total"] += row["n_pre_award_paths"]
+        elif row["status"] == "dated_post_award":
+            funnel["dated_post_award_companies"] += 1
+            funnel["dated_post_award_paths_total"] += row["n_dated_post_award_paths"]
         elif row["status"] == "undated_only":
             funnel["undated_only"] += 1
         elif row["status"] == "path_no_award_date":
@@ -403,6 +545,44 @@ def compute_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
         else:
             funnel["no_path"] += 1
     return funnel
+
+
+def _stage1_context() -> dict[str, Any]:
+    """How far downstream `candidates` starts, against the real awardee population.
+
+    `candidates` is scoped to `SupplierResolution` rows that already exist for
+    `source_id="uk_contracts_finder"` -- it says nothing about awardee supplier
+    names with NO `SupplierResolution` row at all (never attempted, or attempted
+    and not persisted). Measured against the live graph, 55.0% of distinct
+    awardee supplier names in `Award` have no `SupplierResolution` row: a reader
+    seeing `candidates: 13,124 -> resolved: ~12,200` could infer ~93% graph
+    visibility into awardees, when against the real awardee population it is
+    roughly 31% (resolved / total awardee names). This makes that denominator
+    explicit in the artifact instead of leaving it to be inferred.
+    """
+    awardee_names = set(
+        Award.objects.filter(source_id=SOURCE_ID).values_list("supplier_name", flat=True)
+    )
+    resolution_names = set(
+        SupplierResolution.objects.filter(source_id=SOURCE_ID).values_list(
+            "supplier_name", flat=True
+        )
+    )
+    without_resolution = awardee_names - resolution_names
+    total = len(awardee_names)
+    return {
+        "awardee_supplier_names_total": total,
+        "awardee_supplier_names_without_supplier_resolution_row": len(without_resolution),
+        "pct_awardee_supplier_names_without_supplier_resolution_row": (
+            round(100 * len(without_resolution) / total, 1) if total else None
+        ),
+        "note": (
+            "`candidates` below counts only SupplierResolution rows that already "
+            "exist for this source; the percentage above is the share of real "
+            "awardee supplier names (from Award) that have none at all, and are "
+            "therefore not `candidates`, not `unresolved`, not any status below."
+        ),
+    }
 
 
 def _git_commit() -> str | None:
@@ -433,13 +613,18 @@ def build_report(max_hops: int = DEFAULT_MAX_HOPS) -> dict[str, Any]:
 
     return {
         "not_a_reproduction_of_historical_funnel": NOT_HISTORICAL_FUNNEL_STATEMENT,
-        "investigative_lead_caveat": INVESTIGATIVE_LEAD_CAVEAT,
+        "investigative_lead_caveat": _investigative_lead_caveat(max_hops),
         "identity_confidence_caveat": CONFIDENCE_CAVEAT,
+        "sealed_cohort_overlap_note": SEALED_COHORT_OVERLAP_NOTE,
+        "stage1_context": _stage1_context(),
         "graph_state": {
             "commit": _git_commit(),
             "entities": Entity.objects.count(),
             "edges": Edge.objects.count(),
             "same_as_edges": Edge.objects.filter(edge_type="same_as").count(),
+            "supplier_resolution_rows": SupplierResolution.objects.filter(
+                source_id=SOURCE_ID
+            ).count(),
         },
         "max_hops": max_hops,
         "funnel": funnel,
@@ -452,6 +637,15 @@ def main() -> None:
     parser.add_argument("--max-hops", type=int, default=DEFAULT_MAX_HOPS)
     parser.add_argument("--out", default=DEFAULT_OUT)
     args = parser.parse_args()
+
+    if args.max_hops < 1:
+        # 0 or negative is not a smaller funnel, it is a degenerate one:
+        # `find_paths`'s `walk` bails before adding a single edge (see
+        # `phase_c_paths.find_paths`), so every candidate would report
+        # `no_path` and the artifact would still carry the full set of
+        # investigative-lead caveats over zero real connectivity. Reject it
+        # up front instead of silently emitting that.
+        parser.error(f"--max-hops must be a positive integer, got {args.max_hops}")
 
     print(f"graph: {Entity.objects.count()} entities, {Edge.objects.count()} edges")
 

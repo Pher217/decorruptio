@@ -17,6 +17,7 @@ proceeded. That gap is intentional, not an oversight -- see
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,6 +65,17 @@ def _coverage_blocker(name: str, measurement: CoverageMeasurement) -> Blocker | 
     )
 
 
+def _unmeasured_blocker(gate: str, reason: str) -> Blocker:
+    """A required gate family that never reached a real measurement this
+    run -- UNMEASURED is itself a blocker, never an omission and never a
+    silent pass (ADR-008: "we did not measure this" is not the same claim
+    as "this passed"). Distinct in wording from a measured FAIL so a reader
+    can tell "nobody ran the instrument this time" apart from "the
+    instrument ran and found a shortfall".
+    """
+    return Blocker(gate=gate, reason=f"UNMEASURED: {reason}", detail={"status": "UNMEASURED"})
+
+
 def _stratum_blocker(name: str, measurement: StratumMeasurement) -> Blocker | None:
     if not measurement.available:
         return Blocker(
@@ -94,8 +106,10 @@ def build_no_score_certificate(
     freeze_state: GateFreezeState,
     coverage_measurements: dict[str, CoverageMeasurement] | None = None,
     stratum_measurements: dict[str, StratumMeasurement] | None = None,
+    unmeasured_families: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    """A no-score certificate dict if ANY measured gate fails, else `None`.
+    """A no-score certificate dict if ANY measured gate fails or any
+    required family was never measured, else `None`.
 
     `coverage_measurements` / `stratum_measurements`: pass whichever this
     caller measured -- `scripts/measure_coverage_gate.py` passes only
@@ -103,11 +117,23 @@ def build_no_score_certificate(
     half alone is a legitimate, independently blocking certificate; passing
     both produces one combined artifact naming every blocker found.
 
-    Returns `None` (no certificate) only when every measurement passed --
-    an empty `coverage_measurements`/`stratum_measurements` produces no
-    blockers and therefore no certificate, which is correct: a caller that
-    measured nothing has nothing to report as blocking, that is not the
-    same claim as "everything passed".
+    `unmeasured_families`: gate names (already prefixed, e.g.
+    `"coverage:commons_register"`) this caller knows are REQUIRED for its
+    certificate but did not reach a real measurement this run -- a report
+    file that does not exist, is unbound to the current freeze state, or is
+    missing an expected entry. Every one of these is added as an
+    UNMEASURED blocker unconditionally: unknown must never be read as
+    passing (ADR-008). This is how a caller closes the fail-closed hole a
+    missing family would otherwise leave -- see
+    `assert_all_required_families_accounted_for` for the accompanying
+    structural guarantee that a caller forgot to do this at all.
+
+    Returns `None` (no certificate) only when every measurement passed and
+    no family was flagged unmeasured -- an empty `coverage_measurements`/
+    `stratum_measurements`/`unmeasured_families` produces no blockers and
+    therefore no certificate, which is correct: a caller that measured
+    nothing AND declared nothing required has nothing to report as
+    blocking, that is not the same claim as "everything passed".
     """
     blockers: list[Blocker] = []
     for name, measurement in (coverage_measurements or {}).items():
@@ -118,6 +144,8 @@ def build_no_score_certificate(
         blocker = _stratum_blocker(name, measurement)
         if blocker is not None:
             blockers.append(blocker)
+    for gate, reason in (unmeasured_families or {}).items():
+        blockers.append(_unmeasured_blocker(gate, reason))
 
     if not blockers:
         return None
@@ -143,3 +171,46 @@ def write_no_score_certificate(path: str | Path, certificate: dict[str, Any]) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(certificate, indent=2), encoding="utf-8")
     return path
+
+
+def assert_all_required_families_accounted_for(
+    required_gate_names: Iterable[str],
+    certificate: dict[str, Any] | None,
+    passed_families: Iterable[str] = (),
+) -> None:
+    """Refuse to let a caller compute a verdict while any name in
+    `required_gate_names` was never evaluated as PASS, FAIL, or UNMEASURED.
+
+    This is the structural guarantee closing the certificate's fail-closed
+    hole: a certificate (or a caller's decision that none was needed) must
+    never rest on a gate family that was simply never evaluated. A family
+    the caller never measured and never declared unmeasured is worse than
+    one honestly marked UNMEASURED -- ADR-008 requires "we did not evaluate
+    this" to itself be an auditable, blocking fact, never a silent gap that
+    reads as a pass.
+
+    A family is accounted for when it names a blocker in
+    `certificate["blockers"]` (a FAIL or an UNMEASURED blocker -- both are
+    blockers, see `_coverage_blocker`/`_stratum_blocker`/
+    `_unmeasured_blocker`) OR is listed in `passed_families` -- the
+    caller's own record that this family was measured AND passed, which is
+    exactly why it produced no blocker. `certificate` may be `None`
+    (`build_no_score_certificate`'s contract: every measured family
+    passed and none was declared unmeasured) -- in that case every
+    required family must appear in `passed_families`, or this still
+    raises, because `None` alone does not prove which families were
+    actually evaluated.
+
+    Raises `ValueError` naming exactly which families are missing --
+    never silently proceeds. Callers invoke this immediately before
+    deciding a verdict or writing a certificate to disk.
+    """
+    blocker_gates = {b["gate"] for b in (certificate or {}).get("blockers", [])}
+    accounted = blocker_gates | set(passed_families)
+    missing = sorted(set(required_gate_names) - accounted)
+    if missing:
+        raise ValueError(
+            f"refusing to compute a verdict: {missing} were never evaluated as PASS, FAIL, "
+            "or UNMEASURED for this certificate -- every required gate family must be "
+            "explicitly accounted for (ADR-008); 'not evaluated' must never silently pass."
+        )

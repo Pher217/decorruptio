@@ -2,8 +2,9 @@
 the pieces `uncorrupt.gates.certificate.build_no_score_certificate` does not
 compute: the Companies House structural-ceiling finding, the threshold
 arithmetic table, the manifest-hash fallback, the sealed-cohort statement,
-the Electoral Commission materiality caveat, and the SystemExit refusal when
-every measured stratum unexpectedly passes.
+the Electoral Commission materiality caveat, the coverage-gate-family
+loader/note (spec A2.4.2), and the SystemExit refusal when every measured
+stratum unexpectedly passes.
 """
 
 from __future__ import annotations
@@ -16,13 +17,19 @@ from pathlib import Path
 import pytest
 from scripts.emit_no_score_certificate import (
     GATE_FRACTION,
+    REQUIRED_COVERAGE_FAMILIES,
+    _load_coverage_gate_measurements,
     _manifest_hash_or_unavailable,
     ch_structural_ceiling,
+    coverage_gate_note,
     electoral_commission_materiality_note,
     sealed_cohort_statement,
     threshold_arithmetic_table,
 )
+from scripts.run_gold_benchmark import compute_manifest_hash
 
+from uncorrupt.gates.binding import GateFreezeState
+from uncorrupt.gates.coverage import CoverageMeasurement
 from uncorrupt.gates.stratum import StratumMeasurement
 from uncorrupt.staging.models import Company
 
@@ -227,6 +234,193 @@ class TestThresholdArithmeticTable:
         assert row_11["passes_gate"] is True
 
 
+def _freeze_state(
+    *, code_commit: str = "abc123", graph_hash: str = "graphhash", manifest_hash: str = "manihash"
+) -> GateFreezeState:
+    return GateFreezeState(
+        code_commit=code_commit,
+        graph_hash=graph_hash,
+        attestation_inclusive_hash="attesthash",
+        manifest_hash=manifest_hash,
+        measured_at="2026-08-04T00:00:00+00:00",
+    )
+
+
+def _strict_gate_entry(*, ingested: int, total: int) -> dict:
+    return {
+        "ingested": ingested,
+        "explicitly_failed": 0,
+        "not_attempted": total - ingested,
+        "total": total,
+        "failure_manifest_sample": [],
+        "known_limits": [],
+        "extra": {},
+    }
+
+
+class TestLoadCoverageGateMeasurements:
+    def test_both_required_families_are_unmeasured_when_no_report_file_exists(self, tmp_path):
+        """GIVEN no coverage-gate report file exists at the given path
+        WHEN the coverage-gate family is loaded
+        THEN both REQUIRED_COVERAGE_FAMILIES land in `unmeasured`, `measured`
+        is empty, and the reason names measure_coverage_gate.py as the
+        missing producer -- unknown must never be silently read as
+        passing."""
+        report_path = tmp_path / "coverage_gate.json"
+
+        measured, unmeasured = _load_coverage_gate_measurements(report_path, _freeze_state())
+
+        assert measured == {}
+        assert set(unmeasured) == set(REQUIRED_COVERAGE_FAMILIES)
+        assert "measure_coverage_gate.py" in unmeasured["companies_house_officer_roster"]
+
+    def test_loads_both_families_from_a_report_bound_to_the_current_state(self, tmp_path):
+        """GIVEN a coverage_gate.json report bound to the SAME code_commit/
+        graph_hash/manifest_hash as the certificate being emitted, with a
+        real strict_gate entry for both required families
+        WHEN the coverage-gate family is loaded
+        THEN both are reconstructed as real CoverageMeasurement objects
+        carrying the report's own counts, and `unmeasured` is empty."""
+        freeze_state = _freeze_state()
+        report_path = tmp_path / "coverage_gate.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "code_commit": freeze_state.code_commit,
+                    "graph_hash": freeze_state.graph_hash,
+                    "manifest_hash": freeze_state.manifest_hash,
+                    "strict_gate": {
+                        "companies_house_officer_roster": _strict_gate_entry(
+                            ingested=12227, total=12227
+                        ),
+                        "commons_register": _strict_gate_entry(ingested=25, total=3415),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        measured, unmeasured = _load_coverage_gate_measurements(report_path, freeze_state)
+
+        assert unmeasured == {}
+        assert measured["companies_house_officer_roster"].ingested == 12227
+        assert measured["companies_house_officer_roster"].total == 12227
+        assert measured["companies_house_officer_roster"].passed is True
+        assert measured["commons_register"].ingested == 25
+        assert measured["commons_register"].total == 3415
+        assert measured["commons_register"].passed is False
+
+    def test_treats_a_report_bound_to_a_different_graph_hash_as_unmeasured(self, tmp_path):
+        """GIVEN a coverage_gate.json report file that exists but was measured
+        against a DIFFERENT graph_hash than the certificate being emitted
+        WHEN the coverage-gate family is loaded
+        THEN both required families are unmeasured with a reason citing the
+        state mismatch -- a stale coverage measurement must never be
+        silently trusted for a different graph state (spec A2.4.5)."""
+        report_path = tmp_path / "coverage_gate.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "code_commit": "abc123",
+                    "graph_hash": "a-different-graph-hash",
+                    "manifest_hash": "manihash",
+                    "strict_gate": {
+                        "companies_house_officer_roster": _strict_gate_entry(
+                            ingested=12227, total=12227
+                        ),
+                        "commons_register": _strict_gate_entry(ingested=3415, total=3415),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        measured, unmeasured = _load_coverage_gate_measurements(report_path, _freeze_state())
+
+        assert measured == {}
+        assert set(unmeasured) == set(REQUIRED_COVERAGE_FAMILIES)
+        assert "different code/graph/manifest state" in unmeasured["commons_register"]
+
+    def test_a_bound_report_missing_one_family_only_marks_that_family_unmeasured(self, tmp_path):
+        """GIVEN a bound report whose strict_gate carries only
+        'companies_house_officer_roster', not 'commons_register'
+        WHEN the coverage-gate family is loaded
+        THEN 'companies_house_officer_roster' is measured and
+        'commons_register' alone is unmeasured -- a partial report never
+        silently credits the family it does not carry."""
+        freeze_state = _freeze_state()
+        report_path = tmp_path / "coverage_gate.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "code_commit": freeze_state.code_commit,
+                    "graph_hash": freeze_state.graph_hash,
+                    "manifest_hash": freeze_state.manifest_hash,
+                    "strict_gate": {
+                        "companies_house_officer_roster": _strict_gate_entry(
+                            ingested=12227, total=12227
+                        ),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        measured, unmeasured = _load_coverage_gate_measurements(report_path, freeze_state)
+
+        assert "companies_house_officer_roster" in measured
+        assert set(unmeasured) == {"commons_register"}
+
+
+class TestCoverageGateNote:
+    def test_note_names_both_families_unmeasured_with_their_reasons(self):
+        """GIVEN both coverage families are unmeasured
+        WHEN the note is composed
+        THEN it says UNMEASURED for both family names and includes each
+        reason string verbatim."""
+        note = coverage_gate_note(
+            {},
+            {
+                "companies_house_officer_roster": "no report found",
+                "commons_register": "no report found",
+            },
+        )
+
+        assert "companies_house_officer_roster: UNMEASURED (no report found)" in note
+        assert "commons_register: UNMEASURED (no report found)" in note
+
+    def test_note_reports_a_measured_pass_and_a_measured_fail_accurately(self):
+        """GIVEN one coverage family measured fully accounted for (PASS) and
+        the other measured with a partial shortfall (FAIL)
+        WHEN the note is composed
+        THEN the prose says PASS for the passing family and FAIL for the
+        failing one, each with its real accounted-for/total counts --
+        proving the note is derived from the measured booleans, never a
+        fixed claim (the exact prose/data-disagreement defect class an
+        earlier review caught in this same file's ch_structural_ceiling)."""
+        measurements = {
+            "companies_house_officer_roster": CoverageMeasurement(
+                name="companies_house_officer_roster",
+                ingested=12227,
+                explicitly_failed=0,
+                not_attempted=0,
+                total=12227,
+            ),
+            "commons_register": CoverageMeasurement(
+                name="commons_register",
+                ingested=25,
+                explicitly_failed=0,
+                not_attempted=3390,
+                total=3415,
+            ),
+        }
+
+        note = coverage_gate_note(measurements, {})
+
+        assert "companies_house_officer_roster: 12227/12227 accounted for -- PASS" in note
+        assert "commons_register: 25/3415 accounted for -- FAIL" in note
+
+
 class TestManifestHashOrUnavailable:
     def test_returns_the_real_sha256_when_the_manifest_file_exists(self, tmp_path):
         """GIVEN a real manifest file on disk
@@ -397,3 +591,158 @@ class TestMainRefusesToEmitWhenEveryMeasuredStratumPasses:
             emit_mod.main()
 
         assert not out_path.exists()
+
+
+def _failing_strata_shape() -> dict[str, StratumMeasurement]:
+    """The real measured spec-v2.10 shape: CH/Commons/Lords fail, Electoral
+    Commission passes but is non-material. Mirrors the committed
+    `experiments/no_score_certificate.json` so these integration tests
+    exercise a realistic combined certificate, not a contrived one."""
+    return {
+        "ch_officer_appointment": StratumMeasurement(
+            name="ch_officer_appointment",
+            available=True,
+            retrieval_recovered=7,
+            retrieval_total=12,
+            temporal_recovered=7,
+            temporal_total=12,
+        ),
+        "commons_declared_interest": StratumMeasurement(name="commons_declared_interest"),
+        "lords_declared_interest": StratumMeasurement(name="lords_declared_interest"),
+        "electoral_commission": StratumMeasurement(
+            name="electoral_commission",
+            available=True,
+            retrieval_recovered=11,
+            retrieval_total=12,
+            temporal_recovered=11,
+            temporal_total=12,
+        ),
+    }
+
+
+@pytest.mark.django_db
+class TestMainCoverageGateFamily:
+    def test_adds_unmeasured_coverage_blockers_when_no_coverage_report_exists(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN the real measured stratum shape (CH/Commons/Lords fail) and
+        NO experiments/coverage_gate.json report anywhere on disk -- the
+        actual state of this repository, since scripts/measure_coverage_gate.py
+        has never been run here
+        WHEN main() runs
+        THEN the written certificate's blockers include the three stratum
+        blockers PLUS both required coverage-gate families, each reasoned
+        UNMEASURED -- the certificate can no longer emit with the
+        coverage-gate family silently absent, and the verdict is unchanged."""
+        import scripts.emit_no_score_certificate as emit_mod
+
+        monkeypatch.setattr(
+            emit_mod, "measure_all_strata", lambda **kwargs: _failing_strata_shape()
+        )
+        out_path = tmp_path / "out.json"
+        missing_report = tmp_path / "no_such_coverage_gate.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "emit_no_score_certificate.py",
+                "--out",
+                str(out_path),
+                "--manifest",
+                str(tmp_path / "no_such_manifest.csv"),
+                "--coverage-gate-report",
+                str(missing_report),
+            ],
+        )
+
+        emit_mod.main()
+
+        certificate = json.loads(out_path.read_text(encoding="utf-8"))
+        gates_named = {b["gate"] for b in certificate["blockers"]}
+        assert gates_named == {
+            "stratum:ch_officer_appointment",
+            "stratum:commons_declared_interest",
+            "stratum:lords_declared_interest",
+            "coverage:companies_house_officer_roster",
+            "coverage:commons_register",
+        }
+        coverage_blockers = {
+            b["gate"]: b for b in certificate["blockers"] if b["gate"].startswith("coverage:")
+        }
+        assert coverage_blockers["coverage:companies_house_officer_roster"]["reason"].startswith(
+            "UNMEASURED:"
+        )
+        assert coverage_blockers["coverage:commons_register"]["reason"].startswith("UNMEASURED:")
+        assert certificate["verdict"] == "NO SCORE -- INSTRUMENT-LIMITED"
+        assert set(certificate["coverage_gate_unmeasured"]) == set(REQUIRED_COVERAGE_FAMILIES)
+        assert "UNMEASURED" in certificate["note"]
+
+    def test_omits_coverage_blockers_when_a_bound_report_shows_full_coverage(
+        self, tmp_path, monkeypatch
+    ):
+        """GIVEN the real measured stratum shape (CH/Commons/Lords fail) and a
+        coverage_gate.json report BOUND to this exact run's code_commit/
+        graph_hash/manifest_hash, showing both required coverage families
+        fully accounted for
+        WHEN main() runs
+        THEN the written certificate's blockers name ONLY the three stratum
+        gates -- no coverage:* entry -- because a real, bound, passing
+        measurement is not a blocker, and coverage_gate_measured records
+        both families as passed."""
+        import scripts.emit_no_score_certificate as emit_mod
+
+        monkeypatch.setattr(
+            emit_mod, "measure_all_strata", lambda **kwargs: _failing_strata_shape()
+        )
+        monkeypatch.setattr(emit_mod, "current_code_commit", lambda: "fixedcommit123")
+        monkeypatch.setattr(emit_mod, "compute_graph_hash", lambda: "fixedgraphhash456")
+
+        manifest_path = tmp_path / "gold_manifest.csv"
+        manifest_path.write_bytes(b"case_id,company_number\n1,00000001\n")
+        manifest_hash = compute_manifest_hash(manifest_path)
+
+        report_path = tmp_path / "coverage_gate.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "code_commit": "fixedcommit123",
+                    "graph_hash": "fixedgraphhash456",
+                    "manifest_hash": manifest_hash,
+                    "strict_gate": {
+                        "companies_house_officer_roster": _strict_gate_entry(
+                            ingested=12227, total=12227
+                        ),
+                        "commons_register": _strict_gate_entry(ingested=3415, total=3415),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_path = tmp_path / "out.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "emit_no_score_certificate.py",
+                "--out",
+                str(out_path),
+                "--manifest",
+                str(manifest_path),
+                "--coverage-gate-report",
+                str(report_path),
+            ],
+        )
+
+        emit_mod.main()
+
+        certificate = json.loads(out_path.read_text(encoding="utf-8"))
+        gates_named = {b["gate"] for b in certificate["blockers"]}
+        assert gates_named == {
+            "stratum:ch_officer_appointment",
+            "stratum:commons_declared_interest",
+            "stratum:lords_declared_interest",
+        }
+        assert certificate["coverage_gate_measured"]["companies_house_officer_roster"]["passed"]
+        assert certificate["coverage_gate_measured"]["commons_register"]["passed"]
+        assert certificate["coverage_gate_unmeasured"] == {}
+        assert certificate["verdict"] == "NO SCORE -- INSTRUMENT-LIMITED"

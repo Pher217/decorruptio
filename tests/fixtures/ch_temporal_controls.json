@@ -1,0 +1,151 @@
+{
+  "control_set": "UK Companies House officer-appointment controls — retrieval + temporal",
+  "purpose": "Externally specified ground truth for testing whether the pipeline recovers a known officer<->company appointment, INCLUDING its exact appointed_on date, from Companies House itself. Unlike the graph-derived controls in run_positive_controls.py (which sample relationships already present in our own graph and are therefore structurally blind to ingestion failure), every row here was fetched live from the Companies House REST API and never touched our database during selection.",
+  "source": {
+    "name": "Companies House REST API",
+    "search_url": "https://api.company-information.service.gov.uk/search/companies",
+    "officers_url_template": "https://api.company-information.service.gov.uk/company/{company_number}/officers",
+    "retrieval_method": "httpx.Client with HTTP Basic auth (COMPANIES_HOUSE_API_KEY as username, empty password — CH convention), same auth pattern as src/uncorrupt/graph/ch_officers.py",
+    "retrieved_at": "2026-08-04T01:50:00+00:00",
+    "selection_rule": "A fixed, alphabetically-ordered, pre-registered list of 15 well-known UK-registered company names, spread across sectors (pharma, banking, energy, aviation, telecom, drink, retail, football/agriculture), chosen WITHOUT reference to our own graph/DB. For each name: the top hit from CH's own /search/companies (never an invented company number) gives the verified company_number/company_name; the FIRST officer in that company's live /company/{number}/officers response satisfying (a) a stable officer_id parseable from links.officer.appointments, (b) a non-null appointed_on, and (c) resigned_on is null — a fixed rule, not a cherry-pick — supplies the officer_id/officer_name/officer_role/appointed_on. All 15 queries returned an eligible row; the first 12 in the pre-registered alphabetical order were kept (ASTRAZENECA .. SAINSBURY), TESCO/UNILEVER/VODAFONE dropped to hit the 10-12 target band, per the same 'take the first N of a deterministic order' discipline scripts/ch_officers.py's select_next_pending already uses elsewhere in this repo.",
+    "note_on_search_relevance": "CH's own relevance ranking is authoritative, not ours: 'BP' resolved to ASHTEAD TECHNOLOGY MIDCO LIMITED (10041931) and 'SAINSBURY' to SAINSBURY & SAINSBURY LTD (17107759), neither the iconic company that name might suggest. Rows were kept exactly as returned rather than replaced with a 'better' hand-picked match — verifying live and accepting whatever comes back is the discipline being tested, not a curated result."
+  },
+  "controls": [
+    {
+      "id": 1,
+      "query": "ASTRAZENECA",
+      "company_number": "02723534",
+      "company_name": "ASTRAZENECA PLC",
+      "company_status": "active",
+      "officer_id": "hfUVbB1SOxpAmXJj443yaiug7Lk",
+      "officer_name": "BOWDEN, Matthew Shaun",
+      "officer_role": "secretary",
+      "appointed_on": "2025-05-01"
+    },
+    {
+      "id": 2,
+      "query": "BARCLAYS BANK",
+      "company_number": "01026167",
+      "company_name": "BARCLAYS BANK PLC",
+      "company_status": "active",
+      "officer_id": "c_VL8Q1GCTzPLfLX0NkPePkq7qs",
+      "officer_name": "ELLWOOD, Hannah Elisabeth, Ms.",
+      "officer_role": "secretary",
+      "appointed_on": "2023-02-15"
+    },
+    {
+      "id": 3,
+      "query": "BP",
+      "company_number": "10041931",
+      "company_name": "ASHTEAD TECHNOLOGY MIDCO LIMITED",
+      "company_status": "active",
+      "officer_id": "EbxkWt7DD-4KEpizEr-xkt7OljU",
+      "officer_name": "STEWART, Ingrid",
+      "officer_role": "secretary",
+      "appointed_on": "2021-03-03"
+    },
+    {
+      "id": 4,
+      "query": "BRITISH AIRWAYS",
+      "company_number": "NF002699",
+      "company_name": "BRITISH AIRWAYS PLC",
+      "company_status": "closed-on",
+      "officer_id": "QGfbiAa3xIIVB6Mgwcc33ViaIK0",
+      "officer_name": "GEORGE, Martin Peter",
+      "officer_role": "director",
+      "appointed_on": "2005-07-19"
+    },
+    {
+      "id": 5,
+      "query": "BT GROUP",
+      "company_number": "04190816",
+      "company_name": "BT GROUP PLC",
+      "company_status": "active",
+      "officer_id": "dGVgRcGHewOcUc5pKK5vpCKQbck",
+      "officer_name": "CHALMERS, Sabine",
+      "officer_role": "secretary",
+      "appointed_on": "2021-09-01"
+    },
+    {
+      "id": 6,
+      "query": "DIAGEO",
+      "company_number": "00023307",
+      "company_name": "DIAGEO PLC",
+      "company_status": "active",
+      "officer_id": "WGle2XkvNXrDmzVlRkW0fBssjsc",
+      "officer_name": "INGBER, Randall David",
+      "officer_role": "secretary",
+      "appointed_on": "2025-07-01"
+    },
+    {
+      "id": 7,
+      "query": "GLAXOSMITHKLINE",
+      "company_number": "12215835",
+      "company_name": "GLAXOSMITHKLINE LIMITED",
+      "company_status": "active",
+      "officer_id": "hWEm_xEPWHh88_eSBQdzLVprT2s",
+      "officer_name": "EDINBURGH PHARMACEUTICAL INDUSTRIES LIMITED",
+      "officer_role": "corporate-secretary",
+      "appointed_on": "2019-09-19"
+    },
+    {
+      "id": 8,
+      "query": "HSBC HOLDINGS",
+      "company_number": "00617987",
+      "company_name": "HSBC HOLDINGS PLC",
+      "company_status": "active",
+      "officer_id": "TWqKI8rNmwtm32O5HHYGRc7VRcQ",
+      "officer_name": "MCENTEE, Angela Claire",
+      "officer_role": "secretary",
+      "appointed_on": "2026-01-01"
+    },
+    {
+      "id": 9,
+      "query": "MARKS AND SPENCER",
+      "company_number": "NF001553",
+      "company_name": "MARKS AND SPENCER P.L.C.",
+      "company_status": "closed-on",
+      "officer_id": "MCJ22UBRM60V1quXQ6ieYR-BHoU",
+      "officer_name": "EPSTEIN, Maurice",
+      "officer_role": "secretary",
+      "appointed_on": "1967-10-11"
+    },
+    {
+      "id": 10,
+      "query": "NATIONAL GRID",
+      "company_number": "04031152",
+      "company_name": "NATIONAL GRID PLC",
+      "company_status": "active",
+      "officer_id": "3sel5m2nw3npCM4XLgiSnByzonA",
+      "officer_name": "BADDELEY, Julian",
+      "officer_role": "secretary",
+      "appointed_on": "2024-07-01"
+    },
+    {
+      "id": 11,
+      "query": "ROLLS-ROYCE",
+      "company_number": "01003142",
+      "company_name": "ROLLS-ROYCE PLC",
+      "company_status": "active",
+      "officer_id": "a7msay6kQK38vCASgCpEJdRkW2M",
+      "officer_name": "CONACHER, Matthew Ian",
+      "officer_role": "secretary",
+      "appointed_on": "2025-04-22"
+    },
+    {
+      "id": 12,
+      "query": "SAINSBURY",
+      "company_number": "17107759",
+      "company_name": "SAINSBURY & SAINSBURY LTD",
+      "company_status": "active",
+      "officer_id": "Upfe3vAG2OJK7ydbKYjTWTAfVBU",
+      "officer_name": "SAINSBURY, Blanche Rosetta",
+      "officer_role": "director",
+      "appointed_on": "2026-03-22"
+    }
+  ],
+  "scope_limits": {
+    "closes": "The Companies House-stratum control gap: 12 externally verified, independently checkable officer<->company appointments (with exact appointed_on dates) that a scorer can gate on.",
+    "does_not_close": "Wiring this fixture into uncorrupt.gates.stratum.measure_ch_officer_stratum (which still hard-codes available=False pending a runner) — out of this deliverable's allowed scope; another workstream owns that file."
+  }
+}

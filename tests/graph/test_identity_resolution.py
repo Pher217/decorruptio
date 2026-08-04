@@ -12,6 +12,8 @@ edge is created; the Lords Spiritual functional-title pattern is excluded
 from surname matching entirely.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 
 from uncorrupt.graph.identity_resolution import (
@@ -568,15 +570,26 @@ class TestPersonalFieldsNeverSurface:
         assert "nationality" not in edge.properties
 
 
-def _make_same_as_edge(member: Entity, officer: Entity) -> Edge:
+def _make_same_as_edge(
+    member: Entity,
+    officer: Entity,
+    match_confidence: float = 0.60,
+    match_method: str = "surname_title_only",
+    observed_at: datetime | None = None,
+) -> Edge:
     """Persist a `same_as` edge exactly as `resolve_cross_register_identities`
-    would have written it in an earlier run, for reconciliation fixtures."""
+    would have written it in an earlier run, for reconciliation fixtures.
+    `source_reference` mirrors the resolver's own `f"{registry_id}:{registry_id}"`
+    key -- without it, this fixture does not actually reproduce a real
+    earlier-run row (see the staleness-fix commit that added it)."""
     edge = Edge.objects.create(edge_type="same_as", source_entity=member, target_entity=officer)
     Attestation.objects.create(
         edge=edge,
         source_name="Cross-register name match",
-        match_confidence=0.60,
-        match_method="surname_title_only",
+        source_reference=f"{member.registry_id}:{officer.registry_id}",
+        match_confidence=match_confidence,
+        match_method=match_method,
+        observed_at=observed_at,
     )
     return edge
 
@@ -696,6 +709,169 @@ class TestSameAsReconciliation:
         assert existing_edge.target_entity_id == officer.id
         assert stats["edges_deleted_stale"] == 0
         assert Edge.objects.filter(edge_type="same_as").count() == 1
+
+
+@pytest.mark.django_db
+class TestAttestationConfidenceStaleness:
+    """`Attestation.objects.get_or_create(..., defaults={...})` silently
+    discards `defaults` once a row exists, because `source_reference` is a
+    STABLE key across runs (derived from the member/officer registry-id
+    pair, which cannot change for a surviving edge) -- so a pair whose match
+    tier changed between runs kept its OLD confidence published forever,
+    even though the resolver reconciles the persisted `same_as` Edge set to
+    match every run. Measured live: 3 attestations stuck at a superseded
+    surname_title_only / 0.60 after the 2026-08 territorial-tier fix
+    shipped -- and now that `min_identity_confidence` is published per path
+    (including via the MCP tool layer), a stale confidence is a published
+    number about a named person."""
+
+    def test_attestation_whose_tier_improved_is_updated_to_the_current_confidence(self):
+        """GIVEN a `same_as` edge for "Lord Howard of Rising" already
+        persisted with a STALE attestation at the old, pre-territorial-tier
+        confidence (surname_title_only / 0.60) -- exactly what an earlier
+        run of this resolver would have written for this pair before the
+        territorial-tier fix shipped
+        WHEN identities are resolved under the current logic, which now
+        confirms the territorial designation and computes
+        surname_title_territorial / 0.85 for this same pair
+        THEN the persisted attestation is corrected in place to the current
+        confidence and method, `observed_at` advances to reflect this run's
+        determination, and no second attestation is created (updated, not
+        duplicated)."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        _make_member("mp-2", "Lord Howard of Lympne")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        stale_observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        stale_edge = _make_same_as_edge(
+            rising,
+            officer,
+            match_confidence=CONFIDENCE_TITLE_ONLY,
+            match_method="surname_title_only",
+            observed_at=stale_observed_at,
+        )
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["attestations_updated"] == 1
+        assert Attestation.objects.filter(edge=stale_edge).count() == 1
+        attestation = Attestation.objects.get(edge=stale_edge)
+        assert attestation.match_confidence == CONFIDENCE_TERRITORIAL
+        assert attestation.match_method == "surname_title_territorial"
+        assert attestation.observed_at > stale_observed_at
+
+    def test_attestation_whose_tier_is_unchanged_is_not_rewritten(self):
+        """GIVEN a `same_as` edge already persisted with an attestation that
+        already matches EXACTLY what the current logic would compute for
+        this pair (uncontested surname_title_only / 0.60 -- nothing about
+        the resolver's decision has changed since it was written)
+        WHEN identities are resolved
+        THEN the attestation's `observed_at` is left untouched -- the fix
+        only corrects a STALE confidence, it does not blindly bump
+        `observed_at` to "now" on every re-run, which would erase when this
+        stable claim was first settled."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        original_observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        edge = _make_same_as_edge(
+            member,
+            officer,
+            match_confidence=CONFIDENCE_TITLE_ONLY,
+            match_method="surname_title_only",
+            observed_at=original_observed_at,
+        )
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["attestations_updated"] == 0
+        attestation = Attestation.objects.get(edge=edge)
+        assert attestation.observed_at == original_observed_at
+
+    def test_a_confidence_downgrade_is_applied_not_protected(self):
+        """GIVEN a `same_as` edge already persisted with an attestation at a
+        HIGH confidence (surname_title_territorial / 0.85) for a pair the
+        CURRENT logic now resolves only to the weaker uncontested tier
+        (surname_title_only / 0.60) -- e.g. a prior run's now-superseded
+        territorial confirmation
+        WHEN identities are resolved
+        THEN the persisted confidence is corrected DOWN to match this run's
+        decision. A stale HIGH confidence left in place would be fail-open
+        (a stronger claim than the current evidence supports stays
+        published) -- the fix must apply the correction in either
+        direction, not special-case "only ever raise the confidence"."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        edge = _make_same_as_edge(
+            member,
+            officer,
+            match_confidence=CONFIDENCE_TERRITORIAL,
+            match_method="surname_title_territorial",
+        )
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["attestations_updated"] == 1
+        attestation = Attestation.objects.get(edge=edge)
+        assert attestation.match_confidence == CONFIDENCE_TITLE_ONLY
+        assert attestation.match_method == "surname_title_only"
+
+    def test_a_same_method_confidence_downgrade_is_still_applied(self):
+        """GIVEN a `same_as` edge already persisted with the SAME match
+        method the current logic still computes (uncontested
+        surname_title_only) but at an inflated confidence value that
+        disagrees with `CONFIDENCE_TITLE_ONLY` -- isolating a confidence-only
+        correction from a method change, so a fix that only re-checks
+        `match_method` (or only ever raises `match_confidence`) cannot pass
+        by accident
+        WHEN identities are resolved
+        THEN the confidence is still corrected down to what this run
+        actually decided, even though the method string alone gave no
+        signal that anything was stale."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        edge = _make_same_as_edge(
+            member,
+            officer,
+            match_confidence=0.90,
+            match_method="surname_title_only",
+        )
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["attestations_updated"] == 1
+        attestation = Attestation.objects.get(edge=edge)
+        assert attestation.match_confidence == CONFIDENCE_TITLE_ONLY
+
+    def test_dry_run_reports_attestation_corrections_without_writing_them(self):
+        """GIVEN a stale attestation whose tier the current logic would
+        correct
+        WHEN identities are resolved with dry_run=True
+        THEN `attestations_updated` reports the count a real run WOULD
+        apply, but the persisted attestation is left completely untouched --
+        the only way this correction can be validated against the live
+        graph before it is ever run for real."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        _make_member("mp-2", "Lord Howard of Lympne")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        stale_observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        stale_edge = _make_same_as_edge(
+            rising,
+            officer,
+            match_confidence=CONFIDENCE_TITLE_ONLY,
+            match_method="surname_title_only",
+            observed_at=stale_observed_at,
+        )
+
+        stats = resolve_cross_register_identities(dry_run=True)
+
+        assert stats["attestations_updated"] == 1
+        attestation = Attestation.objects.get(edge=stale_edge)
+        assert attestation.match_confidence == CONFIDENCE_TITLE_ONLY
+        assert attestation.match_method == "surname_title_only"
+        assert attestation.observed_at == stale_observed_at
 
 
 @pytest.mark.django_db

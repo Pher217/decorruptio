@@ -389,6 +389,7 @@ def resolve_cross_register_identities(
         "proposed_edges": 0,
         "edges_created": 0,
         "edges_deleted_stale": 0,
+        "attestations_updated": 0,
         "undecidable_members": [],
     }
 
@@ -639,6 +640,24 @@ def resolve_cross_register_identities(
                 "id", "source_entity_id", "target_entity_id"
             )
         )
+        persisted_pairs_to_edge_id = {(m, o): eid for eid, m, o in persisted}
+
+        # This resolver is the sole writer of these attestations (module
+        # docstring), and there is only ever one per edge: the edge's own
+        # identity IS the (member, officer) pair `source_reference` is
+        # derived from, so it cannot change across runs for a surviving
+        # edge. `edge_id`, scoped to this resolver's `source_name`, is
+        # therefore a safe, simpler stand-in for the full (edge, source_name,
+        # source_reference) uniqueness key. Fetched once here (not per-pair
+        # inside the loop below) so both the dry-run report and the real
+        # write can look up "what's already there" without N+1 queries.
+        persisted_attestations = {
+            att.edge_id: att
+            for att in Attestation.objects.filter(
+                edge__edge_type="same_as", source_name=SOURCE_NAME
+            )
+        }
+
         stale_edge_ids = [
             edge_id
             for edge_id, member_id, officer_id in persisted
@@ -704,14 +723,22 @@ def resolve_cross_register_identities(
                 stats["linked_title_only"] += 1
 
             if dry_run:
-                # Report what a real run WOULD create, rather than 0. A dry
-                # run that tells you what it deletes but not what it adds
-                # invites approving a net loss by mistake -- the whole point
-                # of the dry run is to see both sides before committing.
-                persisted_pairs = {(m, o) for _eid, m, o in persisted}
-                stats["edges_created"] += sum(
-                    1 for officer, _op in matched if (member.id, officer.id) not in persisted_pairs
-                )
+                # Report what a real run WOULD create or correct, rather
+                # than 0. A dry run that tells you what it deletes and
+                # creates but not what confidence it would silently leave
+                # stale invites publishing a corrected 0.85 as the old 0.60
+                # (or vice versa) unreviewed -- the whole point of the dry
+                # run is to see the full effect before committing.
+                for officer, _op in matched:
+                    edge_id = persisted_pairs_to_edge_id.get((member.id, officer.id))
+                    if edge_id is None:
+                        stats["edges_created"] += 1
+                        continue
+                    existing = persisted_attestations.get(edge_id)
+                    if existing is not None and (
+                        existing.match_confidence != confidence or existing.match_method != tier
+                    ):
+                        stats["attestations_updated"] += 1
                 continue
 
             for officer, _op in matched:
@@ -731,16 +758,51 @@ def resolve_cross_register_identities(
                 )
                 if created:
                     stats["edges_created"] += 1
-                Attestation.objects.get_or_create(
-                    edge=edge,
-                    source_name=SOURCE_NAME,
-                    source_reference=f"{member.registry_id}:{officer.registry_id}",
-                    defaults={
-                        "match_confidence": confidence,
-                        "match_method": tier,
-                        "observed_at": observed_at,
-                    },
-                )
+
+                # `get_or_create`'s `defaults` are silently discarded once a
+                # row exists -- the exact bug class Phase 2.5 fixed for the
+                # Edge itself (see module docstring): a match tier that
+                # changed between runs (e.g. the 2026-08 territorial-tier
+                # fix) left the PUBLISHED confidence frozen at whatever the
+                # very first run computed, forever (measured live: 3
+                # attestations stuck at the superseded surname_title_only /
+                # 0.60 tier). Bring the persisted confidence/method to match
+                # this run's decision -- in either direction, a corrected
+                # upgrade or a corrected downgrade -- but only when it
+                # actually changed: `observed_at` is transaction time, when
+                # THIS determination was made (Attestation docstring), and
+                # bumping it on every re-run, even a no-op one, would erase
+                # "when did we first settle on this claim" for the common
+                # case where nothing changed. Updating in place (rather than
+                # writing a second, distinct observation) is deliberate: this
+                # is not new real-world evidence arriving at a new date --
+                # like a fresh Wayback register snapshot would be (see
+                # register_snapshots.py) -- it is the same fixed input names
+                # re-scored by improved logic, so there is nothing bitemporal
+                # to preserve by keeping the superseded row around. Nothing
+                # currently reads `Attestation.created_at` for history either
+                # (`auto_now_add`, untouched by this update).
+                existing_attestation = persisted_attestations.get(edge.id)
+                if existing_attestation is None:
+                    Attestation.objects.create(
+                        edge=edge,
+                        source_name=SOURCE_NAME,
+                        source_reference=f"{member.registry_id}:{officer.registry_id}",
+                        match_confidence=confidence,
+                        match_method=tier,
+                        observed_at=observed_at,
+                    )
+                elif (
+                    existing_attestation.match_confidence != confidence
+                    or existing_attestation.match_method != tier
+                ):
+                    existing_attestation.match_confidence = confidence
+                    existing_attestation.match_method = tier
+                    existing_attestation.observed_at = observed_at
+                    existing_attestation.save(
+                        update_fields=["match_confidence", "match_method", "observed_at"]
+                    )
+                    stats["attestations_updated"] += 1
 
     logger.info(
         "resolve_cross_register_identities%s: %d parliamentarians, %d "

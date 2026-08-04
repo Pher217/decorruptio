@@ -182,9 +182,17 @@ def _resolve_by_company_number(cn: str) -> Entity | None:
     ingestion order (which source ran first, whether the graph was rebuilt),
     not a rule about which register is authoritative. That is a
     reproducibility hazard across graph builds, and it is liable to land on
-    the GLEIF twin: `officer_of` edges attach to the GB-COH node, so
-    resolving to the GLEIF twin silently yields a company with no officers,
-    a recall failure indistinguishable from a genuine null.
+    the GLEIF twin rather than the authoritative Companies House node.
+
+    Measured, so the severity is not overstated: `officer_of` targets are
+    648,763 GB-COH vs 33 GLEIF-LEI, and those 33 belong to just three
+    companies whose GLEIF twin and GB-COH node carry *identical* officer
+    sets. So landing on the twin does NOT currently lose officers, and this
+    is a correctness-and-reproducibility fix, not a recall recovery. (An
+    earlier version of this docstring claimed resolving to the twin "yields
+    a company with no officers, a recall failure indistinguishable from a
+    genuine null" -- that was asserted from the 648,763-vs-33 split without
+    checking whether the twins overlap. They do.)
 
     The GB-COH node for a company number is unique by construction
     (`unique_registry_id` constraint on (`registry_scheme`, `registry_id`),

@@ -36,8 +36,18 @@ confidence of 0.6 says so rather than pretending otherwise.
 Ambiguity rule: candidates that differ in forename are DIFFERENT PEOPLE and
 produce no edge (Agnew has a Lord, a Lady and a Sir -- linking on surname alone
 would fuse three people). Candidates that agree on name but differ only by
-officer ID are the SAME person duplicated by Companies House, and all of them are
-linked -- suppressing those would discard real appointments.
+officer ID are the SAME person duplicated by Companies House -- in the
+forename tier (the member's own forename is known) every such duplicate is
+still linked, unchanged from the original rule. In the peerage-name tiers
+below (no forename to check) that is no longer universally true: a
+duplicate officer record is linked only if its OWN title field carries a
+confirming territorial designation (see "Adversarial review" below) -- a
+second, otherwise-identical CH record for the same real person that
+happens to carry no designation of its own (e.g. a bare second "MORGAN,
+Sally, Baroness" record beside a confirmed one) gets no edge. This is a
+deliberate recall cost, not an oversight: the alternative -- letting a
+confirmed sibling's territorial match vouch for an unconfirmed one -- is
+the exact adversarial-review bug this tier exists to prevent.
 
 Territorial designation as a tier-B signal (2026-08): a live-graph scan found
 CH officer titles occasionally carry the peer's full peerage style, not just
@@ -182,6 +192,17 @@ def _normalize_title(title: str | None) -> str | None:
 # fail-closed set, checked regardless of whether a territorial designation
 # is present (a functional role must not fall through to "assert" just
 # because it lacks the diocesan "of X" clause bishops happen to carry).
+#
+# Known gap, not fixed here: the set itself is still a blacklist, not a
+# structural test for "is this a functional role, not a surname" -- any
+# functional title word not listed here (Dean, Provost, Chancellor, Earl
+# Marshal, Lord Mayor, Chief Rabbi, Moderator are all real UK ex-officio /
+# functional styles) falls through to ordinary surname matching, fail-open,
+# exactly as "bishop" and "archbishop" once did. Zero reachability on the
+# current member set (none of those words appear as a bare parsed surname
+# today) is why this is noted rather than redesigned here -- a real
+# occurrence would reproduce the same class of bug this set was built to
+# close.
 _FUNCTIONAL_TITLE_WORDS = {"bishop", "archbishop", "speaker"}
 
 # Territorial designation: the "of X" clause in a peerage style ("of
@@ -326,7 +347,19 @@ def _titles_compatible(parliament_title: str | None, officer_title: str | None) 
 
 
 def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
-    """Create `same_as` edges from parliament entities to CH officer entities."""
+    """Reconcile the persisted `same_as` edge set to match this run's decisions.
+
+    This resolver is authoritative for `same_as` -- it is the only writer
+    of that edge type in the codebase (verified by grep) and the edges are
+    derived, regenerable output, not source data (ADR-006: this asserts
+    identity, it never merges an Entity). So every run computes the FULL
+    target set of `same_as` edges and reconciles the persisted graph to
+    match it exactly: edges no longer proposed are deleted, missing ones
+    are created. `Edge.objects.get_or_create` alone is additive-only and
+    was found live to leave stale wrong edges in place forever (see
+    "Phase 2.5" below) -- reporting `collision_dropped: 0` while the
+    persisted graph still held real invariant violations.
+    """
     stats: dict[str, Any] = {
         "parliamentarians": 0,
         "linked_with_forename": 0,
@@ -336,7 +369,11 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
         "no_candidate": 0,
         "skipped_functional_title": 0,
         "collision_dropped": 0,
+        "collision_dropped_partial_members": 0,
+        "collision_dropped_partial_records": 0,
+        "proposed_edges": 0,
         "edges_created": 0,
+        "edges_deleted_stale": 0,
         "undecidable_members": [],
     }
 
@@ -405,6 +442,14 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
             continue
 
         if parsed["forename"]:
+            # Known gap, not fixed here: unlike the peerage-name branches
+            # below, this tier never checks territorial compatibility --
+            # a genuine forename match on a contested surname+title bucket
+            # is trusted outright. Reachable under adversarial fuzzing
+            # (198 violations) but 0 on the current real member set, and
+            # identical to the pre-fix behaviour this module already
+            # shipped with -- noted as a scoped follow-up, not redesigned
+            # here.
             matched = [(o, op) for o, op in candidates if op["forename"] == parsed["forename"]]
             confidence = CONFIDENCE_WITH_FORENAME
             tier = "surname_forename_title"
@@ -513,10 +558,89 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
                 }
             )
             continue
+        if len(surviving) < len(matched):
+            # A PARTIAL drop: the member keeps at least one officer record
+            # (so it never enters undecidable_members, which only tracks
+            # members who end up with nothing) but loses one or more CH
+            # duplicate records to the guardrail. Previously unrecorded
+            # anywhere -- the exact "computed but not reported" defect
+            # class the Phase 2.5 reconciliation below closes for the
+            # persisted graph; recorded here so it is not silently true of
+            # this run's own decisions too.
+            stats["collision_dropped_partial_members"] += 1
+            stats["collision_dropped_partial_records"] += len(matched) - len(surviving)
         final_decisions.append((member, surviving, confidence, tier))
+
+    # Phase 2.5: reconcile against the persisted graph. `same_as` edges are
+    # produced exclusively by this resolver (module docstring) and are
+    # derived, regenerable resolver output, not source data -- so this
+    # resolver is authoritative for the FULL persisted `same_as` edge set
+    # on every run, not merely additive to it. Without this, a stale edge
+    # from an earlier (buggy) run of this module survives forever --
+    # `Edge.objects.get_or_create` below only ever adds, it has no path
+    # that removes an edge the current logic no longer proposes (found
+    # live: 83 persisted edges the fixed logic no longer proposes,
+    # including the 22-Lords-Spiritual-onto-one-businessman and
+    # 5-peers-onto-one-officer cases this module exists to prevent, both
+    # silently left in place by an additive-only run that reports
+    # collision_dropped: 0).
+    #
+    # Seeding the officer-ownership guardrail above (Phase 2) from
+    # persisted edges INSTEAD of doing this would be a worse bug, not a
+    # fix: it would make the guardrail refuse to add a correct new edge
+    # because the officer already holds a stale wrong one, leaving the
+    # wrong edge in place AND blocking the right one.
+    desired_pairs: set[tuple[int, int]] = set()
+    for member, matched, _confidence, _tier in final_decisions:
+        for officer, _op in matched:
+            desired_pairs.add((member.id, officer.id))
+    stats["proposed_edges"] = len(desired_pairs)
+
+    # `desired_pairs` is about to become the ENTIRE persisted same_as edge
+    # set this resolver owns -- it must be collision-free. It already
+    # passed the intra-run guardrail above by construction (every officer
+    # in colliding_officer_ids was subtracted out of every `matched` list),
+    # so this can never fire in practice; it is a hard runtime check, not
+    # a silent trust, because a violation here would defeat the
+    # guardrail's entire purpose at the moment its output is written.
+    officer_to_members: dict[int, set[int]] = {}
+    for member_id, officer_id in desired_pairs:
+        officer_to_members.setdefault(officer_id, set()).add(member_id)
+    resulting_violations = {
+        officer_id: members
+        for officer_id, members in officer_to_members.items()
+        if len(members) > 1
+    }
+    if resulting_violations:
+        raise RuntimeError(
+            "identity_resolution: officer-ownership guardrail invariant "
+            f"violated after reconciliation for officer id(s) "
+            f"{sorted(resulting_violations)} -- refusing to write or delete "
+            "same_as edges"
+        )
 
     # Phase 3: write.
     with transaction.atomic():
+        persisted = list(
+            Edge.objects.filter(edge_type="same_as").values_list(
+                "id", "source_entity_id", "target_entity_id"
+            )
+        )
+        stale_edge_ids = [
+            edge_id
+            for edge_id, member_id, officer_id in persisted
+            if (member_id, officer_id) not in desired_pairs
+        ]
+        stats["edges_deleted_stale"] = len(stale_edge_ids)
+
+        if stale_edge_ids and not dry_run:
+            # Deleting the Edge cascades to its Attestation rows
+            # (Attestation.edge is on_delete=CASCADE) -- an Attestation
+            # with no Edge to attest is meaningless, never orphaned data
+            # worth keeping, so this is the intended, documented cascade,
+            # not an incidental side effect.
+            Edge.objects.filter(id__in=stale_edge_ids).delete()
+
         for member, matched, confidence, tier in final_decisions:
             if tier == "surname_forename_title":
                 stats["linked_with_forename"] += 1
@@ -557,11 +681,18 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
                 )
 
     logger.info(
-        "resolve_cross_register_identities: %d parliamentarians, %d edges created, "
-        "%d undecidable (%d dropped by the officer-collision guardrail)",
+        "resolve_cross_register_identities%s: %d parliamentarians, %d "
+        "proposed same_as edges (%d created, %d deleted as stale), %d "
+        "undecidable (%d dropped by the officer-collision guardrail, %d "
+        "more partially dropped across %d members)",
+        " (dry run)" if dry_run else "",
         stats["parliamentarians"],
+        stats["proposed_edges"],
         stats["edges_created"],
+        stats["edges_deleted_stale"],
         len(stats["undecidable_members"]),
         stats["collision_dropped"],
+        stats["collision_dropped_partial_records"],
+        stats["collision_dropped_partial_members"],
     )
     return stats

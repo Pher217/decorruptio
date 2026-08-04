@@ -24,7 +24,7 @@ from uncorrupt.graph.identity_resolution import (
     parse_parliament_name,
     resolve_cross_register_identities,
 )
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 
 
 def test_parses_peerage_name_dropping_territorial_designation_from_surname():
@@ -565,3 +565,133 @@ class TestPersonalFieldsNeverSurface:
         assert set(edge.properties.keys()) == {"match_tier", "parliament_name", "officer_name"}
         assert "date_of_birth" not in edge.properties
         assert "nationality" not in edge.properties
+
+
+def _make_same_as_edge(member: Entity, officer: Entity) -> Edge:
+    """Persist a `same_as` edge exactly as `resolve_cross_register_identities`
+    would have written it in an earlier run, for reconciliation fixtures."""
+    edge = Edge.objects.create(edge_type="same_as", source_entity=member, target_entity=officer)
+    Attestation.objects.create(
+        edge=edge,
+        source_name="Cross-register name match",
+        match_confidence=0.60,
+        match_method="surname_title_only",
+    )
+    return edge
+
+
+@pytest.mark.django_db
+class TestSameAsReconciliation:
+    """`same_as` edges are produced exclusively by this resolver (module
+    docstring) and are derived, regenerable output, not source data -- so
+    the resolver is authoritative for the FULL persisted `same_as` edge set
+    on every run: it must delete a persisted edge its current logic no
+    longer proposes, not merely add new ones on top
+    (`Edge.objects.get_or_create` alone is additive-only)."""
+
+    def test_a_persisted_edge_no_longer_proposed_is_deleted(self):
+        """GIVEN a `same_as` edge already persisted from an earlier run
+        (as if written under different matching logic) between a peer and
+        an officer whose OWN territorial designation contradicts that
+        peer's, and a SECOND peer sharing the same surname+title whose
+        territorial designation the officer record actually confirms
+        (mirrors the live "Lord Howard of Lympne" / "Lord Howard of
+        Rising" case)
+        WHEN identities are resolved
+        THEN the current logic correctly matches only the second (genuinely
+        confirmed) peer to the officer, and the stale persisted edge from
+        the first peer -- no longer among this run's proposals -- is
+        deleted rather than left in place forever."""
+        stale_member = _make_member("mp-stale", "Lord Howard of Lympne")
+        correct_member = _make_member("mp-correct", "Lord Howard of Rising")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        _make_same_as_edge(stale_member, officer)
+
+        stats = resolve_cross_register_identities()
+
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=stale_member).exists()
+        correct_edge = Edge.objects.get(edge_type="same_as", source_entity=correct_member)
+        assert correct_edge.target_entity_id == officer.id
+        assert stats["edges_deleted_stale"] == 1
+        claimants = set(
+            Edge.objects.filter(edge_type="same_as", target_entity=officer).values_list(
+                "source_entity_id", flat=True
+            )
+        )
+        assert claimants == {correct_member.id}
+
+    def test_dry_run_reports_would_be_deletions_without_performing_them(self):
+        """GIVEN a stale persisted `same_as` edge that this run's logic no
+        longer proposes
+        WHEN identities are resolved with dry_run=True
+        THEN the stale edge still exists afterwards (dry_run must never
+        mutate the graph) but the stats report how many deletions WOULD
+        happen -- the only way this reconciliation can be validated before
+        it is ever run for real."""
+        stale_member = _make_member("mp-stale", "Lord Howard of Lympne")
+        _make_member("mp-correct", "Lord Howard of Rising")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        _make_same_as_edge(stale_member, officer)
+
+        stats = resolve_cross_register_identities(dry_run=True)
+
+        assert stats["edges_deleted_stale"] == 1
+        assert Edge.objects.filter(edge_type="same_as", source_entity=stale_member).exists()
+        assert Edge.objects.filter(edge_type="same_as").count() == 1
+
+    def test_only_same_as_edges_are_ever_deleted(self):
+        """GIVEN a member and officer with OTHER edge types persisted on
+        them (an `officer_of` edge on the officer, a `declared_interest`
+        edge on the member) alongside a stale `same_as` edge the current
+        logic no longer proposes
+        WHEN identities are resolved
+        THEN only the stale `same_as` edge is removed -- reconciliation
+        must never touch any other edge type, no matter what else is
+        attached to the same entities."""
+        stale_member = _make_member("mp-stale", "Lord Howard of Lympne")
+        _make_member("mp-correct", "Lord Howard of Rising")
+        officer = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        _make_same_as_edge(stale_member, officer)
+
+        company = Entity.objects.create(
+            entity_type="company", name="Acme Ltd", company_number="123"
+        )
+        officer_of_edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=officer, target_entity=company
+        )
+        declared_interest_edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=stale_member, target_entity=company
+        )
+
+        resolve_cross_register_identities()
+
+        assert Edge.objects.filter(id=officer_of_edge.id, edge_type="officer_of").exists()
+        assert Edge.objects.filter(
+            id=declared_interest_edge.id, edge_type="declared_interest"
+        ).exists()
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=stale_member).exists()
+
+    def test_a_persisted_edge_still_proposed_is_left_untouched(self):
+        """GIVEN a `same_as` edge already persisted from an earlier run that
+        the current logic STILL proposes today (nothing has changed for
+        this member)
+        WHEN identities are resolved
+        THEN the edge id is unchanged (get_or_create finds it, does not
+        delete-and-recreate it) and no deletion is counted for it."""
+        member = _make_member("mp-1", "Lord Agnew of Oulton")
+        officer = _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+        existing_edge = _make_same_as_edge(member, officer)
+
+        stats = resolve_cross_register_identities()
+
+        existing_edge.refresh_from_db()
+        assert existing_edge.source_entity_id == member.id
+        assert existing_edge.target_entity_id == officer.id
+        assert stats["edges_deleted_stale"] == 0
+        assert Edge.objects.filter(edge_type="same_as").count() == 1

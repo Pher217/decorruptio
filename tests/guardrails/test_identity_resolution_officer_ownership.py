@@ -10,7 +10,7 @@ entirely."""
 import pytest
 
 from uncorrupt.graph.identity_resolution import resolve_cross_register_identities
-from uncorrupt.graph.models import Edge, Entity
+from uncorrupt.graph.models import Attestation, Edge, Entity
 
 
 def _make_member(registry_id: str, name: str) -> Entity:
@@ -35,18 +35,34 @@ def _make_officer(registry_id: str, name: str) -> Entity:
 def test_no_officer_ever_receives_same_as_from_more_than_one_distinct_member():
     """GIVEN two distinct real parliament members who happen to share the
     exact same surname, forename and title (a genuine full-name collision --
-    e.g. two different people both recorded as "Sir John Smith") and a
-    single CH officer record matching that full name
+    e.g. two different people both recorded as "Sir John Smith"), a single
+    CH officer record matching that full name, and -- pre-seeded before
+    resolution runs -- a `same_as` edge from the FIRST member onto that
+    officer, as if an earlier run had already asserted it
     WHEN identities are resolved
     THEN a scan for the invariant -- the same scan that originally found the
     five-peers-one-officer bug -- finds no officer with `same_as` claims
-    from more than one distinct member; the collision is dropped rather
-    than resolved by guessing, because forename-tier matching (a genuine
-    first-name match) has no other defence against two members who share an
-    identical full name."""
+    from more than one distinct member; the intra-run collision is dropped
+    rather than resolved by guessing (forename-tier matching has no other
+    defence against two members who share an identical full name), AND the
+    pre-seeded edge is purged too, not merely left in place because it
+    predates this run -- an officer-collision guardrail whose write path
+    never re-examines what is already persisted only ever catches
+    collisions this run itself proposes, not ones already sitting in the
+    graph, so a real fixture is needed here for the assertion below to mean
+    anything (an empty starting graph makes it trivially true)."""
     first = _make_member("mp-1", "Sir John Smith")
     second = _make_member("mp-2", "Sir John Smith")
     officer = _make_officer("officer-1", "SMITH, John Robert, Sir")
+    pre_existing_edge = Edge.objects.create(
+        edge_type="same_as", source_entity=first, target_entity=officer
+    )
+    Attestation.objects.create(
+        edge=pre_existing_edge,
+        source_name="Cross-register name match",
+        match_confidence=0.85,
+        match_method="surname_forename_title",
+    )
 
     resolve_cross_register_identities()
 

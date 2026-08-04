@@ -282,17 +282,25 @@ def test_resolve_supplier_two_genuine_namesakes_yield_no_match():
 
 @pytest.mark.django_db
 def test_resolve_supplier_capped_window_cannot_prove_uniqueness():
-    """GIVEN 201 companies whose name contains the same 15-character search
-    prefix: one genuine exact-name namesake created first (lowest id, so it
-    falls inside an unordered 200-row window), 199 filler companies that
-    match the substring but not the exact name, and a second genuine
-    exact-name namesake created last (highest id, so it falls outside an
-    unordered 200-row window)
+    """GIVEN 302 companies whose name contains the same 15-character search
+    prefix -- a genuine exact-name namesake created first (lowest id, so it
+    falls inside the 201-row window), 300 filler companies that match the
+    substring but not the exact name, and a SECOND genuine exact-name
+    namesake created last (highest id, so with only 201 slots and 302 rows
+    to choose from, it is genuinely excluded from the window)
     WHEN resolve_supplier resolves that name
-    THEN it returns None -- a window that had to be capped can never be
-    trusted to prove uniqueness. Before the fix, the second namesake's
-    exclusion from the window was invisible to the guard, which saw a single
-    candidate and returned it as if it were unique."""
+    THEN it returns None -- because the window is truncated, only the first
+    namesake is ever seen, so the pre-existing uniqueness guard (which only
+    fires on 2+ candidates within the window) would wrongly see a single
+    candidate and return it. This fixture must make the *cap* guard
+    (`len(nearby) > 200`) the thing that catches it, not the uniqueness
+    guard -- with exactly 201 rows total (as an earlier version of this
+    fixture used), both namesakes land inside the window and the
+    pre-existing uniqueness guard alone already returns None, leaving the
+    cap guard unexercised and untested. 302 rows forces genuine truncation:
+    the second namesake falls outside the top-201-by-id window, so without
+    the cap guard the code would see exactly one candidate and wrongly
+    return it as unique."""
     from scripts.phase_c_paths import resolve_supplier
 
     target_name = "CAPWATCH INDUSTRIES LIMITED"
@@ -303,7 +311,7 @@ def test_resolve_supplier_capped_window_cannot_prove_uniqueness():
         registry_id="55550001",
         company_number="55550001",
     )
-    for i in range(199):
+    for i in range(300):
         Entity.objects.create(
             entity_type="company",
             name=f"CAPWATCH INDUSTRIES FILLER {i} LIMITED",
@@ -322,3 +330,173 @@ def test_resolve_supplier_capped_window_cannot_prove_uniqueness():
     resolved = resolve_supplier(target_name, ch_cache={})
 
     assert resolved is None
+
+
+@pytest.mark.django_db
+def test_resolve_supplier_window_exactly_at_cap_still_resolves():
+    """GIVEN exactly 200 companies sharing the same 15-character search
+    prefix -- one genuine exact-name match and 199 fillers -- so the window
+    is NOT truncated (200 rows fit inside the 201-row fetch, `len(nearby)`
+    is 200, not > 200)
+    WHEN resolve_supplier resolves that name
+    THEN it returns the genuine match -- the cap guard must not fire at
+    exactly 200 candidates, only when the window overflows past it. This
+    pins the guard's `>` boundary: a mutant that widens it to `>=` would
+    wrongly reject this legitimate, non-truncated resolution."""
+    from scripts.phase_c_paths import resolve_supplier
+
+    target_name = "WINDOWCAP SYSTEMS LIMITED"
+    genuine = Entity.objects.create(
+        entity_type="company",
+        name=target_name,
+        registry_scheme="GB-COH",
+        registry_id="60000001",
+        company_number="60000001",
+    )
+    for i in range(199):
+        Entity.objects.create(
+            entity_type="company",
+            name=f"WINDOWCAP SYSTEMS FILLER {i} LIMITED",
+            registry_scheme="GB-COH",
+            registry_id=f"6000{i + 1000}",
+            company_number=f"6000{i + 1000}",
+        )
+
+    resolved = resolve_supplier(target_name, ch_cache={})
+
+    assert resolved == genuine
+
+
+@pytest.mark.django_db
+def test_resolve_by_company_number_primary_registry_id_lookup_is_authoritative():
+    """GIVEN a GB-COH entity whose `registry_id` matches the target company
+    number, and a second GB-COH entity that happens to share the same
+    `company_number` field value but has a different `registry_id` (an
+    inconsistency the fallback path alone cannot disambiguate, since both
+    are GB-COH and prefer_companies_house cannot break a same-scheme tie)
+    WHEN _resolve_by_company_number looks up that company number
+    THEN it returns the entity whose registry_id matches directly -- proving
+    the primary GB-COH `registry_id` lookup is what makes this
+    deterministic, not the fallback. Tests that route a `company_number`
+    through `resolve_supplier` where the correct GB-COH row's registry_id
+    already equals its own company_number (the normal ingest case) pass via
+    the fallback alone and never exercise this primary branch -- this test
+    makes the branches diverge so the primary path is pinned by something."""
+    from scripts.phase_c_paths import _resolve_by_company_number
+
+    target = Entity.objects.create(
+        entity_type="company",
+        name="PRIMARY LOOKUP CO",
+        registry_scheme="GB-COH",
+        registry_id="09990001",
+        company_number="09990001",
+    )
+    Entity.objects.create(
+        entity_type="company",
+        name="PRIMARY LOOKUP CO DECOY",
+        registry_scheme="GB-COH",
+        registry_id="09990002",
+        company_number="09990001",
+    )
+
+    resolved = _resolve_by_company_number("09990001")
+
+    assert resolved == target
+
+
+@pytest.mark.django_db
+def test_resolve_by_company_number_fallback_refuses_to_pick_among_ambiguous_candidates():
+    """GIVEN no GB-COH row for the company number (so the primary lookup
+    misses), but two GLEIF-LEI rows that both carry it -- two genuine
+    twins, neither authoritative -- fails closed
+    WHEN _resolve_by_company_number looks up that company number
+    THEN it returns None -- the fallback's uniqueness check refuses to
+    silently pick the lowest-id candidate when more than one remains after
+    prefer_companies_house. A mutant that made the fallback return
+    `candidates[0]` unconditionally would instead silently return one of
+    the two twins here."""
+    from scripts.phase_c_paths import _resolve_by_company_number
+
+    Entity.objects.create(
+        entity_type="company",
+        name="AMBIGUOUS TWIN A",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI-AMBIG-A",
+        company_number="12340000",
+    )
+    Entity.objects.create(
+        entity_type="company",
+        name="AMBIGUOUS TWIN B",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI-AMBIG-B",
+        company_number="12340000",
+    )
+
+    resolved = _resolve_by_company_number("12340000")
+
+    assert resolved is None
+
+
+@pytest.mark.django_db
+def test_resolve_by_company_number_two_gb_coh_rows_sharing_company_number_fail_closed():
+    """GIVEN two GB-COH rows that both carry the same `company_number` field
+    value but neither has a `registry_id` equal to that number (so the
+    primary lookup finds nothing, and prefer_companies_house's GB-COH
+    preference cannot break a tie between two same-scheme candidates)
+    WHEN _resolve_by_company_number looks up that company number
+    THEN it returns None -- ambiguity between two authoritative-scheme rows
+    is never silently resolved to whichever sorts first, even though both
+    are nominally GB-COH."""
+    from scripts.phase_c_paths import _resolve_by_company_number
+
+    Entity.objects.create(
+        entity_type="company",
+        name="SHARED NUMBER CO A",
+        registry_scheme="GB-COH",
+        registry_id="10101010",
+        company_number="99990000",
+    )
+    Entity.objects.create(
+        entity_type="company",
+        name="SHARED NUMBER CO B",
+        registry_scheme="GB-COH",
+        registry_id="20202020",
+        company_number="99990000",
+    )
+
+    resolved = _resolve_by_company_number("99990000")
+
+    assert resolved is None
+
+
+@pytest.mark.django_db
+def test_resolve_by_company_number_fallback_applies_gb_coh_preference():
+    """GIVEN no GB-COH row filed under this exact registry_id (so the
+    primary lookup misses), but a GB-COH row and a GLEIF-LEI row both
+    carrying the company number in their `company_number` field, with the
+    GLEIF-LEI row created first (lowest id)
+    WHEN _resolve_by_company_number looks up that company number
+    THEN the fallback still prefers the GB-COH candidate over the
+    lower-id GLEIF-LEI row -- without the `prefer_companies_house` call in
+    the fallback, the raw 2-row list would fail the uniqueness check and
+    this would wrongly return None instead of the GB-COH entity."""
+    from scripts.phase_c_paths import _resolve_by_company_number
+
+    Entity.objects.create(
+        entity_type="company",
+        name="FALLBACK PREF CO",
+        registry_scheme="GLEIF-LEI",
+        registry_id="LEI-FALLBACK-PREF",
+        company_number="77778888",
+    )
+    gb_coh = Entity.objects.create(
+        entity_type="company",
+        name="FALLBACK PREF CO",
+        registry_scheme="GB-COH",
+        registry_id="00000099",
+        company_number="77778888",
+    )
+
+    resolved = _resolve_by_company_number("77778888")
+
+    assert resolved == gb_coh

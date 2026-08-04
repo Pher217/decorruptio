@@ -196,6 +196,17 @@ def _resolve_by_company_number(cn: str) -> Entity | None:
     `prefer_companies_house` over whatever `company_number`-tagged rows do
     exist, same disambiguation convention used for name matches below --
     never a second, ad hoc tie-break.
+
+    Intentional, measured behaviour change from the old plain-`.first()`
+    version: when an ambiguous `company_number` has NO GB-COH row at all
+    (so the fallback's `prefer_companies_house` sees no authoritative
+    candidate and stays ambiguous among 2+ rows), this now returns `None`
+    where the old code returned whichever row had the lowest pk. Exactly 4
+    such groups exist in the graph as measured, all with 0 edges attached
+    (so nothing downstream was relying on the old pick), and one of them
+    (`04867747`) holds two genuinely different companies sharing a reused
+    company number, for which `None` is the more correct answer than an
+    arbitrary pick.
     """
     found = Entity.objects.filter(registry_scheme="GB-COH", registry_id=cn).first()
     if found:
@@ -232,6 +243,21 @@ def resolve_supplier(name: str, ch_cache: dict, company_number: str | None = Non
     # truncation manufacturing apparent uniqueness. A capped window is
     # therefore never trusted to prove uniqueness; we return None instead
     # (same precision-over-recall stance as the guard itself).
+    #
+    # Known over-conservatism: this guard counts rows matching the 15-char
+    # SUBSTRING prefix, but the question it is standing in for is whether an
+    # EXACT-name match is unique -- a check measured at one scope (substring
+    # window size) and applied to a different one (exact-name uniqueness).
+    # That means it can reject a resolution as unprovable even when the
+    # exact-name candidate set underneath it is trivially unique. It fails
+    # closed (this never produces a wrong link, only a missed one), and it is
+    # unreachable in practice today: the worst observed substring window
+    # across this cohort is 21 rows against a cap of 200, and 0 of 52 cohort
+    # names and 0 of 300 sampled company names come anywhere near the cap.
+    # Left as-is deliberately -- precision-over-recall makes the conservative
+    # behaviour acceptable here -- but it is a latent recall trap if the
+    # company table grows enough that ordinary substrings start landing
+    # windows near 200.
     nearby = list(
         Entity.objects.filter(entity_type="company", name__icontains=name.strip()[:15]).order_by(
             "id"

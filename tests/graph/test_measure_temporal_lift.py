@@ -16,6 +16,7 @@ from datetime import date
 
 import pytest
 from scripts.measure_temporal_lift import (
+    classify_negative_controls,
     classify_positive_controls,
     classify_vip_lane_cohort,
     report_page_bias,
@@ -135,6 +136,121 @@ class TestClassifyVipLaneCohortIsSeparate:
         two separate functions -- the VIP-lane cohort is an invalid positive
         set and must never be reachable under the "positive controls" name."""
         assert classify_vip_lane_cohort is not classify_positive_controls
+
+
+@pytest.mark.django_db
+class TestNoTemporalClaimHandledAtEveryCallSite:
+    """`relationship_evidence_level` can now return `None` (a structural
+    path exists but carries no temporal evidence at all -- every path found
+    is same_as-only). Each of this file's three call sites must handle it
+    without crashing on an unconditional `int(level)`/`level.name`, and
+    without silently reintroducing the one-rung-lower ATEMPORAL_CORROBORATION
+    fallback the fix removed. All three reuse this file's existing
+    `"level": None` convention rather than a new one."""
+
+    def test_classify_positive_controls_reports_no_temporal_claim(self):
+        """A positive-control row whose ONLY path to its re-resolved target
+        company is an identity (same_as) chain classifies as
+        'classified_no_temporal_claim' with `level: None` -- not a crash,
+        and not ATEMPORAL_CORROBORATION."""
+        person = Entity.objects.create(
+            entity_type="person",
+            name="Lord Test",
+            registry_scheme="UK-PARLIAMENT-MEMBER",
+            registry_id="1",
+        )
+        company = Entity.objects.create(
+            entity_type="company",
+            name="Match Ltd",
+            company_number="11111111",
+            registry_scheme="GB-COH",
+            registry_id="11111111",
+        )
+        Edge.objects.create(
+            edge_type="declared_interest", source_entity=person, target_entity=company
+        )
+        # The traversal adjacency carries ONLY an identity bridge between
+        # person and company -- deliberately excludes the declared_interest
+        # edge above (which is only used for source_edge_level/pages), so
+        # relationship_evidence_level's search sees an identity-only path.
+        same_as_edge = Edge.objects.create(
+            edge_type="same_as", source_entity=person, target_entity=company
+        )
+        adj = {person.id: [same_as_edge], company.id: [same_as_edge]}
+        people_by_surname = {"test": [person]}
+
+        rows = classify_positive_controls(
+            adj, people_by_surname, max_hops=2, award_cutoff=date(2020, 3, 1)
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "classified_no_temporal_claim"
+        assert rows[0]["level"] is None
+        assert "level_name" not in rows[0]
+
+    def test_classify_vip_lane_cohort_reports_no_temporal_claim(self, monkeypatch, tmp_path):
+        """The same handling for the VIP-lane cohort's classification call site."""
+        import scripts.measure_temporal_lift as module
+
+        cohort_csv = tmp_path / "cohort.csv"
+        cohort_csv.write_text(
+            "supplier_name,source_of_referral,actual_referrer,company_number\n"
+            "Match Ltd,Lord Test,,\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(module, "COHORT_CSV", str(cohort_csv))
+
+        referrer = Entity.objects.create(entity_type="person", name="Lord Test")
+        supplier = Entity.objects.create(
+            entity_type="company",
+            name="Match Ltd",
+            company_number="11111111",
+            registry_scheme="GB-COH",
+            registry_id="11111111",
+        )
+        same_as_edge = Edge.objects.create(
+            edge_type="same_as", source_entity=referrer, target_entity=supplier
+        )
+        adj = {referrer.id: [same_as_edge], supplier.id: [same_as_edge]}
+        people_by_surname = {"test": [referrer]}
+
+        rows = module.classify_vip_lane_cohort(
+            adj, people_by_surname, {}, max_hops=2, award_cutoff=date(2020, 3, 1)
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "classified_no_temporal_claim"
+        assert rows[0]["level"] is None
+        assert "level_name" not in rows[0]
+
+    def test_classify_negative_controls_reports_no_temporal_claim(self):
+        """The same handling for the negative-control classification call
+        site. The identity bridge runs through an intermediate node (not a
+        direct person->company edge) so the pre-existing-edge exclusion
+        check does not remove this pair from the sample."""
+        person = Entity.objects.create(
+            entity_type="person", name="A", registry_scheme="UK-PARLIAMENT-MEMBER"
+        )
+        twin = Entity.objects.create(entity_type="person", name="A (CH record)")
+        company = Entity.objects.create(entity_type="company", name="B", registry_scheme="GB-COH")
+        same_as_1 = Edge.objects.create(
+            edge_type="same_as", source_entity=person, target_entity=twin
+        )
+        same_as_2 = Edge.objects.create(
+            edge_type="same_as", source_entity=twin, target_entity=company
+        )
+        adj = {
+            person.id: [same_as_1],
+            twin.id: [same_as_1, same_as_2],
+            company.id: [same_as_2],
+        }
+
+        rows = classify_negative_controls(adj, n=1, max_hops=2, award_cutoff=date(2020, 3, 1))
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "classified_no_temporal_claim"
+        assert rows[0]["level"] is None
+        assert "level_name" not in rows[0]
 
 
 class TestReportPageBias:

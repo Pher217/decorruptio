@@ -1,0 +1,80 @@
+source_id: opensanctions_entities
+name: OpenSanctions — sanctioned/watchlisted legal entities (Company/Organization/LegalEntity only)
+jurisdictions: [GLOBAL]
+data_class: A1                 # non-personal only: the connector hard-filters to FtM
+                                # schema Company/Organization/LegalEntity and drops every
+                                # Person and relationship-schema record (Directorship,
+                                # Ownership, Family, Occupancy, Succession, UnknownLink)
+                                # before any write reaches the raw cache or the DB — see
+                                # ALLOWED_SCHEMAS in src/uncorrupt/graph/opensanctions.py
+                                # and its TestSchemaFilter coverage. This is a DELIBERATELY
+                                # NARROWER slice of the same upstream data as the sibling
+                                # sources/opensanctions.yml entry (source_id: opensanctions),
+                                # which stays A2/dpia_cleared:false/unused exactly as-is —
+                                # this entry does not supersede or loosen that gate, it
+                                # only registers the non-personal subset separately, as its
+                                # own honestly-scoped connector (ADR-004 D1/D2).
+tier: b                         # same publication tier as the sibling opensanctions.yml —
+                                 # same upstream CC-BY-NC licence per record
+license: "CC-BY-NC 4.0"
+redistribution: non_commercial
+legal_basis: >-
+  Republication of public government sanctions/debarment/watchlist designations
+  (OFAC SDN, EU/UK/UN sanctions lists, procurement-exclusion lists, etc., as
+  aggregated by OpenSanctions) that name a LEGAL ENTITY in its own regulatory
+  status — not a natural person. Non-personal data (Companies Act-style register
+  data by nature, same category as sources/gleif.yml): every ingested record's
+  FtM `schema` is Company, Organization, or LegalEntity; Person-schema entities
+  and every relationship-schema entity that could re-introduce a named
+  individual (Directorship, Ownership, Family, Occupancy, Succession,
+  UnknownLink) are dropped before any write, so ADR-004 D1's DPIA gate (which
+  governs processing of named natural persons) is not engaged by this entry.
+  Person-level OpenSanctions data (PEPs, sanctioned individuals, associates,
+  family members) remains entirely out of scope here — see
+  sources/opensanctions.yml, unchanged, still dpia_cleared: false.
+access_method: open-data-dump  # static bulk file download (entities.ftm.json), not a
+                                # paginated/query API
+robots_tos_reviewed: 2026-08-04
+freshness_sla_days: 2          # matches the sibling opensanctions.yml (same publisher's
+                                # stated near-daily rebuild cadence)
+dpia_cleared: false            # irrelevant for A1 (no gate reads this for A1 sources —
+                                # see src/uncorrupt/connectors/registry.py), kept false as
+                                # the honest default every A1 entry in this register uses
+                                # (e.g. sources/gleif.yml)
+connector_kind: graph
+# jurisdictions is [GLOBAL] (entities span every jurisdiction OpenSanctions covers),
+# so no single `locale` applies — same reasoning as sources/gleif.yml.
+registry_schemes: [OPENSANCTIONS-ORG]
+identifier_field: >-
+  OpenSanctions entity id (always present, primary key of Entity(registry_scheme=
+  OPENSANCTIONS-ORG)). Cross-linked, identifier-only, never by name: `leiCode` exact
+  match against Entity(registry_scheme=GLEIF-LEI); `registrationNumber` (only when
+  `jurisdiction`/`country` includes "gb"), normalised via
+  uncorrupt.staging.companies_house.normalise_company_number and exact-matched against
+  staging.Company.company_number. A record with neither is ingested unlinked
+  (company_number stays NULL) — never name-matched (ADR-004 D2).
+rate_limit: >-
+  No published rate limit for the bulk artifact host, but data.opensanctions.org's
+  robots.txt returns `Disallow: /` for every user agent with no path exceptions
+  (verified 2026-08-04) — in tension with the docs page's "no login or API key
+  needed" framing for bulk downloads. Given that tension, this connector does NOT
+  perform automated/repeatable HTTP fetches against that host: fetch_opensanctions()
+  takes a path to an already-downloaded local file (obtained by a human, out of band,
+  via the documented no-login bulk-download page) and only hashes/caches it — it never
+  issues a network request itself. Re-review before ever adding a live fetch path.
+notes: >-
+  Graph connector: src/uncorrupt/graph/opensanctions.py (fetch_opensanctions +
+  ingest_opensanctions), wired to this entry via load_source (refuses to run without
+  it). Ingests ONLY the non-personal slice of OpenSanctions' free "default" collection
+  (bulk export, CC-BY-NC 4.0, ~4.3M entities total across all schemas as of
+  2026-08-04: ~1.23M Person, ~251K Company, ~72K Organization, ~70K LegalEntity, plus
+  relationship/position/address/security schemas). Only Company/Organization/
+  LegalEntity are written; everything else — every Person record and every
+  relationship-typed record that could carry a named individual — is counted and
+  dropped before any write. Supplies weak-label / entity-risk context (sanctions
+  topics, program IDs, source datasets) joinable to the existing graph by identifier
+  only (GLEIF-LEI, GB-COH), never by name (ADR-004 D2). The person-level portion of
+  OpenSanctions (PEPs, sanctioned individuals, family/associates) is explicitly NOT
+  in scope for this entry — see sources/opensanctions.yml, which is unmodified and
+  stays gated (data_class A2, dpia_cleared: false, legal_basis "TBD — requires the
+  up-front global A2 DPIA/LIA before ingest") until that DPIA/LIA lands.

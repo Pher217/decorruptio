@@ -26,6 +26,32 @@ own `declared_interest` edge (child fields take priority; parent fields —
 e.g. `PayerName` — fill gaps the child doesn't carry). Interests with no
 children are ingested directly.
 
+Nested donors: "Visits outside the UK" does not carry a flat counterparty
+field at all — its sponsor(s) live under a `Donors` field of API type
+`Donor[]`, whose real payload is nested in that field's own `values` key (a
+list of donor groups, each a field-list in the same shape as a top-level
+`fields` list), not its `value` key like every other field. A visit can name
+more than one donor (two organisations jointly funding one trip); each donor
+group is ingested as its own `declared_interest` edge, sharing the visit's
+`interest_id`/dates but reading its own name/`IsPrivateIndividual`/`Value`
+(see `_donor_group_field_lists`, `_counterparty_groups`). Before this was
+handled, every "Visits outside the UK" interest silently extracted zero
+counterparties (verified live 2026-08-04: 410/410 fell through to
+`skipped_no_counterparty`) — a category-wide silent-drop, not a fetch or
+pagination failure.
+
+`totalResults` caveat: the live `/api/v1/Interests` endpoint reports a
+*different* `totalResults` depending on `ExpandChildInterests` — 4,057
+without it (children counted as separate flat records) vs 3,415 with it
+(verified live 2026-08-04; children are nested under their parent instead of
+counted separately, even though the live corpus at that moment held only one
+interest with any children at all — the ~640-record gap is NOT a
+parent/child-count effect and remains unexplained). `fetch_parliament_interests`
+always sends `ExpandChildInterests=true`, so a denominator read without that
+parameter (e.g. a coverage gate's own `totalResults` probe) is not
+apples-to-apples with what this module can ever ingest — flag this to
+whoever owns that comparison rather than silently reconciling the two here.
+
 Money: register entries either give an exact `Value` (type `Decimal`, with a
 `typeInfo.currencyCode`) or, for shareholdings, a text threshold band (e.g.
 "(ii) Other shareholdings, valued at more than £70,000") with no exact
@@ -304,6 +330,28 @@ def _raw_field(fields: list[dict[str, Any]], name: str) -> dict[str, Any] | None
     return None
 
 
+def _donor_group_field_lists(fields: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Extract per-donor field-lists from a `Donor[]`-typed nested field.
+
+    "Visits outside the UK" (CategoryId 5) does not carry a flat
+    `DonorName`/`PayerName`/`OrganisationName` field at all — instead a
+    single `Donors` field of API type `Donor[]` has `value: null` and its
+    real payload nested under its own `values` key: a list of donor groups,
+    each itself a list of field dicts (`Name`, `IsPrivateIndividual`,
+    `Value`, ...) in the same shape as a top-level `fields` list (verified
+    live 2026-08-04; a visit can have more than one donor — e.g. two
+    organisations jointly funding one trip). `_fields_by_name`/`_raw_field`
+    only ever read a field's own `value`, never its nested `values` --
+    without this, every "Visits outside the UK" interest silently extracts
+    zero counterparties (confirmed: 410/410 fell through to
+    `skipped_no_counterparty`).
+    """
+    donors_field = _raw_field(fields, "Donors")
+    if donors_field is None or donors_field.get("type") != "Donor[]":
+        return []
+    return list(donors_field.get("values") or [])
+
+
 def _leaf_interests(item: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten an interest into its ingestable leaves.
 
@@ -407,8 +455,19 @@ def _extract_money(fields: list[dict[str, Any]]) -> tuple[int | None, str | None
 
 # Statuses that positively identify an organisation counterparty — verified
 # live against https://interests-api.parliament.uk on 2026-07-26 (CategoryId
-# 3, "Donations..."). "Other" is a real value the API returns and is
-# deliberately excluded: it is not a positive organisation classification.
+# 3, "Donations...") and re-verified 2026-08-04 by exhaustively enumerating
+# every DonorStatus value across CategoryId 3 (642/642), 4 (679/679) and 6
+# (17/17): "Limited Liability Partnership" and "Registered Party" are real,
+# unambiguously-organisational values this allowlist was missing (an LLP and
+# a registered political party are never private individuals). Mirrors
+# `ec_donations.ORGANISATION_DONOR_STATUSES`, which already allowlists the
+# equivalent "Limited Liability Partnership" / "Registered Political Party"
+# for the Electoral Commission's donor-status taxonomy. "Trust" (5 live
+# occurrences) is deliberately NOT added: unlike an LLP or a registered
+# party, a "Trust" can be a private family trust rather than an
+# institutional one, and EC's own allowlist excludes it too — fail closed.
+# "Other" is a real value the API returns and is deliberately excluded: it
+# is not a positive organisation classification.
 PARLIAMENT_ORGANISATION_DONOR_STATUSES = frozenset(
     {
         "Company",
@@ -416,6 +475,8 @@ PARLIAMENT_ORGANISATION_DONOR_STATUSES = frozenset(
         "Building society",
         "Unincorporated association",
         "Friendly society",
+        "Limited Liability Partnership",
+        "Registered Party",
     }
 )
 
@@ -465,6 +526,36 @@ def _extract_counterparty_name(
         return None, None, False, True
 
     return None, None, False, False
+
+
+def _counterparty_groups(
+    fields: list[dict[str, Any]], values: dict[str, Any]
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Yield one (values, money_fields) pair per counterparty on this leaf.
+
+    Every category except "Visits outside the UK" carries at most one
+    counterparty in its own flat `fields` — the existing `(values, fields)`
+    pair is returned unchanged, so this is a no-op for every already-tested
+    code path. A visit's donor(s) live in a nested `Donor[]` field (see
+    `_donor_group_field_lists`); each donor group is normalised onto the
+    `PayerName`/`PayerIsPrivateIndividual` keys `_extract_counterparty_name`
+    already understands, and the donor's own field list is kept alongside it
+    so `_extract_money` reads that donor's own contribution (`Value`), not
+    the visit's top-level fields (which carry no `Value` of their own).
+    """
+    donor_groups = _donor_group_field_lists(fields)
+    if not donor_groups:
+        return [(values, fields)]
+
+    groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for group_fields in donor_groups:
+        group_values = _fields_by_name(group_fields)
+        synthetic_values = {
+            "PayerName": group_values.get("Name"),
+            "PayerIsPrivateIndividual": group_values.get("IsPrivateIndividual"),
+        }
+        groups.append((synthetic_values, group_fields))
+    return groups
 
 
 def _canonical_company_entity(company: Company) -> Entity:
@@ -574,6 +665,12 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
     Returns summary stats: {matched, unmatched_counterparty, skipped_family,
     skipped_private_individual, skipped_unclassified_counterparty,
     skipped_no_counterparty, inverted_interval, total}.
+
+    `total` counts one unit per counterparty-classification decision, not
+    one per API record: a "Visits outside the UK" interest with 2 donors
+    contributes 2 to `total` (and can produce 2 edges) — the same precedent
+    already set by child interests, which are flattened into their own
+    counted units by `_leaf_interests` before this loop ever sees them.
     """
     json_path = Path(json_path)
     items = json.loads(json_path.read_text())
@@ -605,81 +702,91 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
         member_entity = _get_or_create_member_entity(member)
 
         for leaf in _leaf_interests(item):
-            total += 1
             fields = leaf.get("fields") or []
             values = _fields_by_name(fields)
-
-            name, company_number, is_private, is_unclassified = _extract_counterparty_name(values)
-            if is_private:
-                skipped_private_individual += 1
-                continue
-            if is_unclassified:
-                skipped_unclassified_counterparty += 1
-                continue
-            if not name:
-                skipped_no_counterparty += 1
-                continue
-
             interest_id = leaf["id"]
 
-            # Commit per interest, not the whole dump in one transaction: a
-            # giant transaction over every item/leaf holds locks for the
-            # entire ingest and loses everything already processed if one
-            # row (or the process) dies partway through.
-            try:
-                with transaction.atomic():
-                    resolved = _resolve_counterparty_entity(name, company_number, interest_id)
-                    if resolved is None:
-                        unmatched_counterparty += 1
-                        continue
-                    counterparty_entity, confidence, method, resolve_properties = resolved
+            # Almost every leaf has exactly one counterparty group (itself);
+            # "Visits outside the UK" nests 1+ donors in a `Donor[]` field
+            # and yields one group per donor (see `_counterparty_groups`).
+            for group_values, money_fields in _counterparty_groups(fields, values):
+                total += 1
 
-                    amount_cents, currency, money_properties = _extract_money(fields)
-                    valid_from = _parse_date(leaf.get("registrationDate"))
-                    valid_to = _parse_date(values.get("EndDate"))
+                name, company_number, is_private, is_unclassified = _extract_counterparty_name(
+                    group_values
+                )
+                if is_private:
+                    skipped_private_individual += 1
+                    continue
+                if is_unclassified:
+                    skipped_unclassified_counterparty += 1
+                    continue
+                if not name:
+                    skipped_no_counterparty += 1
+                    continue
 
-                    properties = {**resolve_properties, **money_properties}
-                    if valid_to is not None and valid_from is not None and valid_to < valid_from:
-                        # An inverted interval is bad data, not a real claim —
-                        # never store it as if it were valid.
-                        inverted_interval += 1
-                        properties["end_date_before_registration_date"] = valid_to.isoformat()
-                        valid_to = None
+                # Commit per interest, not the whole dump in one transaction: a
+                # giant transaction over every item/leaf holds locks for the
+                # entire ingest and loses everything already processed if one
+                # row (or the process) dies partway through.
+                try:
+                    with transaction.atomic():
+                        resolved = _resolve_counterparty_entity(name, company_number, interest_id)
+                        if resolved is None:
+                            unmatched_counterparty += 1
+                            continue
+                        counterparty_entity, confidence, method, resolve_properties = resolved
 
-                    # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
-                    edge, _ = Edge.objects.get_or_create(
-                        edge_type="declared_interest",
-                        source_entity=member_entity,
-                        target_entity=counterparty_entity,
-                        valid_from=valid_from,
-                        valid_to=valid_to,
-                        defaults={
-                            "amount_cents": amount_cents,
-                            "currency": currency,
-                            "properties": properties,
-                        },
-                    )
+                        amount_cents, currency, money_properties = _extract_money(money_fields)
+                        valid_from = _parse_date(leaf.get("registrationDate"))
+                        valid_to = _parse_date(values.get("EndDate"))
 
-                    # Attestation = THE EVIDENCE
-                    Attestation.objects.get_or_create(
-                        edge=edge,
-                        source_name=SOURCE_NAME,
-                        source_reference=str(interest_id),
-                        defaults={
-                            "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
-                            "match_confidence": confidence,
-                            "match_method": method,
-                        },
-                    )
-            except Entity.MultipleObjectsReturned:
-                # A company_number can legitimately resolve to 2+ Entity rows
-                # under different registry schemes (GB-COH, GLEIF-LEI —
-                # ADR-006 duplicate-over-merge). Count and move on rather
-                # than losing the whole run to one row.
-                ambiguous_company_number += 1
-                continue
+                        properties = {**resolve_properties, **money_properties}
+                        if (
+                            valid_to is not None
+                            and valid_from is not None
+                            and valid_to < valid_from
+                        ):
+                            # An inverted interval is bad data, not a real claim —
+                            # never store it as if it were valid.
+                            inverted_interval += 1
+                            properties["end_date_before_registration_date"] = valid_to.isoformat()
+                            valid_to = None
 
-            matched += 1
+                        # Edge = THE CLAIM (no citation — spec v0.3 §7-bis)
+                        edge, _ = Edge.objects.get_or_create(
+                            edge_type="declared_interest",
+                            source_entity=member_entity,
+                            target_entity=counterparty_entity,
+                            valid_from=valid_from,
+                            valid_to=valid_to,
+                            defaults={
+                                "amount_cents": amount_cents,
+                                "currency": currency,
+                                "properties": properties,
+                            },
+                        )
+
+                        # Attestation = THE EVIDENCE
+                        Attestation.objects.get_or_create(
+                            edge=edge,
+                            source_name=SOURCE_NAME,
+                            source_reference=str(interest_id),
+                            defaults={
+                                "source_url": f"{INTERESTS_API_BASE}/{interest_id}",
+                                "match_confidence": confidence,
+                                "match_method": method,
+                            },
+                        )
+                except Entity.MultipleObjectsReturned:
+                    # A company_number can legitimately resolve to 2+ Entity rows
+                    # under different registry schemes (GB-COH, GLEIF-LEI —
+                    # ADR-006 duplicate-over-merge). Count and move on rather
+                    # than losing the whole run to one row.
+                    ambiguous_company_number += 1
+                    continue
+
+                matched += 1
 
     return {
         "matched": matched,

@@ -71,6 +71,36 @@ def _write_json(tmp_path: Path, items: list[dict]) -> Path:
     return json_path
 
 
+def _donor_group(
+    name: str, is_private_individual: bool | None, value: str | None = None
+) -> list[dict]:
+    """One donor entry inside a "Visits outside the UK" `Donors` field.
+
+    Mirrors the live API shape verified 2026-08-04: a donor group is a
+    field-list (`Name`, `IsPrivateIndividual`, `Value`, ...) in the same
+    shape as a top-level `fields` list, nested under the `Donors` field's
+    own `values` key rather than its `value` key.
+    """
+    fields = [
+        _field("Name", name),
+        _field("IsPrivateIndividual", is_private_individual, "Boolean"),
+    ]
+    if value is not None:
+        fields.append(_field("Value", value, "Decimal", "GBP"))
+    return fields
+
+
+def _donors_field(donor_groups: list[list[dict]]) -> dict:
+    return {
+        "name": "Donors",
+        "description": "Donors and value of visits",
+        "type": "Donor[]",
+        "typeInfo": None,
+        "value": None,
+        "values": donor_groups,
+    }
+
+
 @pytest.mark.django_db
 class TestParliamentInterestsIngest:
     def test_registration_date_maps_to_valid_from(self, tmp_path):
@@ -604,6 +634,202 @@ class TestParliamentInterestsIngest:
         assert summary["matched"] == 0
         assert summary["total"] == 1
 
+    def test_visit_donor_nested_in_donor_array_is_extracted(self, tmp_path):
+        """A "Visits outside the UK" interest's sponsor lives in a nested
+        `Donor[]` field, not a flat `DonorName`/`PayerName`/`OrganisationName`
+        field. Regression test: before `_counterparty_groups` was added, the
+        flat `_fields_by_name`/`_raw_field` helpers only ever read a field's
+        own `value` (null here) and never its nested `values`, so this
+        interest fell through to `skipped_no_counterparty` with zero edges
+        created — reproduced live 2026-08-04 (410/410 Visits interests)."""
+        items = [
+            _interest(
+                20001,
+                "Visits outside the UK",
+                [
+                    _field("Purpose", "Fact finding visit"),
+                    _field("StartDate", "2025-10-06", "DateOnly"),
+                    _field("EndDate", "2025-10-10", "DateOnly"),
+                    _donors_field(
+                        [
+                            _donor_group(
+                                "Caabu (Council for Arab-British Understanding)", False, "1260.00"
+                            )
+                        ]
+                    ),
+                ],
+                registration_date="2025-10-20",
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 1
+        assert summary["skipped_no_counterparty"] == 0
+        edge = Attestation.objects.get(source_reference="20001").edge
+        assert edge.target_entity.name == "Caabu (Council for Arab-British Understanding)"
+        assert edge.amount_cents == 126000
+        assert edge.valid_from.isoformat() == "2025-10-20"
+
+    def test_visit_with_multiple_donors_creates_one_edge_per_donor(self, tmp_path):
+        """A visit jointly funded by two organisations creates two distinct
+        edges, not one edge with the second donor silently dropped."""
+        items = [
+            _interest(
+                20002,
+                "Visits outside the UK",
+                [
+                    _field("Purpose", "Conference"),
+                    _field("StartDate", "2026-06-02", "DateOnly"),
+                    _field("EndDate", "2026-06-07", "DateOnly"),
+                    _donors_field(
+                        [
+                            _donor_group("First Sponsor Org", False, "500.00"),
+                            _donor_group("Second Sponsor Org", False, "300.00"),
+                        ]
+                    ),
+                ],
+                registration_date="2026-06-20",
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 2
+        attestations = Attestation.objects.filter(source_reference="20002")
+        assert attestations.count() == 2
+        target_names = {a.edge.target_entity.name for a in attestations}
+        assert target_names == {"First Sponsor Org", "Second Sponsor Org"}
+        edge_ids = {a.edge_id for a in attestations}
+        assert len(edge_ids) == 2
+
+    def test_visit_with_private_individual_donor_creates_no_person_entity(self, tmp_path):
+        """A visit donor positively flagged as a private individual must never
+        become a person Entity or edge (ADR-004 D1) — even through the new
+        nested `Donor[]` code path, not just the flat-field path already
+        covered by `test_individual_donor_creates_no_entity_or_edge`."""
+        items = [
+            _interest(
+                20003,
+                "Visits outside the UK",
+                [
+                    _field("Purpose", "Private visit"),
+                    _field("StartDate", "2026-03-01", "DateOnly"),
+                    _field("EndDate", "2026-03-05", "DateOnly"),
+                    _donors_field([_donor_group("Jane Private Citizen", True, "2000.00")]),
+                ],
+                registration_date="2026-03-10",
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["skipped_private_individual"] == 1
+        assert summary["matched"] == 0
+        assert Attestation.objects.filter(source_reference="20003").count() == 0
+        assert not Entity.objects.filter(name="Jane Private Citizen").exists()
+
+    def test_visit_donor_with_missing_private_individual_flag_is_skipped(self, tmp_path):
+        """A donor group with no `IsPrivateIndividual` flag must never default
+        to organisation (fail-closed), mirroring
+        `test_payer_with_no_private_individual_classification_is_skipped`."""
+        items = [
+            _interest(
+                20004,
+                "Visits outside the UK",
+                [
+                    _field("Purpose", "Unclassified visit"),
+                    _field("StartDate", "2026-03-01", "DateOnly"),
+                    _field("EndDate", "2026-03-05", "DateOnly"),
+                    _donors_field([_donor_group("Ambiguous Sponsor", None, "1000.00")]),
+                ],
+                registration_date="2026-03-10",
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["skipped_unclassified_counterparty"] == 1
+        assert summary["matched"] == 0
+        assert not Entity.objects.filter(name="Ambiguous Sponsor").exists()
+
+    def test_limited_liability_partnership_donor_status_is_organisation(self, tmp_path):
+        """DonorStatus "Limited Liability Partnership" is a real, live-verified
+        value (e.g. "The Ivors Academy") this allowlist was previously
+        missing — an LLP is never a private individual. Mirrors
+        `ec_donations.ORGANISATION_DONOR_STATUSES`, which already allows it."""
+        items = [
+            _interest(
+                20005,
+                "Gifts, benefits and hospitality from UK sources",
+                [
+                    _field("DonorName", "The Ivors Academy"),
+                    _field("DonorStatus", "Limited Liability Partnership"),
+                    _field("Value", "1314.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 1
+        assert summary["skipped_unclassified_counterparty"] == 0
+        edge = Attestation.objects.get(source_reference="20005").edge
+        assert edge.target_entity.name == "The Ivors Academy"
+
+    def test_registered_party_donor_status_is_organisation(self, tmp_path):
+        """DonorStatus "Registered Party" (a registered political party) is a
+        real, live-verified value this allowlist was previously missing — a
+        registered party is never a private individual."""
+        items = [
+            _interest(
+                20006,
+                "Donations and other support (including loans) for activities as an MP",
+                [
+                    _field("DonorName", "Example Registered Party"),
+                    _field("DonorStatus", "Registered Party"),
+                    _field("Value", "5000.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["matched"] == 1
+        assert summary["skipped_unclassified_counterparty"] == 0
+        edge = Attestation.objects.get(source_reference="20006").edge
+        assert edge.target_entity.name == "Example Registered Party"
+
+    def test_trust_donor_status_remains_excluded(self, tmp_path):
+        """DonorStatus "Trust" is deliberately NOT added to the allowlist: a
+        trust can be a private family trust rather than an institutional
+        one, and `ec_donations.ORGANISATION_DONOR_STATUSES` excludes it too
+        — fail closed, never guess an ambiguous status into an organisation."""
+        items = [
+            _interest(
+                20007,
+                "Gifts, benefits and hospitality from UK sources",
+                [
+                    _field("DonorName", "Example Family Trust"),
+                    _field("DonorStatus", "Trust"),
+                    _field("Value", "800.00", "Decimal", "GBP"),
+                ],
+            )
+        ]
+        json_path = _write_json(tmp_path, items)
+
+        summary = ingest_parliament_interests_json(json_path)
+
+        assert summary["skipped_unclassified_counterparty"] == 1
+        assert summary["matched"] == 0
+        assert not Entity.objects.filter(name="Example Family Trust").exists()
+
 
 class TestParliamentInterestsFetch:
     def test_fetch_uses_valid_sort_order(self, tmp_path, monkeypatch):
@@ -659,3 +885,36 @@ class TestParliamentInterestsFetch:
         assert len(registers) == 2
         assert registers[0].register_id == 804
         assert registers[0].published_date == "2026-07-13"
+
+    def test_fetch_paginates_across_multiple_full_pages_without_premature_stop(self, tmp_path):
+        """Regression guard for the pagination-defect class already seen twice
+        in this codebase (EC's `start` parameter silently ignored, returning
+        byte-identical pages forever; a page returning fewer items than
+        requested ending the loop before the true end of the corpus). A
+        real 3-page fetch (two full pages of `page_size`, one partial) must
+        make exactly 3 requests with strictly increasing, non-repeating
+        `Skip` values, and must return the full 45 items across all pages —
+        never stopping after the first full page nor looping forever on a
+        server that ignores `Skip`.
+        """
+        page_size = 20
+        pages = {
+            0: [{"id": i} for i in range(20)],
+            20: [{"id": i} for i in range(20, 40)],
+            40: [{"id": i} for i in range(40, 45)],
+        }
+        requested_skips: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            skip = int(request.url.params["Skip"])
+            requested_skips.append(skip)
+            return httpx.Response(200, json={"items": pages.get(skip, [])})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        result = fetch_parliament_interests(
+            tmp_path, page_size=page_size, polite_delay_seconds=0, client=client
+        )
+
+        assert requested_skips == [0, 20, 40]
+        assert result.item_count == 45

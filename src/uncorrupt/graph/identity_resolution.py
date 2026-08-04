@@ -67,8 +67,30 @@ Birmingham" and 21 other sitting Lords Spiritual all parsed to surname
 "bishop" (the word "Bishop" is a functional role marker in the ex-officio
 seat's title, not a family name) and all matched the one CH officer who is
 literally surnamed Bishop ("BISHOP, Michael David, Baron Glendonbrook") --
-22 real bishops wrongly asserted as one businessman. `_LORDS_SPIRITUAL_RE`
-excludes this pattern before it ever reaches surname matching.
+22 real bishops wrongly asserted as one businessman. `_FUNCTIONAL_TITLE_WORDS`
+excludes this pattern (and "Archbishop"/"Speaker", found by the same class
+of bug) before it ever reaches surname matching.
+
+Adversarial review (2026-08) found the tier-B fix above recreated the exact
+bug it eliminated, at the *higher* 0.85 confidence: territorial confirmation
+was checked with `any()` over a whole same-forename group but then applied
+to the ENTIRE group, so one officer with a confirmed match dragged in every
+same-forename sibling, including ones whose own designation contradicted
+the member's, or carried none at all ("HOWARD ... Of Rising" and "HOWARD
+... Of Lympne" share the forename "Greville" and were both linking to both
+peers). The contested-bucket key was also built from the raw parsed title,
+so a Baron/Lord spelling variant reopened the original bug, and it only
+counted no-forename members, so a forenamed sibling ("Lord Quentin Davies")
+never contested the bucket a peerage-name sibling ("Lord Davies of
+Stamford") relied on. Fixes: territorial confirmation is now checked and
+applied per INDIVIDUAL officer record; the bucket key is normalised through
+the same baron/lord equivalence `_titles_compatible` uses, and every member
+with a matching surname+title counts toward it; the uncontested path also
+now rejects a contradicting territorial designation, not only the contested
+path. A post-pass guardrail additionally enforces, at runtime, that no CH
+officer ever receives `same_as` from more than one distinct member --
+catching the residual case (two members with a genuinely identical full
+name) that no per-tier rule defends against.
 
 Signals investigated and NOT used: date of birth (`ch_officers.py` strips it
 at ingest -- `_ALLOWED_OFFICER_FIELDS` never includes `date_of_birth`, and
@@ -105,18 +127,62 @@ CONFIDENCE_WITH_FORENAME = 0.85
 CONFIDENCE_TERRITORIAL = 0.85
 CONFIDENCE_TITLE_ONLY = 0.60
 
-_PEERAGE_TITLES = {"lord", "lady", "baroness", "baron"}
+# Earl/Countess/Viscount/Viscountess/Duke/Duchess/Marquess/Marchioness are
+# personal hereditary peerage ranks exactly like Baron/Lord -- omitting them
+# left e.g. "Viscount Hailsham" parsing as forename "viscount", title None,
+# so the peer could only ever match an untitled officer (the rank confusion
+# `_titles_compatible` exists to prevent). Including them here also means a
+# bare "The Earl of Snowdon"-style name (title + territorial, no separate
+# surname token) correctly yields no surname instead of misreading the rank
+# word as one.
+_PEERAGE_TITLES = {
+    "lord",
+    "lady",
+    "baroness",
+    "baron",
+    "earl",
+    "countess",
+    "viscount",
+    "viscountess",
+    "duke",
+    "duchess",
+    "marquess",
+    "marchioness",
+}
 _HONORIFICS = {"sir", "dame"}
 _ALL_TITLES = _PEERAGE_TITLES | _HONORIFICS
 _PREFIXES = {"the", "rt", "hon", "mr", "mrs", "ms", "dr", "prof"}
 
-# "The Lord Bishop of Birmingham" etc. -- the 26 Lords Spiritual sit ex
-# officio by diocese, a functional/rotating seat, not a personal peerage.
-# "Bishop" here is a role marker, not a surname: treating it as one collides
-# every sitting bishop onto any CH officer who happens to be literally
-# surnamed Bishop (found live in the graph -- 22 wrong `same_as` edges onto
-# one businessman, "BISHOP, Michael David, Baron Glendonbrook").
-_LORDS_SPIRITUAL_RE = re.compile(r"^bishop$")
+_TITLE_EQUIVALENCES = {"baron": "lord", "baroness": "lady"}
+
+
+def _normalize_title(title: str | None) -> str | None:
+    """Collapse baron/baroness into lord/lady so bucket keys built from raw
+    parsed titles agree with `_titles_compatible` -- otherwise "Lord Davies
+    of Stamford" and "Baron Davies of Abersoch" land in two separately
+    "uncontested" buckets that both assert onto the same officer at 0.60."""
+    if title is None:
+        return None
+    return _TITLE_EQUIVALENCES.get(title, title)
+
+
+# Ex-officio / functional role nouns that are never a family surname, even
+# though they are the only token left once title/prefix stripping removes
+# everything else: "The Lord Bishop of Birmingham" and "The Lord Archbishop
+# of Canterbury" leave "bishop"/"archbishop"; "The Speaker" leaves
+# "speaker". The 26 Lords Spiritual sit ex officio by diocese (a rotating
+# functional seat, not a personal peerage) and the Speaker is a single
+# elected office, not a family name -- treating either as a surname
+# collides every holder of the role onto whichever CH officer happens to be
+# literally surnamed that word (found live: 22 sitting bishops wrongly
+# linked to one businessman, "BISHOP, Michael David, Baron Glendonbrook").
+# A literal-word regex matching only "bishop" failed open for every other
+# functional title (found real: "The Lord Archbishop of Canterbury/York",
+# scripts/run_positive_controls.py:63-67) -- this is a deliberately curated,
+# fail-closed set, checked regardless of whether a territorial designation
+# is present (a functional role must not fall through to "assert" just
+# because it lacks the diocesan "of X" clause bishops happen to carry).
+_FUNCTIONAL_TITLE_WORDS = {"bishop", "archbishop", "speaker"}
 
 # Territorial designation: the "of X" clause in a peerage style ("of
 # Oulton", "of Preston Candover"). Extracted separately from the surname/
@@ -189,9 +255,10 @@ def parse_parliament_name(name: str) -> dict[str, Any]:
             "functional_title": False,
         }
 
-    if len(tokens) == 1 and _LORDS_SPIRITUAL_RE.match(tokens[0].lower()) and territorial:
-        # "The Lord Bishop of X" -- an ex-officio Lords Spiritual seat, not a
-        # personal peerage. "Bishop" is a role marker here, not a surname.
+    if len(tokens) == 1 and tokens[0].lower() in _FUNCTIONAL_TITLE_WORDS:
+        # "The Lord Bishop of X" / "The Lord Archbishop of X" / "The
+        # Speaker" -- a functional role, not a personal peerage. The word is
+        # a role marker here, not a surname.
         return {
             "surname": "",
             "forename": None,
@@ -255,15 +322,12 @@ def _titles_compatible(parliament_title: str | None, officer_title: str | None) 
         return officer_title is None
     if officer_title is None:
         return False
-    equivalences = {"baron": "lord", "baroness": "lady"}
-    return equivalences.get(parliament_title, parliament_title) == equivalences.get(
-        officer_title, officer_title
-    )
+    return _normalize_title(parliament_title) == _normalize_title(officer_title)
 
 
-def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
+def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, Any]:
     """Create `same_as` edges from parliament entities to CH officer entities."""
-    stats = {
+    stats: dict[str, Any] = {
         "parliamentarians": 0,
         "linked_with_forename": 0,
         "linked_territorial": 0,
@@ -271,7 +335,9 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
         "ambiguous_skipped": 0,
         "no_candidate": 0,
         "skipped_functional_title": 0,
+        "collision_dropped": 0,
         "edges_created": 0,
+        "undecidable_members": [],
     }
 
     officers = list(
@@ -292,90 +358,166 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
 
     # "Lord Smith" is not a unique parliament member either: a (surname,
     # title) bucket containing more than one real peer is "contested" -- the
-    # old single-candidate-officer shortcut below would hand every contested
+    # single-candidate-officer shortcut below would hand every contested
     # member the SAME edge, when at most one can be right (found live: one
     # real "Evan Mervyn Davies, Lord" officer with five different "Lord
     # Davies of ..." peers same_as'd onto it). Contested members need a
     # confirmed territorial match; uncontested members keep the original
-    # single-candidate rule.
+    # single-candidate rule. The key is normalised through the same
+    # baron/lord equivalence `_titles_compatible` uses (otherwise "Lord
+    # Davies of Stamford" and "Baron Davies of Abersoch" land in two
+    # separately-uncontested buckets that both assert onto the same
+    # officer), and EVERY member with this surname+title counts toward the
+    # bucket, not just the ones with no forename -- a forenamed member
+    # ("Lord Quentin Davies") can claim the same officer a no-forename peer
+    # ("Lord Davies of Stamford") would otherwise take via the uncontested
+    # shortcut.
     bucket_member_counts: dict[tuple[str, str | None], int] = {}
     for member in members:
         parsed = parse_parliament_name(member.name)
-        if parsed["surname"] and not parsed["forename"]:
-            key = (parsed["surname"], parsed["title"])
+        if parsed["surname"]:
+            key = (parsed["surname"], _normalize_title(parsed["title"]))
             bucket_member_counts[key] = bucket_member_counts.get(key, 0) + 1
     contested_buckets = {key for key, count in bucket_member_counts.items() if count > 1}
 
-    with transaction.atomic():
-        for member in members:
-            stats["parliamentarians"] += 1
-            parsed = parse_parliament_name(member.name)
-            if not parsed["surname"]:
-                if parsed["functional_title"]:
-                    stats["skipped_functional_title"] += 1
-                else:
-                    stats["no_candidate"] += 1
-                continue
+    # Phase 1: decide a match (or non-match) for every member without
+    # writing anything yet -- the officer-ownership guardrail below needs
+    # every member's decision in hand before any edge is created.
+    decisions: list[tuple[Entity, list[tuple[Entity, dict[str, Any]]], float, str]] = []
 
-            candidates = [
-                (officer, op)
-                for officer, op in by_surname.get(parsed["surname"], [])
-                if _titles_compatible(parsed["title"], op["title"])
-            ]
-            if not candidates:
-                stats["no_candidate"] += 1
-                continue
-
-            if parsed["forename"]:
-                matched = [(o, op) for o, op in candidates if op["forename"] == parsed["forename"]]
-                confidence = CONFIDENCE_WITH_FORENAME
-                tier = "surname_forename_title"
+    for member in members:
+        stats["parliamentarians"] += 1
+        parsed = parse_parliament_name(member.name)
+        if not parsed["surname"]:
+            if parsed["functional_title"]:
+                stats["skipped_functional_title"] += 1
             else:
-                # Peerage name: no forename to check. Group candidates by
-                # forename first -- candidates sharing (surname, title,
-                # forename) are the SAME person duplicated by Companies
-                # House (module docstring), never different people.
-                groups: dict[str | None, list[tuple[Entity, dict[str, Any]]]] = {}
-                for officer, op in candidates:
-                    groups.setdefault(op["forename"], []).append((officer, op))
+                stats["no_candidate"] += 1
+            continue
 
-                bucket_key = (parsed["surname"], parsed["title"])
-                if bucket_key in contested_buckets:
-                    # Multiple real parliament members share this surname +
-                    # title: the single-candidate-officer shortcut cannot
-                    # tell them apart, and a bare/no-territorial officer
-                    # candidate cannot be safely attributed to any one of
-                    # them. Only a positively confirmed territorial
-                    # designation breaks the tie.
-                    territorial_groups = [
-                        group
-                        for group in groups.values()
-                        if any(
-                            op["territorial"] is not None
-                            and _territorial_compatible(parsed["territorial"], op["territorial"])
-                            for _, op in group
-                        )
+        candidates = [
+            (officer, op)
+            for officer, op in by_surname.get(parsed["surname"], [])
+            if _titles_compatible(parsed["title"], op["title"])
+        ]
+        if not candidates:
+            stats["no_candidate"] += 1
+            continue
+
+        if parsed["forename"]:
+            matched = [(o, op) for o, op in candidates if op["forename"] == parsed["forename"]]
+            confidence = CONFIDENCE_WITH_FORENAME
+            tier = "surname_forename_title"
+        else:
+            # Peerage name: no forename to check. Group candidates by
+            # forename first -- candidates sharing (surname, title,
+            # forename) are the SAME person duplicated by Companies
+            # House (module docstring), never different people.
+            groups: dict[str | None, list[tuple[Entity, dict[str, Any]]]] = {}
+            for officer, op in candidates:
+                groups.setdefault(op["forename"], []).append((officer, op))
+
+            bucket_key = (parsed["surname"], _normalize_title(parsed["title"]))
+            if bucket_key in contested_buckets:
+                # Multiple real parliament members share this surname +
+                # title: the single-candidate-officer shortcut cannot tell
+                # them apart. Only a positively confirmed territorial
+                # designation breaks the tie -- and it must be confirmed on
+                # the INDIVIDUAL officer record, not merely somewhere in its
+                # forename group, or a group containing one officer with a
+                # confirmed match drags in every same-forename sibling,
+                # including ones whose own designation contradicts the
+                # member's (found live: "HOWARD ... Of Rising" and "HOWARD
+                # ... Of Lympne" share the forename "Greville" and would
+                # otherwise both link to both peers).
+                territorial_groups = [
+                    group
+                    for group in groups.values()
+                    if any(
+                        op["territorial"] is not None
+                        and _territorial_compatible(parsed["territorial"], op["territorial"])
+                        for _, op in group
+                    )
+                ]
+                if parsed["territorial"] and len(territorial_groups) == 1:
+                    matched = [
+                        (o, op)
+                        for o, op in territorial_groups[0]
+                        if op["territorial"] is not None
+                        and _territorial_compatible(parsed["territorial"], op["territorial"])
                     ]
-                    if parsed["territorial"] and len(territorial_groups) == 1:
-                        matched = territorial_groups[0]
-                        confidence = CONFIDENCE_TERRITORIAL
-                        tier = "surname_title_territorial"
-                    else:
-                        matched = []
-                        confidence = CONFIDENCE_TITLE_ONLY
-                        tier = "surname_title_only"
+                    confidence = CONFIDENCE_TERRITORIAL
+                    tier = "surname_title_territorial"
                 else:
-                    # Not contested: only one real parliament member could
-                    # possibly be this surname+title, so the original
-                    # single-distinct-officer rule is safe.
-                    matched = candidates if len(groups) == 1 else []
+                    matched = []
                     confidence = CONFIDENCE_TITLE_ONLY
                     tier = "surname_title_only"
+            else:
+                # Not contested: only one real parliament member could
+                # possibly be this surname+title, so the single-candidate
+                # rule is safe from a cross-member collision -- but an
+                # officer record whose OWN territorial designation
+                # contradicts this member's (or is present when the member
+                # has none) still belongs to someone else, and that check
+                # must not be skipped just because the bucket happens to be
+                # uncontested (found live: sole member "Lord Howard of
+                # Rising" against an officer titled "...Of Lympne").
+                if len(groups) == 1:
+                    sole_group = next(iter(groups.values()))
+                    matched = [
+                        (o, op)
+                        for o, op in sole_group
+                        if _territorial_compatible(parsed["territorial"], op["territorial"])
+                    ]
+                else:
+                    matched = []
+                confidence = CONFIDENCE_TITLE_ONLY
+                tier = "surname_title_only"
 
-            if not matched:
-                stats["ambiguous_skipped"] += 1
-                continue
+        if not matched:
+            stats["ambiguous_skipped"] += 1
+            stats["undecidable_members"].append(
+                {"registry_id": member.registry_id, "name": member.name, "reason": "ambiguous"}
+            )
+            continue
 
+        decisions.append((member, matched, confidence, tier))
+
+    # Phase 2: guardrail -- no CH officer may end up with `same_as` claims
+    # from more than one distinct parliament member. If it would, drop
+    # every claim on that officer rather than guess which member is right.
+    # This is the invariant whose absence let one real officer collect
+    # `same_as` edges from five different peers before this module existed
+    # -- enforced here as a runtime post-pass (not merely scattered
+    # per-tier logic) because a genuine full-name collision bypasses the
+    # per-tier contested-bucket and territorial defenses entirely.
+    officer_claimants: dict[int, set[int]] = {}
+    for member, matched, _confidence, _tier in decisions:
+        for officer, _op in matched:
+            officer_claimants.setdefault(officer.id, set()).add(member.id)
+    colliding_officer_ids = {
+        officer_id for officer_id, claimants in officer_claimants.items() if len(claimants) > 1
+    }
+
+    final_decisions: list[tuple[Entity, list[tuple[Entity, dict[str, Any]]], float, str]] = []
+    for member, matched, confidence, tier in decisions:
+        surviving = [(o, op) for o, op in matched if o.id not in colliding_officer_ids]
+        if not surviving:
+            stats["ambiguous_skipped"] += 1
+            stats["collision_dropped"] += 1
+            stats["undecidable_members"].append(
+                {
+                    "registry_id": member.registry_id,
+                    "name": member.name,
+                    "reason": "officer_collision",
+                }
+            )
+            continue
+        final_decisions.append((member, surviving, confidence, tier))
+
+    # Phase 3: write.
+    with transaction.atomic():
+        for member, matched, confidence, tier in final_decisions:
             if tier == "surname_forename_title":
                 stats["linked_with_forename"] += 1
             elif tier == "surname_title_territorial":
@@ -414,4 +556,12 @@ def resolve_cross_register_identities(dry_run: bool = False) -> dict[str, int]:
                     },
                 )
 
+    logger.info(
+        "resolve_cross_register_identities: %d parliamentarians, %d edges created, "
+        "%d undecidable (%d dropped by the officer-collision guardrail)",
+        stats["parliamentarians"],
+        stats["edges_created"],
+        len(stats["undecidable_members"]),
+        stats["collision_dropped"],
+    )
     return stats

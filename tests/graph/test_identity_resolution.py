@@ -17,6 +17,7 @@ import pytest
 from uncorrupt.graph.identity_resolution import (
     CONFIDENCE_TERRITORIAL,
     CONFIDENCE_TITLE_ONLY,
+    CONFIDENCE_WITH_FORENAME,
     _territorial_compatible,
     _titles_compatible,
     parse_officer_name,
@@ -87,6 +88,20 @@ def test_ordinary_bishop_surname_is_not_excluded():
     parsed = parse_parliament_name("Lord Smith")
     assert parsed["surname"] == "smith"
     assert parsed["functional_title"] is False
+
+
+def test_viscount_is_recognised_as_a_title_not_a_forename():
+    """GIVEN a peer styled with a peerage rank word missing from the
+    original title set ("Viscount Hailsham")
+    WHEN parsed
+    THEN "Viscount" is stripped as the title, not left to be misread as a
+    bogus "forename" — the old parse gave title=None, meaning the peer
+    could only ever match an untitled CH officer, exactly the rank
+    confusion `_titles_compatible` exists to prevent."""
+    parsed = parse_parliament_name("Viscount Hailsham")
+    assert parsed["title"] == "viscount"
+    assert parsed["surname"] == "hailsham"
+    assert parsed["forename"] is None
 
 
 def test_parses_officer_name_surname_forename_title():
@@ -300,6 +315,196 @@ class TestContestedBucketRequiresTerritorialConfirmation:
 
         assert stats["skipped_functional_title"] == 1
         assert not Edge.objects.filter(edge_type="same_as", source_entity=bishop_member).exists()
+
+
+@pytest.mark.django_db
+class TestAdversarialReviewRegressions:
+    """Regressions from an adversarial review that reproduced, by executing
+    the shipped code, that the 0.85 territorial tier recreated the exact
+    cross-assertion bug it was written to eliminate — at higher confidence."""
+
+    def test_territorial_confirmation_is_checked_per_officer_record_not_per_group(
+        self,
+    ):
+        """GIVEN two distinct real peers who share surname + title (a
+        contested bucket) and TWO CH officer records that happen to share
+        the SAME forename token ("Greville") but carry DIFFERENT, mutually
+        contradicting territorial designations (found live: "HOWARD,
+        Greville Patrick Charles, The Lord Howard Of Rising" and "HOWARD,
+        Greville John, The Lord Howard Of Lympne")
+        WHEN identities are resolved
+        THEN each peer is linked ONLY to the officer record whose own
+        territorial designation actually confirms it — grouping by
+        forename must not let one confirmed officer drag in a
+        same-forename sibling whose designation contradicts the member."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        lympne = _make_member("mp-2", "Lord Howard of Lympne")
+        officer_rising = _make_officer(
+            "officer-1", "HOWARD, Greville Patrick Charles, The Lord Howard Of Rising"
+        )
+        officer_lympne = _make_officer(
+            "officer-2", "HOWARD, Greville John, The Lord Howard Of Lympne"
+        )
+
+        resolve_cross_register_identities()
+
+        rising_edge = Edge.objects.get(edge_type="same_as", source_entity=rising)
+        assert rising_edge.target_entity_id == officer_rising.id
+        lympne_edge = Edge.objects.get(edge_type="same_as", source_entity=lympne)
+        assert lympne_edge.target_entity_id == officer_lympne.id
+        assert not Edge.objects.filter(
+            edge_type="same_as", source_entity=rising, target_entity=officer_lympne
+        ).exists()
+        assert not Edge.objects.filter(
+            edge_type="same_as", source_entity=lympne, target_entity=officer_rising
+        ).exists()
+
+    def test_bare_officer_record_in_a_confirmed_forename_group_gets_no_edge_at_any_tier(
+        self,
+    ):
+        """GIVEN a contested bucket where a confirmed territorial match
+        exists for one peer, and a SECOND officer record sharing that same
+        forename but carrying NO territorial designation of its own at all
+        (found live: "DAVIES, John Emlyn, Lord Davies Of Stamford" confirms
+        "Lord Davies of Stamford"; "DAVIES, John Emrys, Lord" shares
+        forename "John" but has no designation to confirm anything)
+        WHEN identities are resolved
+        THEN the confirmed peer is linked only to the confirming officer
+        record, the bare officer record receives NO same_as edge from
+        anyone — neither at the territorial tier nor a silent fallback to
+        the weak title-only tier — and the non-matching peer gets nothing
+        either."""
+        stamford = _make_member("mp-1", "Lord Davies of Stamford")
+        oldham = _make_member("mp-2", "Lord Davies of Oldham")
+        officer_stamford = _make_officer("officer-1", "DAVIES, John Emlyn, Lord Davies Of Stamford")
+        officer_bare = _make_officer("officer-2", "DAVIES, John Emrys, Lord")
+
+        stats = resolve_cross_register_identities()
+
+        stamford_edge = Edge.objects.get(edge_type="same_as", source_entity=stamford)
+        assert stamford_edge.target_entity_id == officer_stamford.id
+        assert stamford_edge.attestations.get().match_confidence == CONFIDENCE_TERRITORIAL
+        assert not Edge.objects.filter(edge_type="same_as", target_entity=officer_bare).exists()
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=oldham).exists()
+        assert stats["linked_title_only"] == 0
+
+    def test_bucket_key_normalises_baron_lord_equivalence(self):
+        """GIVEN two distinct real peers who share surname + title but one
+        is styled "Lord" and the other "Baron" — the same rank written two
+        ways — against a single bare CH officer record
+        WHEN identities are resolved
+        THEN both peers are treated as ONE contested bucket (not two
+        separately "uncontested" buckets) and neither gets an edge to the
+        shared officer — the original multi-peer-one-officer bug, reached
+        via a title spelling variant instead of an exact string match."""
+        stamford = _make_member("mp-1", "Lord Davies of Stamford")
+        abersoch = _make_member("mp-2", "Baron Davies of Abersoch")
+        _make_officer("officer-1", "DAVIES, Evan Mervyn, Lord")
+
+        resolve_cross_register_identities()
+
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=stamford).exists()
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=abersoch).exists()
+
+    def test_forenamed_member_contests_the_bucket_for_a_no_forename_sibling(self):
+        """GIVEN a forenamed member ("Lord Quentin Davies") and a
+        no-forename peerage member ("Lord Davies of Stamford") who share
+        surname + title, against a single CH officer whose forename
+        matches the FORENAMED member exactly
+        WHEN identities are resolved
+        THEN the forenamed member gets the edge (a genuine forename match)
+        and the no-forename peer gets nothing — the peer's own
+        contested-bucket gate must count the forenamed sibling, or the
+        peer's weak uncontested shortcut hands the SAME officer to a
+        second, different member."""
+        quentin = _make_member("mp-1", "Lord Quentin Davies")
+        stamford = _make_member("mp-2", "Lord Davies of Stamford")
+        officer = _make_officer("officer-1", "DAVIES, Quentin, Lord")
+
+        stats = resolve_cross_register_identities()
+
+        quentin_edge = Edge.objects.get(edge_type="same_as", source_entity=quentin)
+        assert quentin_edge.target_entity_id == officer.id
+        assert quentin_edge.attestations.get().match_confidence == CONFIDENCE_WITH_FORENAME
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=stamford).exists()
+        assert stats["linked_title_only"] == 0
+
+    def test_uncontested_bucket_still_rejects_a_contradicting_territorial_designation(
+        self,
+    ):
+        """GIVEN a surname + title shared by only ONE real parliament
+        member (uncontested) whose display name carries a territorial
+        designation, and the single candidate CH officer record carries a
+        DIFFERENT territorial designation in its own title field
+        WHEN identities are resolved
+        THEN no edge is created — an uncontested bucket must not skip the
+        territorial contradiction test just because there is nobody else
+        to disambiguate against; the officer's own designation says it
+        belongs to someone else."""
+        rising = _make_member("mp-1", "Lord Howard of Rising")
+        _make_officer("officer-1", "HOWARD, Someone Else, The Lord Howard Of Lympne")
+
+        stats = resolve_cross_register_identities()
+
+        assert not Edge.objects.filter(edge_type="same_as", source_entity=rising).exists()
+        assert stats["linked_title_only"] == 0
+        assert stats["ambiguous_skipped"] == 1
+
+    def test_archbishop_functional_title_produces_no_edge(self):
+        """GIVEN "The Lord Archbishop of Canterbury" — a real ex-officio
+        Lords Spiritual style, not a personal peerage — and a CH officer
+        literally surnamed Archbishop
+        WHEN identities are resolved
+        THEN no same_as edge is created — the functional-title exclusion
+        must catch more than the single literal word "bishop" (found real:
+        scripts/run_positive_controls.py cites "The Lord Archbishop of
+        York")."""
+        archbishop_member = _make_member("mp-1", "The Lord Archbishop of Canterbury")
+        _make_officer("officer-1", "ARCHBISHOP, Peter James, Lord")
+
+        stats = resolve_cross_register_identities()
+
+        assert stats["skipped_functional_title"] == 1
+        assert not Edge.objects.filter(
+            edge_type="same_as", source_entity=archbishop_member
+        ).exists()
+
+
+@pytest.mark.django_db
+class TestUndecidableMembersArePersisted:
+    def test_ambiguous_members_are_returned_by_registry_id(self):
+        """GIVEN two genuine namesake peers with no discriminating signal
+        (the contested-bucket-no-territorial case)
+        WHEN identities are resolved
+        THEN the actual undecidable member identifiers are returned, not
+        just an aggregate count — previously "185 undecidable members" was
+        a subset of `ambiguous_skipped` that could not be re-derived from
+        the stats dict at all."""
+        stamford = _make_member("mp-1", "Lord Davies of Stamford")
+        oldham = _make_member("mp-2", "Lord Davies of Oldham")
+        _make_officer("officer-1", "DAVIES, Evan Mervyn, Lord")
+
+        stats = resolve_cross_register_identities()
+
+        undecidable_ids = {row["registry_id"] for row in stats["undecidable_members"]}
+        assert undecidable_ids == {stamford.registry_id, oldham.registry_id}
+        assert len(stats["undecidable_members"]) == stats["ambiguous_skipped"]
+
+    def test_resolution_run_logs_a_summary(self, caplog):
+        """GIVEN a normal resolution run
+        WHEN identities are resolved
+        THEN the module's own logger actually emits a record — previously
+        `logger` was instantiated and never called, so nothing about a run
+        was observable outside the returned stats dict."""
+        import logging
+
+        _make_member("mp-1", "Lord Agnew of Oulton")
+        _make_officer("officer-1", "AGNEW, Theodore Thomas More, Lord")
+
+        with caplog.at_level(logging.INFO, logger="uncorrupt.graph.identity_resolution"):
+            resolve_cross_register_identities()
+
+        assert len(caplog.records) >= 1
 
 
 @pytest.mark.django_db

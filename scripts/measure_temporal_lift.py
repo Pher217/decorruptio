@@ -183,6 +183,25 @@ def classify_positive_controls(
         level = relationship_evidence_level(
             {p.id for p in person_candidates}, goal.id, adj, max_hops, award_cutoff
         )
+        if level is None:
+            # A structural path exists but none of it is temporally
+            # meaningful (every path found is same_as-only) — see
+            # `relationship_evidence_level`'s docstring. Reuses this file's
+            # existing "level": None convention for excluded-from-count rows
+            # (see `report_cohort`'s `r.get("level") is not None` filter)
+            # rather than a second sentinel.
+            rows.append(
+                {
+                    "person_register_name": person.name,
+                    "person_as_published": published_name,
+                    "company": company.name,
+                    "status": "classified_no_temporal_claim",
+                    "level": None,
+                    "source_edge_level": int(source_edge_level),
+                    "source_edge_pages": source_edge_pages,
+                }
+            )
+            continue
         rows.append(
             {
                 "person_register_name": person.name,
@@ -266,6 +285,19 @@ def classify_vip_lane_cohort(
         level = relationship_evidence_level(
             {r.id for r in referrers}, supplier.id, adj, max_hops, award_cutoff
         )
+        if level is None:
+            rows.append(
+                {
+                    "supplier": supplier_name,
+                    "supplier_entity": supplier.name,
+                    "referrer": referrer_name,
+                    "referrer_field": referrer_field,
+                    "referrer_candidates": len(referrers),
+                    "status": "classified_no_temporal_claim",
+                    "level": None,
+                }
+            )
+            continue
         rows.append(
             {
                 "supplier": supplier_name,
@@ -321,6 +353,16 @@ def classify_negative_controls(
     rows = []
     for person, company in pairs:
         level = relationship_evidence_level({person.id}, company.id, adj, max_hops, award_cutoff)
+        if level is None:
+            rows.append(
+                {
+                    "person": person.name,
+                    "company": company.name,
+                    "status": "classified_no_temporal_claim",
+                    "level": None,
+                }
+            )
+            continue
         rows.append(
             {
                 "person": person.name,

@@ -327,6 +327,61 @@ class TestFindPaths:
         result = tools.find_paths(a.id, b.id, max_hops=0)
         assert result["max_hops"] == 1
 
+    def test_path_with_no_identity_bridge_reports_none_confidence(self):
+        """GIVEN a path with no `same_as` edge WHEN find_paths is called
+        THEN that path's min_identity_confidence is None, not a number and
+        not omitted."""
+        referrer = Entity.objects.create(entity_type="person", name="Referrer MP")
+        supplier = Entity.objects.create(entity_type="company", name="Supplier Ltd")
+        Edge.objects.create(edge_type="officer_of", source_entity=referrer, target_entity=supplier)
+
+        result = tools.find_paths(referrer.id, supplier.id, max_hops=1)
+
+        assert len(result["paths"]) == 1
+        assert result["paths"][0]["min_identity_confidence"] is None
+
+    def test_path_bridged_by_identity_reports_its_confidence(self):
+        """GIVEN a path bridged by a `same_as` edge with an attested
+        confidence WHEN find_paths is called THEN that path's
+        min_identity_confidence reports the attested value -- the diagnostic
+        the reviewer's own scenario found missing from this tool."""
+        parliament_record = Entity.objects.create(entity_type="person", name="A")
+        ch_record = Entity.objects.create(entity_type="person", name="A (CH record)")
+        same_as_edge = Edge.objects.create(
+            edge_type="same_as", source_entity=parliament_record, target_entity=ch_record
+        )
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            match_confidence=0.60,
+        )
+
+        result = tools.find_paths(parliament_record.id, ch_record.id, max_hops=1)
+
+        assert len(result["paths"]) == 1
+        assert result["paths"][0]["min_identity_confidence"] == 0.60
+
+    def test_low_confidence_identity_bridge_is_reported_not_filtered(self):
+        """GIVEN a path bridged by a WEAK identity guess (0.60) alongside a
+        real edge WHEN find_paths is called THEN the path is still returned
+        -- the confidence is reported, never used to drop, reorder, or gate
+        it. Non-gating is the entire point of this diagnostic."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        mid = Entity.objects.create(entity_type="person", name="A (CH record)")
+        c = Entity.objects.create(entity_type="company", name="C")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=mid)
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            match_confidence=0.60,
+        )
+        Edge.objects.create(edge_type="officer_of", source_entity=mid, target_entity=c)
+
+        result = tools.find_paths(a.id, c.id, max_hops=2)
+
+        assert len(result["paths"]) == 1
+        assert result["paths"][0]["min_identity_confidence"] == 0.60
+
 
 @pytest.mark.django_db
 class TestGetAttestations:

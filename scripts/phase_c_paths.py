@@ -45,6 +45,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 django.setup()
 
 from uncorrupt.graph.models import Edge, Entity  # noqa: E402
+from uncorrupt.graph.register_snapshots import path_min_identity_confidence  # noqa: E402
 
 COHORT_CSV = ".consult/vip_lane_positives.csv"
 VIP_CH_CACHE = "experiments/vip_ch_cache.json"
@@ -383,6 +384,23 @@ def find_paths(
     return pre_award, undated
 
 
+def _serialize_paths(paths: list[list[Edge]]) -> tuple[list[list[str]], list[float | None]]:
+    """Render a set of paths for the JSON report: their edge@date strings and
+    the non-gating `min_identity_confidence` diagnostic, index-aligned (the
+    Nth entry of each returned list describes the Nth path).
+
+    `min_identity_confidence` is strictly additive, exploratory metadata —
+    see `register_snapshots.path_min_identity_confidence`'s docstring for
+    why it is uncalibrated and must never be read back into `status` or any
+    other decision this script makes. Truncated to the first 5 paths, same
+    as the caller's existing `pre_award_paths`/`undated_paths` cap.
+    """
+    capped = paths[:5]
+    rendered = [[f"{e.edge_type}@{e.valid_from}" for e in p] for p in capped]
+    confidences = [path_min_identity_confidence(p) for p in capped]
+    return rendered, confidences
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-hops", type=int, default=2)
@@ -462,6 +480,8 @@ def main() -> None:
             counts["no_path"] += 1
             status = "no_path"
 
+        pre_award_rendered, pre_award_confidences = _serialize_paths(pre_award)
+        undated_rendered, undated_confidences = _serialize_paths(undated)
         results.append(
             {
                 "supplier": supplier_name,
@@ -469,12 +489,10 @@ def main() -> None:
                 "referrer": referrer_name,
                 "referrer_candidates": len(referrers),
                 "status": status,
-                "pre_award_paths": [
-                    [f"{e.edge_type}@{e.valid_from}" for e in p] for p in pre_award[:5]
-                ],
-                "undated_paths": [
-                    [f"{e.edge_type}@{e.valid_from}" for e in p] for p in undated[:5]
-                ],
+                "pre_award_paths": pre_award_rendered,
+                "pre_award_paths_min_identity_confidence": pre_award_confidences,
+                "undated_paths": undated_rendered,
+                "undated_paths_min_identity_confidence": undated_confidences,
             }
         )
 

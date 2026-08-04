@@ -32,6 +32,7 @@ from scripts.phase_c_paths import find_paths as _phase_c_find_paths
 
 from uncorrupt.graph import ch_officers
 from uncorrupt.graph.models import Alias, Edge, Entity
+from uncorrupt.graph.register_snapshots import path_min_identity_confidence
 from uncorrupt.mcp.privacy import entity_summary
 from uncorrupt.register.loader import all_sources
 
@@ -161,6 +162,21 @@ def find_paths(source_id: int, target_id: int, max_hops: int = 2) -> dict[str, A
     `valid_from`, and the names of the sources that attest it (see
     `get_attestations` for the full evidence record behind any one edge).
 
+    Each path also carries `min_identity_confidence`
+    (`register_snapshots.path_min_identity_confidence`) -- the same
+    STRICTLY POST-HOC, EXPLORATORY, NON-GATING diagnostic
+    `scripts/phase_c_paths.py`'s own report attaches, surfaced here too
+    because this tool is the layer closest to a published claim: without
+    it, a path bridged by a 0.60 "surname + peerage title only" identity
+    guess rendered identically to one bridged by a registry identifier, and
+    `get_attestations` only exposes the underlying confidence on a second,
+    separate call the caller would have to know to make. Reporting this
+    value NEVER filters, reorders, or drops a path -- see that function's
+    own docstring for why it is uncalibrated and must never be read as a
+    probability. `None` means either no identity bridge on the path, or an
+    unattested one (see that docstring); never confuse it with 1.0
+    ("certain").
+
     `max_hops` is clamped server-side to `[1, _MAX_FIND_PATHS_HOPS]` before
     the walk runs -- the locked Phase C benchmark only ever needs 2, so even
     the ceiling is generous, and an unbounded hop count on a 400k+-edge graph
@@ -186,7 +202,11 @@ def find_paths(source_id: int, target_id: int, max_hops: int = 2) -> dict[str, A
         "target_id": target_id,
         "max_hops": effective_max_hops,
         "paths": [
-            {"hops": len(path), "edges": [_serialize_edge(e) for e in path]}
+            {
+                "hops": len(path),
+                "edges": [_serialize_edge(e) for e in path],
+                "min_identity_confidence": path_min_identity_confidence(path),
+            }
             for path in [*dated, *undated]
         ],
     }

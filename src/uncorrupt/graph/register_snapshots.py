@@ -654,20 +654,121 @@ def edge_evidence_level(edge: Edge, award_date: date) -> EvidenceLevel:
     return EvidenceLevel.ATEMPORAL_CORROBORATION
 
 
-def path_evidence_level(path: Sequence[Edge], award_date: date) -> EvidenceLevel:
+def path_evidence_level(path: Sequence[Edge], award_date: date) -> EvidenceLevel | None:
     """The weakest evidence level among a path's temporally-meaningful edges.
 
     `same_as` edges assert identity, not a relationship in time — they carry
     no temporal claim to weaken and are excluded, mirroring
     `phase_c_paths.find_paths`' treatment of `same_as` as a zero-cost hop
-    exempt from the date test.
+    exempt from the date test. That exclusion is correct and must stay: an
+    identity assertion cannot weaken a temporal level it never contributed
+    to.
+
+    Returns `None` — explicitly, never an `EvidenceLevel` member — when the
+    path has NO temporally-meaningful edge at all (empty path, or every edge
+    on it is `same_as`). This used to return `EvidenceLevel.EVENT_DATED`
+    (level 1, the STRONGEST level) for that case, on the theory that "no
+    temporal edge on the path" means "nothing to weaken it" — but that is
+    fail-open: it asserts affirmative event-dated support that does not
+    exist, in a codebase whose architecture (ADR-008) is fail-closed
+    everywhere else. `None` is the honest representation of "no temporal
+    claim was made"; `EvidenceLevel` has no member for that, and inventing
+    one would misrepresent it as either evidence (weak or strong) or as
+    `NO_TRACE` (which specifically means "no path was found at all" — see
+    `relationship_evidence_level`), neither of which is true here: a path
+    WAS found, it just says nothing about timing. `relationship_evidence_level`
+    is the only caller and is written to handle `None` explicitly (see its
+    docstring for how); any new caller must do the same rather than compare
+    the result to an `EvidenceLevel` directly.
     """
     levels = [edge_evidence_level(edge, award_date) for edge in path if edge.edge_type != "same_as"]
     if not levels:
-        # A path made entirely of same_as identity hops carries no temporal
-        # claim at all — nothing on it can weaken the result.
-        return EvidenceLevel.EVENT_DATED
+        return None
     return max(levels)
+
+
+def path_min_identity_confidence(path: Sequence[Edge]) -> float | None:
+    """The weakest `same_as` identity-bridge confidence on a path.
+
+    STRICTLY POST-HOC, EXPLORATORY, NON-GATING DIAGNOSTIC METADATA. This
+    value must NEVER alter inclusion, scoring, path selection, any gate, the
+    sealed cohort, or the verdict — it may only be *reported* alongside a
+    path's evidence level. No consumer of this project currently reads
+    `Attestation.match_confidence` on a `same_as` edge for any gating
+    purpose (`gates/binding.py` deliberately excludes it — see its ADR-008
+    docstring); this function must not become the first.
+
+    The `same_as` confidence values it reads (0.60 "surname + peerage title
+    only" / 0.85 forename- or territorial-designation-verified — see
+    `identity_resolution.py`'s `CONFIDENCE_*` constants) are UNCALIBRATED
+    estimates, not probabilities. Hand-verification found 15 of 21 checked
+    cross-register identity paths were namesake collisions — two different
+    real humans sharing a name — at BOTH tiers: at 0.85, one match paired an
+    MP born 1986 with a 2002 directorship (age 15, impossible), and two
+    others carried the wrong middle name. Never read this value as "the
+    probability this identity match is correct." Reporting it fixes
+    OBSERVABILITY — a path bridged by a coin-flip identity guess no longer
+    reports identical strength to one bridged by a registry identifier — it
+    does NOT fix VALIDITY. Displaying this number does not make any
+    person-level claim on the path defensible.
+
+    Computed PER BRIDGE (per `same_as` edge on the path), not by flattening
+    every bridge's attestations into one list and taking `min` of that. A
+    bridge is first reduced to its OWN weakest attestation confidence
+    (mirrors `test_reports_the_weaker_of_two_attestations_on_the_same_edge`:
+    if one `same_as` edge somehow carries two attestations, the weaker of
+    the two describes that bridge). A bridge that carries NO
+    confidence-bearing attestation at all is UNKNOWN — not "no opinion" —
+    and unknown DOMINATES: if ANY bridge on the path is unknown, the path's
+    overall identity confidence is `None`, never silently resolved to
+    whatever a DIFFERENT, better-attested bridge on the same path happened
+    to report. An earlier version of this function flattened attestations
+    across every bridge before taking `min`, which let a bridge with zero
+    evidence contribute nothing to that flat list and become invisible — an
+    unattested `same_as` hop sat right next to a 0.85-attested one and the
+    function published 0.85, hiding the unattested hop entirely. That is an
+    aggregation over the wrong set (attestations, instead of
+    bridges-with-unknown-treated-as-unknown) and silently reintroduces the
+    exact "a gap in the evidence reads as safe" failure this module exists
+    to close.
+
+    KNOWN FAIL-OPEN AT THE STORAGE LAYER, not fixable here:
+    `Attestation.match_confidence` (`models.py:245`) is a NOT NULL
+    `FloatField` with `default=1.0` (confirmed live via `PRAGMA
+    table_info`: `notnull=1`) — "unknown identity confidence" is not
+    currently representable in the schema at all. An `Attestation` created
+    without an explicit `match_confidence` — e.g. a future call site that
+    forgets to pass one — silently stores 1.0, "certain identity", the
+    STRONGEST possible value, not "unknown". This function has no way to
+    tell a genuinely-certain 1.0 apart from a forgotten one; it can only see
+    the NOT NULL column. Fixing this requires making the column nullable
+    with no unsafe default, which is a schema migration (human-applied in
+    this repo) and out of scope for this function. See
+    `TestPathMinIdentityConfidence::test_KNOWN_DEFECT_...` in
+    `tests/graph/test_register_snapshots.py`, which pins the current
+    (defective) behaviour so a future model change makes that test fail and
+    forces someone to notice.
+
+    Returns `None` when the path uses no identity bridge at all (no
+    `same_as` edge on it), and also when ANY `same_as` edge on the path is
+    an unknown bridge as defined above — both mean "cannot report a
+    confidence for this path" and are deliberately not distinguished in the
+    return value. Otherwise returns the WEAKEST of the per-bridge
+    confidences (`test_reports_the_weaker_of_two_same_as_confidences_on_the_path`):
+    a chain is only as trustworthy as its weakest identity assertion.
+    """
+    same_as_edges = [edge for edge in path if edge.edge_type == "same_as"]
+    if not same_as_edges:
+        return None
+
+    bridge_confidences: list[float] = []
+    for edge in same_as_edges:
+        attestation_confidences = list(edge.attestations.values_list("match_confidence", flat=True))
+        if not attestation_confidences:
+            return None
+        bridge_confidences.append(min(attestation_confidences))
+
+    return min(bridge_confidences)
 
 
 def find_all_paths(
@@ -721,18 +822,54 @@ def relationship_evidence_level(
     adj: dict[int, list[Edge]],
     max_hops: int,
     award_date: date,
-) -> EvidenceLevel:
+) -> EvidenceLevel | None:
     """Classify a person<->company relationship on the evidence ladder.
 
     The best (lowest-numbered) level among every path found — if ANY path is
     pre-award-observed or event-dated, the relationship is admissible at
     that level, even if other paths between the same two entities are
     weaker. No path at all is NO_TRACE, never a "refuted" level.
+
+    A path can carry NO temporal evidence at all — `path_evidence_level`
+    returns `None` for a path made entirely of `same_as` identity hops (see
+    its docstring). Such paths are excluded from the min-reduction: they say
+    nothing about timing, so they must never be compared against — or win
+    over — a path that does. If EVERY path found is like this — a structural
+    connection exists, but none of it is temporally meaningful — this
+    function returns `None` too, mirroring `path_evidence_level`'s own
+    convention rather than inventing a second one.
+
+    `None` here, never `EvidenceLevel.ATEMPORAL_CORROBORATION` (an earlier
+    version of this function fell back to that level, reasoning that its
+    only caller always needed a concrete `EvidenceLevel` back — that reasoning
+    was false: `scripts/measure_temporal_lift.py` already has a `"level":
+    None` convention for unresolved rows, filtered out by `report_cohort`
+    via `r.get("level") is not None`, so a `None` here needs no new
+    handling, only reuse). Level 3 is defined at the top of this module as
+    "the register CURRENTLY CONTAINS the relationship; timing unknown" — it
+    asserts a real, non-identity relationship exists, corroborated by
+    something in a register. An identity-only path contains no relationship
+    claim in any register at all, only a chain of `same_as` assertions;
+    reporting level 3 for it would manufacture corroboration that was never
+    observed — the same "absence reads as support" failure this whole
+    module exists to close, just one rung lower than the original bug.
+    `NO_TRACE` is also wrong here, for the same reason `path_evidence_level`
+    rejects it: a real structural path WAS found (the branch immediately
+    below handles the genuinely-empty case), so reporting "no record at
+    all" would itself be a false claim.
+
+    Callers MUST handle `None` explicitly — never call `int()` or `.name` on
+    the result unconditionally.
     """
     paths = find_all_paths(start_ids, goal_id, adj, max_hops)
     if not paths:
         return EvidenceLevel.NO_TRACE
-    return min(path_evidence_level(p, award_date) for p in paths)
+    levels = [
+        level for level in (path_evidence_level(p, award_date) for p in paths) if level is not None
+    ]
+    if not levels:
+        return None
+    return min(levels)
 
 
 # ---------------------------------------------------------------------------

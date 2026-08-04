@@ -29,6 +29,7 @@ from uncorrupt.graph.register_snapshots import (
     nearest_capture_before,
     parliament_registration_date_coverage,
     path_evidence_level,
+    path_min_identity_confidence,
     query_wayback_cdx,
     relationship_evidence_level,
     snapshot_evidence_pages,
@@ -682,15 +683,25 @@ class TestPathEvidenceLevel:
 
         assert level == EvidenceLevel.EVENT_DATED
 
-    def test_path_of_only_same_as_edges_is_strongest_level(self):
-        """A path made entirely of identity hops has nothing to weaken it."""
+    def test_path_of_only_same_as_edges_has_no_temporal_evidence(self):
+        """A path made entirely of identity hops carries no temporal claim
+        at all, and must never be reported as EVENT_DATED (the STRONGEST
+        level) — that would assert affirmative dated support that does not
+        exist. `None` is the honest "no temporal evidence" representation,
+        never any `EvidenceLevel` member (weak or strong)."""
         a = Entity.objects.create(entity_type="person", name="A")
         b = Entity.objects.create(entity_type="person", name="B")
         same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
 
         level = path_evidence_level([same_as_edge], date(2020, 3, 1))
 
-        assert level == EvidenceLevel.EVENT_DATED
+        assert level is None
+
+    def test_empty_path_has_no_temporal_evidence(self):
+        """An empty path has nothing to classify — `None`, not a level."""
+        level = path_evidence_level([], date(2020, 3, 1))
+
+        assert level is None
 
 
 @pytest.mark.django_db
@@ -733,6 +744,230 @@ class TestRelationshipEvidenceLevel:
         level = relationship_evidence_level({a.id}, b.id, adj, 2, date(2020, 3, 1))
 
         assert level == EvidenceLevel.EVENT_DATED
+
+    def test_identity_only_path_reports_no_temporal_evidence(self):
+        """A relationship reachable ONLY via an identity (same_as) chain
+        carries no temporal evidence at all — it must report `None`, never
+        the fail-open EVENT_DATED the original code produced, and never the
+        one-rung-lower fail-open ATEMPORAL_CORROBORATION a later version of
+        this function produced. Level 3 is defined as "the register
+        CURRENTLY CONTAINS the relationship; timing unknown" — an
+        identity-only path contains no relationship in any register at all,
+        only an identity assertion, so that level over-claims too. `None`
+        is the only honest representation: a structural path WAS found (so
+        NO_TRACE would also be wrong), but it says nothing about a
+        relationship's timing."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="B (CH record)")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+
+        adj = {a.id: [same_as_edge], b.id: [same_as_edge]}
+
+        level = relationship_evidence_level({a.id}, b.id, adj, 2, date(2020, 3, 1))
+
+        assert level is None
+
+    def test_identity_only_path_never_outranks_a_weaker_real_path(self):
+        """When TWO paths connect the same two entities — one an identity-only
+        chain with no temporal evidence, the other a real but UNDATED edge
+        (ATEMPORAL_CORROBORATION) — the identity-only path must be excluded
+        from the min-reduction entirely, not compared against the real one.
+
+        This is the case that most sharply distinguishes the fix from the
+        fail-open bug: the old code scored the identity-only path as
+        EVENT_DATED (the STRONGEST level), so `min(EVENT_DATED,
+        ATEMPORAL_CORROBORATION)` reported the relationship as
+        EVENT_DATED — the strongest possible claim — purely as an artifact
+        of an identity chain that asserts no timing at all. The fix must
+        report ATEMPORAL_CORROBORATION here: the only real, temporally-
+        meaningful evidence found."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        mid = Entity.objects.create(entity_type="person", name="A (CH record)")
+        c = Entity.objects.create(entity_type="company", name="C")
+        same_as_1 = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=mid)
+        same_as_2 = Edge.objects.create(edge_type="same_as", source_entity=mid, target_entity=c)
+        undated_edge = Edge.objects.create(
+            edge_type="declared_interest", source_entity=a, target_entity=c
+        )
+
+        adj = {
+            a.id: [same_as_1, undated_edge],
+            mid.id: [same_as_1, same_as_2],
+            c.id: [same_as_2, undated_edge],
+        }
+        paths = find_all_paths({a.id}, c.id, adj, 2)
+        assert len(paths) == 2  # sanity: both the identity chain and the undated edge reach c
+
+        level = relationship_evidence_level({a.id}, c.id, adj, 2, date(2020, 3, 1))
+
+        assert level == EvidenceLevel.ATEMPORAL_CORROBORATION
+        assert level != EvidenceLevel.EVENT_DATED
+
+
+@pytest.mark.django_db
+class TestPathMinIdentityConfidence:
+    def test_no_identity_bridge_is_none(self):
+        """A path with no `same_as` edge uses no identity bridge at all —
+        `None`, not a confidence value, and not 1.0 either."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="company", name="B")
+        dated_edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=a, target_entity=b, valid_from=date(2015, 1, 1)
+        )
+
+        confidence = path_min_identity_confidence([dated_edge])
+
+        assert confidence is None
+
+    def test_empty_path_is_none(self):
+        """An empty path has no edges to bridge anything — `None`."""
+        assert path_min_identity_confidence([]) is None
+
+    def test_same_as_edge_with_no_attestation_is_none(self):
+        """A `same_as` edge that carries no confidence-bearing attestation
+        reports `None`, the same as "no identity bridge" — there is nothing
+        to warn on either way."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="A (CH record)")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+
+        confidence = path_min_identity_confidence([same_as_edge])
+
+        assert confidence is None
+
+    def test_single_same_as_attestation_confidence_is_reported(self):
+        """One `same_as` edge with one attestation reports that
+        attestation's `match_confidence` directly."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="A (CH record)")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            match_confidence=0.60,
+        )
+
+        confidence = path_min_identity_confidence([same_as_edge])
+
+        assert confidence == 0.60
+
+    def test_reports_the_weaker_of_two_same_as_confidences_on_the_path(self):
+        """A path bridged by TWO identity hops (e.g. person->person->company)
+        reports the WEAKEST of the two confidences — a chain is only as
+        trustworthy as its weakest identity assertion. This must be `min`,
+        not `max`: reporting the stronger confidence would hide the weaker
+        hop's coin-flip-grade match behind a stronger-looking number."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        mid = Entity.objects.create(entity_type="person", name="A (CH record)")
+        c = Entity.objects.create(entity_type="company", name="C")
+        strong_hop = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=mid)
+        Attestation.objects.create(
+            edge=strong_hop, source_name="Cross-register identity resolution", match_confidence=0.85
+        )
+        weak_hop = Edge.objects.create(edge_type="same_as", source_entity=mid, target_entity=c)
+        Attestation.objects.create(
+            edge=weak_hop, source_name="Cross-register identity resolution", match_confidence=0.60
+        )
+
+        confidence = path_min_identity_confidence([strong_hop, weak_hop])
+
+        assert confidence == 0.60
+
+    def test_reports_the_weaker_of_two_attestations_on_the_same_edge(self):
+        """The same reasoning applies WITHIN one edge: if a `same_as` edge
+        somehow carries more than one attestation, the weakest confidence
+        among them is reported, not the strongest."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="A (CH record)")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            source_reference="ref-1",
+            match_confidence=0.85,
+        )
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            source_reference="ref-2",
+            match_confidence=0.60,
+        )
+
+        confidence = path_min_identity_confidence([same_as_edge])
+
+        assert confidence == 0.60
+
+    def test_mixed_path_still_reports_identity_confidence(self):
+        """A path mixing a real dated edge with an identity hop still
+        reports the identity hop's confidence — the diagnostic is about the
+        path's identity bridge, independent of its temporal evidence."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="A (CH record)")
+        c = Entity.objects.create(entity_type="company", name="C")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+        Attestation.objects.create(
+            edge=same_as_edge,
+            source_name="Cross-register identity resolution",
+            match_confidence=0.60,
+        )
+        dated_edge = Edge.objects.create(
+            edge_type="officer_of", source_entity=b, target_entity=c, valid_from=date(2015, 1, 1)
+        )
+
+        confidence = path_min_identity_confidence([same_as_edge, dated_edge])
+
+        assert confidence == 0.60
+
+    def test_unattested_bridge_dominates_over_an_attested_one(self):
+        """A path with TWO identity bridges — one confidently attested at
+        0.85, the other carrying NO confidence-bearing attestation at all —
+        must report `None`, not 0.85. An unattested bridge means the path's
+        identity confidence is UNKNOWN, which must dominate: it can never
+        be hidden behind a stronger number a DIFFERENT, better-attested
+        bridge on the same path happened to report. The old implementation
+        flattened attestations across every bridge before taking `min`, so
+        the unattested bridge contributed nothing to that flat list and
+        vanished — reporting 0.85 as if it described the whole path."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        mid = Entity.objects.create(entity_type="person", name="A (CH record)")
+        c = Entity.objects.create(entity_type="company", name="C")
+        attested_hop = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=mid)
+        Attestation.objects.create(
+            edge=attested_hop,
+            source_name="Cross-register identity resolution",
+            match_confidence=0.85,
+        )
+        unattested_hop = Edge.objects.create(
+            edge_type="same_as", source_entity=mid, target_entity=c
+        )
+
+        confidence = path_min_identity_confidence([attested_hop, unattested_hop])
+
+        assert confidence is None
+
+    def test_KNOWN_DEFECT_missing_confidence_reads_as_certain(self):
+        """PINS A KNOWN DEFECT — this is NOT correct behaviour. It exists so
+        that the day `Attestation.match_confidence` stops being a NOT NULL
+        `FloatField` with `default=1.0` (`models.py:245`, confirmed live via
+        `PRAGMA table_info`: `notnull=1`), this test starts failing and
+        someone notices. An `Attestation` created without an explicit
+        `match_confidence` — e.g. a future call site that forgets to pass
+        one — silently stores 1.0, "certain identity", the STRONGEST
+        possible value, not "unknown". `path_min_identity_confidence` has no
+        defence against this: it can only see a NOT NULL column, and cannot
+        tell a genuinely-certain 1.0 apart from a forgotten one. Fixing this
+        is a schema migration (human-applied in this repo, out of scope for
+        this change) — see that function's docstring for the full note."""
+        a = Entity.objects.create(entity_type="person", name="A")
+        b = Entity.objects.create(entity_type="person", name="A (CH record)")
+        same_as_edge = Edge.objects.create(edge_type="same_as", source_entity=a, target_entity=b)
+        Attestation.objects.create(
+            edge=same_as_edge, source_name="Some future forgetful call site"
+        )  # match_confidence not passed -- defaults to 1.0, not "unknown"
+
+        confidence = path_min_identity_confidence([same_as_edge])
+
+        assert confidence == 1.0
 
 
 class TestWilsonInterval:

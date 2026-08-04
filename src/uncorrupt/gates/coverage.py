@@ -216,9 +216,36 @@ def measure_ch_officer_coverage(
 # ---------------------------------------------------------------------------
 
 
+def _commons_totals_query_params() -> dict[str, Any]:
+    """The exact query shape `fetch_parliament_interests` issues (minus
+    pagination) -- the single source of truth both `fetch_commons_total_results`
+    and `measure_commons_coverage`'s provenance note read, so the two can never
+    independently drift apart the way they did before this fix.
+
+    `ExpandChildInterests=true` is included DELIBERATELY: the live
+    `/api/v1/Interests` endpoint reports a *different* `totalResults`
+    depending on this flag -- verified live 4,057 without it vs. 3,415 with
+    it (see `parliament_interests.py`'s own documented "totalResults
+    caveat"). `fetch_parliament_interests` always sends
+    `ExpandChildInterests=true`, so a denominator read without it is not
+    apples-to-apples with what this repository can ever ingest -- that
+    mismatch (4,057 vs. the real 3,415 corpus) previously went unnoticed for
+    hours. Never drop this parameter here without also confirming the fetch
+    no longer sends it.
+    """
+    return {
+        "Take": DEFAULT_COMMONS_TAKE,
+        "SortOrder": "PublishingDateDescending",
+        "ExpandChildInterests": "true",
+    }
+
+
 def fetch_commons_total_results(client: httpx.Client | None = None, max_retries: int = 5) -> int:
-    """Live `totalResults` from the Commons Interests API (packet: "the
-    interests API reports totalResults").
+    """Live `totalResults` from the Commons Interests API, queried with the
+    SAME shape (`ExpandChildInterests=true`) the real fetch always sends
+    (packet: "the interests API reports totalResults" -- but see
+    `_commons_totals_query_params`'s docstring for why the query shape must
+    match, not just the endpoint).
 
     A single `Take=1` request reads only the pagination envelope, never the
     corpus itself (that remains `parliament_interests.py`'s job). This
@@ -233,10 +260,7 @@ def fetch_commons_total_results(client: httpx.Client | None = None, max_retries:
     owns_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
-        url = httpx.URL(
-            INTERESTS_API_BASE,
-            params={"Take": DEFAULT_COMMONS_TAKE, "SortOrder": "PublishingDateDescending"},
-        )
+        url = httpx.URL(INTERESTS_API_BASE, params=_commons_totals_query_params())
         payload = _fetch_json_with_backoff(client, url, max_retries)
     finally:
         if owns_client:
@@ -275,9 +299,27 @@ def measure_commons_coverage(
     produces fewer `items`, with no durable trace of which records were
     missed. Every non-ingested record is therefore counted as
     `not_attempted`, never `explicitly_failed`.
+
+    `extra["total_source"]`/`extra["ingested_source"]` record HOW each half
+    of the ratio was obtained (generalising the fix for the query-shape
+    mismatch above: a coverage ratio is meaningless if its two halves came
+    from incomparable queries, so both must always be traceable, not just
+    the denominator).
     """
     if total_results is None:
         total_results = fetch_commons_total_results(client=client)
+        total_source = (
+            f"live query, same shape as fetch_parliament_interests: params="
+            f"{_commons_totals_query_params()} -- ExpandChildInterests=true matches what the "
+            "real fetch always sends, so this total is apples-to-apples with what `ingested` "
+            "can ever reach (see _commons_totals_query_params's docstring)."
+        )
+    else:
+        total_source = (
+            f"explicitly provided by the caller (total_results={total_results}) -- no live "
+            "query made this call; the caller is responsible for having obtained this from "
+            "the same ExpandChildInterests=true query shape fetch_parliament_interests uses."
+        )
 
     ingested = Attestation.objects.filter(source_name=COMMONS_SOURCE_NAME).count()
     not_attempted = total_results - ingested
@@ -292,6 +334,14 @@ def measure_commons_coverage(
             "no per-record fetch-failure evidence is persisted by parliament_interests.py -- "
             "every non-ingested record is counted as not_attempted, never explicitly_failed.",
         ),
+        extra={
+            "total_source": total_source,
+            "ingested_source": (
+                f"Attestation.objects.filter(source_name={COMMONS_SOURCE_NAME!r}).count() -- "
+                "1:1 with the API's own record identifiers via "
+                "source_reference=str(interest_id)."
+            ),
+        },
     )
 
 

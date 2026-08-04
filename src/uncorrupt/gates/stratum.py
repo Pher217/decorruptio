@@ -8,14 +8,35 @@ PRE-REGISTERED EXTERNAL CONTROL SAMPLE -- exactly the case the review said
 `temporal_passed` therefore mirror `run_gold_benchmark.StratumGate`'s own
 >=90% computation deliberately, not by oversight.
 
-Only ONE stratum currently has a pre-registered external control fixture in
-this repository: Lords (`tests/fixtures/lords_retrieval_controls.json`,
-spec v2.9). Companies House and Commons have none yet -- sourcing one is a
-labour-intensive fact-gathering task (assembling independently verified
-peer/company or member/company pairs), not a measurement-tooling gap, and
-is out of this deliverable's scope. Those strata are therefore reported
-`available=False` -- fail closed (ADR-008: "a missing input is an error,
-never a default pass"), never guessed at.
+All four strata now have a pre-registered external control fixture AND a
+wired control-battery runner: Lords (`tests/fixtures/lords_retrieval_controls
+.json`, `scripts/run_lords_controls.py`, spec v2.9), Companies House
+(`tests/fixtures/ch_temporal_controls.json`, `scripts/run_ch_controls.py`),
+Commons (`tests/fixtures/commons_retrieval_controls.json`,
+`scripts/run_commons_controls.py`), and Electoral Commission
+(`tests/fixtures/ec_retrieval_controls.json`, `scripts/run_ec_controls.py`).
+Each runner is REUSED here (imported, never reimplemented) via
+`_measure_wired_stratum` -- fail closed (ADR-008: "a missing input is an
+error, never a default pass") whenever the runner cannot execute at all: no
+`controls_path` configured, no fixture file at that path, or the runner
+itself raises (malformed fixture, DB unreachable, or any other runner
+error). A fixture existing alone is never sufficient -- wiring the runner is
+the deliberate act that makes a stratum `available`, and a runner that DOES
+execute but measures a real, low score reports `available=True` with
+`passed=False`, never `unavailable` and never a silently-defaulted zero.
+
+Retrieval and temporal are reported as two DISTINCT figures, never
+conflated (mirrors each runner's own module docstring): `temporal_total` is
+deliberately rescaled to the RETRIEVED subset only (`retrieval_recovered`),
+not the raw control-battery size -- a control that was never retrieved can
+never carry a temporal outcome (`run_*_controls.py`'s own
+`TEMPORAL_NOT_APPLICABLE` status), so counting it against the temporal
+denominator would silently understate a source whose problem is retrieval,
+already reported separately. Lords is the sole structural exception: the
+register publishes no interest start dates at all, so `measure_lords_stratum`
+leaves `temporal_recovered`/`temporal_total` permanently `None` (see that
+function's own docstring) -- `temporal_passed` can never flip to `True` for
+Lords regardless of retrieval performance.
 
 Electoral Commission is measured and reported here even though it is NOT
 one of `run_gold_benchmark.MATERIAL_STRATA` -- see
@@ -25,6 +46,7 @@ and cannot be closed from this package alone.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -137,12 +159,37 @@ def measure_lords_stratum(
     )
 
 
-def _external_control_stratum(
-    name: str, controls_path: str | Path | None, note_when_missing: str
+def _measure_wired_stratum(
+    name: str,
+    controls_path: str | Path | None,
+    run_controls_fn: Callable[..., dict[str, Any]],
+    note_when_missing: str,
+    runner_label: str,
 ) -> StratumMeasurement:
-    """Fail-closed default for a stratum with no external control fixture
-    wired up yet -- unavailable, never a default pass (ADR-008: "a missing
-    input is an error, never a default pass")."""
+    """Fail-closed wiring for a stratum backed by an external control-battery
+    runner (`scripts/run_*_controls.py`'s own `run_controls`, REUSED here,
+    never reimplemented -- see module docstring).
+
+    Unavailable -- never `passing`, never a silently-defaulted zero -- in
+    every case where the runner cannot execute at all (ADR-008: "a missing
+    input is an error, never a default pass"):
+      * no `controls_path` configured (`None`);
+      * no fixture file exists at the configured path;
+      * the runner itself raises -- a malformed fixture, an unreachable DB,
+        or any other runner error. The exception is captured into `note`
+        for diagnosis, never swallowed silently.
+
+    Once the runner DOES execute, `available=True` unconditionally -- a low
+    or zero score is a real, informative measurement (`passed=False`), not
+    a reason to report unavailable (mirrors `measure_lords_stratum`'s own
+    precedent: `available=True` regardless of the retrieval count).
+
+    `temporal_total` is deliberately RESCALED to `retrieval_recovered` (the
+    retrieved subset only), not the runner's raw `n` -- see module
+    docstring's "Retrieval and temporal are reported as two DISTINCT
+    figures" section for why a not-retrieved control must never count
+    against the temporal denominator.
+    """
     if controls_path is None:
         return StratumMeasurement(name=name, available=False, note=note_when_missing)
     path = Path(controls_path)
@@ -152,21 +199,37 @@ def _external_control_stratum(
             available=False,
             note=f"{note_when_missing} (looked for a fixture at {path}, not found).",
         )
-    # A fixture file exists at the given path, but this package does not yet
-    # define a control-battery RUNNER for this stratum (only Lords has one:
-    # scripts/run_lords_controls.py). Building one is a sourcing task
-    # (assembling independently verified external facts), out of this
-    # tooling deliverable's scope -- reported unavailable, never guessed at.
+    try:
+        result = run_controls_fn(controls_path=path)
+    except Exception as exc:  # noqa: BLE001 -- fail-closed by design, see docstring above
+        return StratumMeasurement(
+            name=name,
+            available=False,
+            note=(
+                f"{runner_label} raised {exc!r} while running the control battery at {path} -- "
+                "reported unavailable, never a silent zero and never passing (ADR-008)."
+            ),
+        )
+
+    retrieval_recovered = result["retrieval_recovered"]
+    retrieval_total = result["retrieval_total"]
+    temporal_recovered = result["temporal_recovered"]
+    temporal_total = retrieval_recovered
+
     return StratumMeasurement(
         name=name,
-        available=False,
+        available=True,
+        retrieval_recovered=retrieval_recovered,
+        retrieval_total=retrieval_total,
+        temporal_recovered=temporal_recovered,
+        temporal_total=temporal_total,
         note=(
-            f"a control fixture exists at {path}, but no control-battery runner is wired up "
-            f"for {name} yet (only Lords has one -- scripts/run_lords_controls.py). Building "
-            "one requires sourcing independently verified external facts, out of this "
-            "measurement-tooling deliverable's scope; reported unavailable rather than "
-            "guessed at."
+            f"retrieval + temporal measured live via {runner_label} against fixture {path} "
+            f"({retrieval_total} controls). temporal_total is scaled to the retrieved subset "
+            f"({retrieval_recovered}) -- a control that was never retrieved cannot carry a "
+            "temporal outcome (see module docstring)."
         ),
+        extra={key: result[key] for key in ("n", "not_found", "unresolved") if key in result},
     )
 
 
@@ -175,20 +238,23 @@ def measure_ch_officer_stratum(
 ) -> StratumMeasurement:
     """Companies House officer/appointment retrieval + temporal (spec A2.4.3).
 
-    92.3% of `officer_of` edges carry `appointed_on` (packet) -- temporal is
-    MEASURABLE in principle, but that figure describes date AVAILABILITY,
-    not a passing external control. No pre-registered external CH temporal
-    control fixture exists yet in this repository (unlike Lords). Fail
-    closed: unavailable until one does -- spec v2.7 §A2.7.4 names exactly
-    this ("a pre-frozen external CH temporal control set end-to-end") as
-    the single most informative next measurement, not yet built.
+    92.3% of `officer_of` edges carry `appointed_on` (packet) -- temporal
+    IS measurable, and `scripts/run_ch_controls.py` (REUSED here, not
+    reimplemented) now closes spec v2.7 §A2.7.4's own next action ("a
+    pre-frozen external CH temporal control set end-to-end") with a 12-row
+    fixture of real (officer_id, company_number, appointed_on) triples
+    fetched live from the Companies House REST API.
     """
-    return _external_control_stratum(
+    from scripts.run_ch_controls import run_controls
+
+    return _measure_wired_stratum(
         STRATUM_CH_OFFICER,
         controls_path,
+        run_controls,
         "no external Companies House temporal control battery exists yet (spec v2.7 "
         "§A2.7.4's own next action) -- 92.3% appointed_on coverage measures date "
         "AVAILABILITY, not a passing control.",
+        "scripts/run_ch_controls.py",
     )
 
 
@@ -198,16 +264,23 @@ def measure_commons_stratum(
     """Commons `declared_interest` retrieval + temporal (spec A2.4.3).
 
     ~95% of API records carry `registrationDate` (packet) -- dateable in
-    principle -- but the source is severely under-ingested (see
-    `coverage.measure_commons_coverage`) and no external Commons control
-    fixture exists yet. Fail closed: unavailable.
+    principle, but the source is severely under-ingested (see
+    `coverage.measure_commons_coverage`). `scripts/run_commons_controls.py`
+    (REUSED here) closes the fixture gap with a 12-row externally-sourced
+    control battery; MOST rows are EXPECTED to classify not-found -- that is
+    the correct, informative result of a genuine coverage gap, not a
+    control-battery defect (see that script's own module docstring).
     """
-    return _external_control_stratum(
+    from scripts.run_commons_controls import run_controls
+
+    return _measure_wired_stratum(
         STRATUM_COMMONS,
         controls_path,
+        run_controls,
         "no external Commons retrieval/temporal control battery exists yet -- the 10 "
         "externally-sourced Commons controls referenced in spec A2.4.3 have no fixture file "
         "in this repository (only tests/fixtures/lords_retrieval_controls.json exists).",
+        "scripts/run_commons_controls.py",
     )
 
 
@@ -227,15 +300,21 @@ def measure_electoral_commission_stratum(
     documents the precise mechanism by which that matters. Reported here so
     the no-score certificate (`certificate.py`) can name it, and so whoever
     next amends `run_gold_benchmark.MATERIAL_STRATA` has a ready producer --
-    never silently swallowed.
+    never silently swallowed. `scripts/run_ec_controls.py` (REUSED here)
+    closes the fixture gap with a 12-row control battery of real donations
+    fetched live from the EC's own `/api/csv/Donations` export.
     """
-    return _external_control_stratum(
+    from scripts.run_ec_controls import run_controls
+
+    return _measure_wired_stratum(
         STRATUM_ELECTORAL_COMMISSION,
         controls_path,
+        run_controls,
         "no external Electoral Commission control battery exists yet, AND this stratum is "
         "not in run_gold_benchmark.MATERIAL_STRATA at all -- a passing gate here would "
         "currently have no effect on the scorer's verdict logic either way (see "
         "donation_edges_are_ungated_in_scorer).",
+        "scripts/run_ec_controls.py",
     )
 
 

@@ -8,18 +8,23 @@ this script existed, that file was simply absent, so every material stratum
 defaulted to `available=False` and REFUTED/CONFIRMED/PARTIAL could never be
 reached -- only INSTRUMENT-LIMITED. This script is the missing producer.
 
-Measures four strata (spec A2.4.3; the fourth is extra, see below):
+Measures four strata (spec A2.4.3; the fourth is extra, see below), each via
+its own wired `scripts/run_*_controls.py` control-battery runner (REUSED,
+never reimplemented -- see `uncorrupt.gates.stratum._measure_wired_stratum`):
   * `lords_declared_interest`   -- RETRIEVAL measured live via
     `scripts/run_lords_controls.py`'s 12-row control battery (spec v2.9).
     Temporal is INTENTIONALLY left unmeasured (`None`, never a ratio) --
     see `uncorrupt.gates.stratum.measure_lords_stratum`'s docstring for why
     this makes a Lords temporal pass structurally impossible, not merely
     unlikely.
-  * `ch_officer_appointment`, `commons_declared_interest` -- no
-    pre-registered external control fixture exists yet in this repository
-    for either (only Lords has one). Reported `available=False` -- fail
-    closed (ADR-008), never guessed at. Pass `--ch-controls`/
-    `--commons-controls` once one exists.
+  * `ch_officer_appointment`, `commons_declared_interest` -- retrieval AND
+    temporal now measured live via `scripts/run_ch_controls.py` /
+    `scripts/run_commons_controls.py`'s own 12-row external control
+    batteries. Either still reports `available=False` -- fail closed
+    (ADR-008) -- if its fixture is missing or its runner cannot execute;
+    otherwise `available=True` with the real measured score, whether that
+    score passes the >=9/10 bar or not. Pass `--ch-controls`/
+    `--commons-controls` to point at a different fixture.
   * `electoral_commission` -- NOT one of `run_gold_benchmark.MATERIAL_STRATA`
     at all. Measured and reported anyway because the sealed gold cohort
     contains cases whose evidence stratum is `electoral_commission`, and a

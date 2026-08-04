@@ -180,6 +180,7 @@ def main() -> None:
                 "not_attempted": commons.not_attempted,
                 "total": commons.total,
                 "known_limits": list(commons.known_limits),
+                "extra": commons.extra,
             },
         },
     }

@@ -4,6 +4,9 @@ Covers the delegation packet's required scenarios:
 - a partial ingest fails the coverage gate (not a 90%-style pass)
 - a valid zero-officer response is not counted as a fetch failure
 - an explicitly-failed record is distinguished from one never attempted
+- the Commons denominator is read with the SAME query shape the fetch
+  actually issues (ExpandChildInterests=true), and the measurement records
+  which query produced each half of the ratio
 """
 
 from __future__ import annotations
@@ -12,10 +15,12 @@ import hashlib
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from uncorrupt.gates.coverage import (
     CoverageMeasurement,
+    fetch_commons_total_results,
     measure_ch_officer_coverage,
     measure_commons_coverage,
     measure_lords_snapshot_coverage,
@@ -285,6 +290,78 @@ class TestMeasureCommonsCoverage:
 
         assert result.ingested == 3
         assert result.passed is True
+
+
+class TestCommonsDenominatorMatchesTheFetchQueryShape:
+    """The defect: the fetch (parliament_interests.fetch_parliament_interests)
+    always sends ExpandChildInterests=true, but the coverage gate's own
+    totalResults probe did not -- 4,057 (without the flag) vs. the real
+    3,415-record corpus (with it). The denominator must be read with the SAME
+    query shape the fetch actually issues, and the measurement must record
+    which query produced each half of the ratio."""
+
+    def test_fetch_commons_total_results_sends_expand_child_interests_true(self):
+        """GIVEN the live Interests API
+        WHEN fetch_commons_total_results issues its totalResults request
+        THEN the request includes ExpandChildInterests=true -- the exact query
+        shape fetch_parliament_interests always sends -- so the denominator is
+        apples-to-apples with what can ever be ingested, not a different
+        totalResults reading from an unexpanded query."""
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.update(dict(request.url.params))
+            return httpx.Response(200, json={"totalResults": 3415})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+
+        total = fetch_commons_total_results(client=client)
+
+        assert captured["ExpandChildInterests"] == "true"
+        assert total == 3415
+
+    @pytest.mark.django_db
+    def test_measure_commons_coverage_records_which_live_query_produced_the_total(
+        self, monkeypatch
+    ):
+        """GIVEN a live (mocked) totalResults fetch
+        WHEN Commons coverage is measured with no total_results override
+        THEN extra['total_source'] records that the total came from a live
+        query including ExpandChildInterests=true -- so a future reader can
+        verify the two halves of the ratio are comparable, not just trust it."""
+
+        def fake_fetch(client=None, max_retries=5):
+            return 3415
+
+        monkeypatch.setattr("uncorrupt.gates.coverage.fetch_commons_total_results", fake_fetch)
+
+        result = measure_commons_coverage()
+
+        assert result.total == 3415
+        assert "ExpandChildInterests" in result.extra["total_source"]
+        assert "live" in result.extra["total_source"].lower()
+
+    @pytest.mark.django_db
+    def test_measure_commons_coverage_records_explicit_override_provenance(self):
+        """GIVEN total_results is passed explicitly (no live query made)
+        WHEN Commons coverage is measured
+        THEN extra['total_source'] records that the total was explicitly
+        provided rather than live-queried -- never silently indistinguishable
+        from a live reading."""
+        result = measure_commons_coverage(total_results=10)
+
+        assert "explicitly provided" in result.extra["total_source"].lower()
+
+    @pytest.mark.django_db
+    def test_measure_commons_coverage_records_the_ingested_side_of_the_ratio_too(self):
+        """GIVEN any Commons coverage measurement
+        WHEN it is produced
+        THEN extra['ingested_source'] documents how `ingested` was obtained --
+        generalising the fix: a coverage ratio must record how BOTH halves
+        were obtained, not just the denominator."""
+        result = measure_commons_coverage(total_results=10)
+
+        assert "Attestation" in result.extra["ingested_source"]
 
 
 # ---------------------------------------------------------------------------

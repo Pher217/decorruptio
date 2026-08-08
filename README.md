@@ -187,7 +187,7 @@ politicians" — that is illegal (GDPR/LGPD), defamation-exposed, and unsound
 flags into ~134 actions). So the guardrails live in code and CI, not in a
 manifesto:
 
-- **`sources/`** — a machine-readable legal-basis + redistribution register (13
+- **`sources/`** — a machine-readable legal-basis + redistribution register (14
   source entries). A connector **cannot run** without a valid entry.
   `opensanctions.yml` ships marked `non_commercial` + `A2` + `dpia_cleared: false`
   so the guardrail tests have a real failing case to bite on.

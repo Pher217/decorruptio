@@ -265,7 +265,7 @@ def _measure_wired_stratum(
     retrieval_total = result["retrieval_total"]
     temporal_recovered = result["temporal_recovered"]
     temporal_total = result["temporal_total"]
-    battery_extra = {
+    battery_extra: dict[str, Any] = {
         **{key: result[key] for key in ("n", "not_found", "unresolved") if key in result},
         "fixture_path": str(path),
         "fixture_sha256": fixture_sha256,

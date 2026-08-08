@@ -247,8 +247,10 @@ def run(client: CompaniesHouse, seeds: tuple[str, ...], per_seed: int, today: da
     for _link, record, disqualification in in_force:
         dob = record["date_of_birth"]
         appointments = client.appointments_for(
-            record.get("forename") or "", record.get("surname") or "",
-            int(dob[:4]), int(dob[5:7]),
+            record.get("forename") or "",
+            record.get("surname") or "",
+            int(dob[:4]),
+            int(dob[5:7]),
         )
         for hit in corroborated_hits(disqualification, appointments):
             findings.append(
@@ -276,7 +278,8 @@ def run(client: CompaniesHouse, seeds: tuple[str, ...], per_seed: int, today: da
         "persons_with_ban_in_force": len(in_force),
         "persons_unmatchable_no_dob": no_dob,
         "competition_section_count": sum(
-            1 for _l, _r, d in in_force
+            1
+            for _l, _r, d in in_force
             if (d.get("reason") or {}).get("section") == COMPETITION_SECTION
         ),
         "findings": [asdict(f) for f in findings],

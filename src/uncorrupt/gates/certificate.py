@@ -136,12 +136,12 @@ def build_no_score_certificate(
     blocking, that is not the same claim as "everything passed".
     """
     blockers: list[Blocker] = []
-    for name, measurement in (coverage_measurements or {}).items():
-        blocker = _coverage_blocker(name, measurement)
+    for name, coverage_measurement in (coverage_measurements or {}).items():
+        blocker = _coverage_blocker(name, coverage_measurement)
         if blocker is not None:
             blockers.append(blocker)
-    for name, measurement in (stratum_measurements or {}).items():
-        blocker = _stratum_blocker(name, measurement)
+    for name, stratum_measurement in (stratum_measurements or {}).items():
+        blocker = _stratum_blocker(name, stratum_measurement)
         if blocker is not None:
             blockers.append(blocker)
     for gate, reason in (unmeasured_families or {}).items():

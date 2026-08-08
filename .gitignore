@@ -43,3 +43,9 @@ graphify-out/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 .claude/TOMORROW.md
+
+# Local agent/advisory scratch. Contains private advisory transcripts and
+# absolute paths into the author's private Obsidian vault -- must never be
+# published. Previously ignored only via .git/info/exclude, which is local to
+# one clone and is NOT shared; a fresh clone would have tracked it.
+.consult/

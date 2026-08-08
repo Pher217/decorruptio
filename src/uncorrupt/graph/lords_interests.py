@@ -437,7 +437,7 @@ def _extract_counterparty(
     #    with-comma-only fallback, now gated on the candidate itself
     #    looking like a name rather than blindly returning whatever
     #    followed the comma).
-    is_shareholding = bool(category) and category.startswith("Category 2")
+    is_shareholding = category is not None and category.startswith("Category 2")
     mentions_org_word = role is not None and bool(
         re.search(r"\b(company|corporation|firm)\b", description, re.IGNORECASE)
     )

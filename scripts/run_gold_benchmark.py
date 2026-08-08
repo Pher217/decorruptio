@@ -1638,7 +1638,7 @@ def main() -> None:
                     "case_key": c.case_key,
                     "row_count": c.row_count,
                     "award_count": c.award_count,
-                    "row_case_ids": c.row_case_ids,
+                    "row_case_ids": [r.case_id for r in c.rows],
                 }
                 for c in concentrated_cases
             ],

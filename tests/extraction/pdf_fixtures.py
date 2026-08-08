@@ -1,8 +1,9 @@
 """Synthetic PDF byte builders for extraction tests.
 
-Built with pypdf's own writer/generic objects (already a project dependency
-for this layer) rather than a second PDF-authoring dependency or a
-hand-rolled xref table.
+Built with pypdf's own writer/generic objects rather than a second
+PDF-authoring dependency or a hand-rolled xref table. pypdf comes from the
+optional `pdf` extra and is imported at module scope here, so the test suite
+requires `uv sync --extra dev --extra pdf` (what CI installs).
 """
 
 from __future__ import annotations

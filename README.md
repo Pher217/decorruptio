@@ -1,6 +1,6 @@
 # Decorruptio
 
-[![CI](https://github.com/Pher217/decorruptio/actions/workflows/ci.yml/badge.svg)](https://github.com/Pher217/decorruptio/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![tests](https://img.shields.io/badge/tests-1101%20passing-brightgreen)](#quickstart) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](pyproject.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![CI](https://github.com/Pher217/decorruptio/actions/workflows/ci.yml/badge.svg)](https://github.com/Pher217/decorruptio/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](pyproject.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > **Follow the world's public money. Surface anomalies for human investigators.
 > Publish reproducible transparency data.** Risk indicators for investigation —
@@ -35,22 +35,41 @@ and validated on UK open data as published?** The answer we measured is **no**, 
 we can say precisely why. This is a null result, not an abandoned project — and it
 is the reason this repo is now open.
 
-**The fail-closed gate was built, then run against itself — and it failed:**
+**The fail-closed gate was built, then run against itself — and it blocked.** The
+one artifact in this repository that you can audit yourself is
+`experiments/no_score_certificate.json`: a certificate bound to a code commit and
+an attestation-inclusive graph hash ([ADR-008](#the-guardrails-are-executable-not-prose)),
+recording `"verdict": "NO SCORE -- INSTRUMENT-LIMITED"` against **five** named
+blockers — three per-stratum control batteries (`commons_declared_interest`,
+`lords_declared_interest`, `ch_officer_appointment`) measured and failing, plus the
+two coverage families recorded as **`UNMEASURED`**. Either state blocks scoring
+identically; that is the whole point. **Unknown never reads as pass.**
+
+**Read the next part sceptically, because the numbers are not in this repo.** A
+coverage-gate run on 2026-08-05 produced the two figures below, but its report
+lives under `experiments/`, which is gitignored, so *the certificate above does not
+carry them* — it carries the same two families as never-measured. Both readings
+block. Neither is auditable from a clone:
 
 | Coverage gate | Accounted for | Standard | Result |
 |---|---|---|---|
-| Companies House officer roster over the procurement-supplier universe | **63 / 12,227 (0.52%)** | 100% accounted | **BLOCKED** |
-| Commons register ingest vs. the Interests API's own `totalResults` | **1,675 / 3,237 (51.7%)** | 100% accounted | **BLOCKED** |
+| Companies House officer roster over the procurement-supplier universe | 63 / 12,227 (0.52%) | 100% accounted | BLOCKED — *report not in repo* |
+| Commons register ingest vs. the Interests API's own `totalResults` | 1,675 / 3,237 (51.7%) | 100% accounted | BLOCKED — *denominator disputed, see below* |
 
-Those two are the coverage half. The checked-in
-`experiments/no_score_certificate.json` — a permanent, auditable artifact bound to
-a code commit and an attestation-inclusive graph hash
-([ADR-008](#the-guardrails-are-executable-not-prose)) — records
-`"verdict": "NO SCORE -- INSTRUMENT-LIMITED"` against **five** named blockers: the
-two coverage gates above plus three per-stratum control batteries
-(`commons_declared_interest`, `lords_declared_interest`, `ch_officer_appointment`).
-Every company without a durable cache file counts `not_attempted`, never silently
-dropped. **Unknown never reads as pass.**
+And the Commons denominator does not reconcile with our own code:
+`src/uncorrupt/gates/coverage.py` documents the live `totalResults` as **3,415**
+with `ExpandChildInterests=true` (the flag the fetcher always sends) versus **4,057**
+without it, both verified live 2026-08-04, and
+`tests/fixtures/commons_retrieval_controls.json` uses 4,057. The 3,237 above matches
+neither. **We are not going to quietly pick one.** Reconciling it — and checking
+whether the shortfall is a genuine gap or the deliberate ADR-004 privacy exclusions
+the gate fails to credit — is open work, item 3 in *how you can help* below.
+
+Publishing a blocked gate whose own headline figures are unpublished is a real
+defect in this README's auditability, found by an adversarial review of it rather
+than by us. It is recorded here rather than smoothed over, on the same reasoning as
+the methods confession further down: the fix is to check the report in, not to
+soften the sentence.
 
 **The instrument was then tested against a case known to be true** — CMA Case
 50697, the demolition cartel (decision 12 June 2023, ~£60m fines, 19 rigged
@@ -263,12 +282,16 @@ they stay unregistered. Raise it as an issue rather than opening a one-line PR.
 ## Quickstart
 
 ```bash
-uv sync --extra dev                      # install (Python 3.12+)
-uv run uncorrupt validate-registry       # load + validate sources/*.yml
+uv sync --extra dev --extra pdf           # install (Python 3.12+)
+uv run uncorrupt validate-registry        # load + validate sources/*.yml
 uv run ruff check . && uv run ruff format --check .
-uv run mypy                              # strict on core/, register/, vault/
-uv run pytest                            # 1101 tests, incl. the guardrail suite
+uv run mypy                               # strict on core/, register/, vault/
+uv run pytest                             # incl. the guardrail suite
 ```
+
+`--extra pdf` is required, not optional: `pypdf` is imported at module scope by the
+extraction and citation-verifier tests, so `--extra dev` alone fails at collection
+with three errors. This is what CI installs.
 
 Postgres is optional for the test suite (tests use the Django test settings).
 `make up` starts a local Postgres via `docker compose` if you want to run the

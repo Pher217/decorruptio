@@ -128,7 +128,7 @@ def main() -> None:
             [e for e in nearby if normalise_name(e.name) == target]
         )
 
-        row = {
+        row: dict[str, int | str | None | list[str]] = {
             "person_register_name": person.name,
             "person_as_published": published_name,
             "company": company.name,

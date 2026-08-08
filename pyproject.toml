@@ -93,6 +93,12 @@ strict_equality = true
 module = ["django.*", "rest_framework.*", "environ.*"]
 ignore_missing_imports = true
 
+# Optional `ocr` extra: not installed in CI (which uses --extra dev --extra pdf) and
+# ships no type stubs. Imports are lazy, inside the OCR code path only.
+[[tool.mypy.overrides]]
+module = ["pypdfium2.*", "pytesseract.*", "PIL.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

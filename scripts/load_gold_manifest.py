@@ -501,6 +501,7 @@ def load_gold_manifest(path: str | Path) -> ManifestLoadResult:
         assert relationship_start is not None
         assert office_holding_start_date is not None
         assert held_office_at_award is not None
+        assert company_number is not None
 
         # Spec A2.2.2: office post-dates the award -- out of scope, NOT
         # inadmissible (nothing about the row's own sourcing is wrong), NOT
@@ -594,8 +595,8 @@ def main() -> None:
     print(f"out of scope    : {len(result.out_of_scope)}  (office post-dates award, spec A2.2.2)")
     for row in result.inadmissible:
         print(f"  REJECTED {row.case_id}: {'; '.join(row.reasons)}")
-    for row in result.out_of_scope:
-        print(f"  OUT OF SCOPE {row.case_id}: {row.reason}")
+    for oos_row in result.out_of_scope:
+        print(f"  OUT OF SCOPE {oos_row.case_id}: {oos_row.reason}")
     if concentrated:
         print("\nconcentrated cases (>1 row, spec A2.1.1/A2.3.2 requires these listed explicitly):")
         for case in concentrated:

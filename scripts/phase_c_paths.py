@@ -424,7 +424,7 @@ def main() -> None:
     with open(COHORT_CSV, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    counts = defaultdict(int)
+    counts: defaultdict[str, int] = defaultdict(int)
     for row in rows:
         supplier_name = (row.get("supplier_name") or "").strip()
         # `source_of_referral` is the person who ORIGINATED the referral;

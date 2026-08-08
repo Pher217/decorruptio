@@ -42,9 +42,13 @@ is the reason this repo is now open.
 | Companies House officer roster over the procurement-supplier universe | **63 / 12,227 (0.52%)** | 100% accounted | **BLOCKED** |
 | Commons register ingest vs. the Interests API's own `totalResults` | **1,675 / 3,237 (51.7%)** | 100% accounted | **BLOCKED** |
 
-`experiments/no_score_certificate.json` therefore emits `NO SCORE: 2 gate(s)
-blocked scoring` — a permanent, auditable artifact naming the exact controls that
-blocked it, bound to a code commit and a graph hash ([ADR-008](#the-guardrails-are-executable-not-prose)).
+Those two are the coverage half. The checked-in
+`experiments/no_score_certificate.json` — a permanent, auditable artifact bound to
+a code commit and an attestation-inclusive graph hash
+([ADR-008](#the-guardrails-are-executable-not-prose)) — records
+`"verdict": "NO SCORE -- INSTRUMENT-LIMITED"` against **five** named blockers: the
+two coverage gates above plus three per-stratum control batteries
+(`commons_declared_interest`, `lords_declared_interest`, `ch_officer_appointment`).
 Every company without a durable cache file counts `not_attempted`, never silently
 dropped. **Unknown never reads as pass.**
 
@@ -200,8 +204,10 @@ L1 Connectors (httpx fetch, ingestion only — no parsing)
 ```
 
 Scheduled via cron + Django management commands — **no Dagster, no MinIO, no object
-store, no Vite/React dashboard** (retired per ADR-005 D6; `dagster.yaml` and
-`dashboard/` are leftovers pending deletion). FtM-*shaped* models live in the
+store, no Vite/React dashboard** (retired per ADR-005 D6). `dagster.yaml` and
+`dashboard/` are still tracked leftovers, pending deletion — do not build on
+them. The `Dockerfile` used to `CMD ["dagster", "dev", ...]`, which could never
+have started since Dagster is not a dependency; it now serves the Django/DRF app. FtM-*shaped* models live in the
 Django ORM, but the project does **not** depend on the FollowTheMoney library,
 Aleph, or nomenklatura, and OCP indicators are not used.
 
@@ -234,9 +240,16 @@ SECOP II**, plus **GLEIF**. Locale profiles: `gb`, `eu`, `ua`, `co`, `br`.
 `i004` price vs estimate · `i005` direct-award share — all registered as entry
 points. `i006` incorporation proximity · `i007` value vs company size · `i008`
 dormancy/delinquency are implemented and tested, and used directly by
-`scripts/kill_experiment.py`, but are **not registered** in `pyproject.toml`, so
-`load_indicators()` does not see them. Registering them is a small, well-defined
-first contribution.
+`scripts/kill_experiment.py`, but are **deliberately not registered** in
+`pyproject.toml`, so `load_indicators()` and `enabled_for()` never return them.
+
+That is not an oversight to fix casually. All three carry
+`"gb": ValidationStatus.VALIDATED` in their class body, so registering them
+would make them **live in the `gb` locale** on the strength of a validation
+claim that predates the null above and is not defensible at ~20–25% power.
+Registering them is therefore a decision about what the project is willing to
+assert, not a packaging chore — either the `VALIDATED` marks come down first, or
+they stay unregistered. Raise it as an issue rather than opening a one-line PR.
 
 ## Scaling split (why the layout looks like this)
 

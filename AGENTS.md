@@ -51,9 +51,13 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy                  # strict on core/, register/, vault/
 uv run pytest                # 1101 tests, incl. the guardrail suite
 ```
-**Known red:** `mypy` reports 13 errors (3 are missing `--extra ocr` stubs; the rest
-are real type defects, some in `gates/certificate.py` and the gold-manifest runners).
-CI on `main` is failing on this. Fix it root-cause; do not add blanket `# type: ignore`.
+`--extra pdf` is **not optional for the test suite**: `pypdf` is imported at module
+scope by `tests/extraction/pdf_fixtures.py` and `tests/research/test_citation_verifier.py`,
+so `uv sync --extra dev` alone fails at collection with three errors. CI installs
+`--extra dev --extra pdf` for this reason.
+
+All four gates are green on `main`. Keep them that way root-cause — do not add
+blanket `# type: ignore` to restore a green run.
 
 ## Conventions
 - Indicators yield `Flag` objects — never verdicts (ADR-000 G4).

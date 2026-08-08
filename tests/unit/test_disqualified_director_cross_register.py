@@ -106,18 +106,14 @@ class TestCorroboratedHits:
         """GIVEN an unresigned role at a company named in the disqualification
         WHEN that company is dissolved (nobody files TM01s for dissolved companies)
         THEN it is not reported — this artifact inflated a true 1.9% to 50.3%."""
-        hits = corroborated_hits(
-            _disqualification(), [_appointment(company_status="dissolved")]
-        )
+        hits = corroborated_hits(_disqualification(), [_appointment(company_status="dissolved")])
         assert hits == []
 
     def test_company_in_liquidation_is_excluded(self):
         """GIVEN an unresigned role at a company in liquidation
         WHEN hits are computed
         THEN it is not reported, for the same filing-inertia reason as dissolution."""
-        hits = corroborated_hits(
-            _disqualification(), [_appointment(company_status="liquidation")]
-        )
+        hits = corroborated_hits(_disqualification(), [_appointment(company_status="liquidation")])
         assert hits == []
 
     def test_resigned_officer_is_excluded(self):

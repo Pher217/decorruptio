@@ -67,8 +67,22 @@ from scripts.disqualified_director_cross_register import (
 
 DEFAULT_OUTPUT = Path("experiments/s9b_seed_footprint.json")
 DEFAULT_SEEDS = (
-    "brown", "patel", "wilson", "ahmed", "murphy", "clark", "singh", "walsh",
-    "khan", "davies", "evans", "roberts", "jones", "williams", "taylor", "thomas",
+    "brown",
+    "patel",
+    "wilson",
+    "ahmed",
+    "murphy",
+    "clark",
+    "singh",
+    "walsh",
+    "khan",
+    "davies",
+    "evans",
+    "roberts",
+    "jones",
+    "williams",
+    "taylor",
+    "thomas",
 )
 CONTROL_NAMED_COMPANY = "CANTILLON LIMITED"
 CONTROL_EXPECTED_CURRENT_NAME = "MORRISROE DEMOLITION LIMITED"
@@ -165,9 +179,11 @@ def classify(named_company: str, profile: dict[str, Any] | None) -> CompanyOutco
     address_key = ", ".join(
         str(address.get(k, "")) for k in ("address_line_1", "locality", "postal_code")
     )
-    outcome = "active" if normalise_company_name(current_name) == normalise_company_name(
-        named_company
-    ) else "successor"
+    outcome = (
+        "active"
+        if normalise_company_name(current_name) == normalise_company_name(named_company)
+        else "successor"
+    )
     return CompanyOutcome(
         named_company=named_company,
         resolved_number=profile.get("company_number"),

@@ -36,6 +36,7 @@ import csv
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import date
 
@@ -406,6 +407,30 @@ def main() -> None:
     parser.add_argument("--max-hops", type=int, default=2)
     parser.add_argument("--out", default="experiments/phase_c_paths.json")
     args = parser.parse_args()
+
+    if not os.path.exists(COHORT_CSV):
+        print(
+            f"cohort file not found: {COHORT_CSV}\n"
+            "This script requires the DHSC VIP-lane referral cohort, which is deliberately NOT\n"
+            "distributed with this repository: it is a locally curated CSV that names individual\n"
+            "referrers, so publishing it is an A2 (public-persons) decision gated by\n"
+            "ADR-000, not a packaging detail.\n"
+            "See 'A note on personal data in this repo' in README.md.\n"
+            "To run this script, supply a CSV at that path with these columns:\n"
+            "supplier_name, company_number, contract_value_gbp, source_of_referral,\n"
+            "actual_referrer, source_doc, source_url, source_reference",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if not os.path.exists(VIP_CH_CACHE):
+        print(
+            f"Companies House cache not found: {VIP_CH_CACHE}\n"
+            "`experiments/` is gitignored, so this cache is not distributed either. Rebuild it "
+            "locally before running this script.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     with open(VIP_CH_CACHE, encoding="utf-8") as f:
         ch_cache = json.load(f)

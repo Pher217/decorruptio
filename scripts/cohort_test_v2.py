@@ -18,6 +18,7 @@ import csv
 import gzip
 import json
 import re
+import sys
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -453,6 +454,21 @@ def main() -> None:
 
     # 1. Load positives
     print("\n## LOADING POSITIVES")
+    if not POSITIVES_CSV.exists():
+        print(
+            f"cohort file not found: {POSITIVES_CSV}\n"
+            "This script requires the DHSC VIP-lane referral cohort, which is deliberately NOT\n"
+            "distributed with this repository: it is a locally curated CSV that names individual\n"
+            "referrers, so publishing it is an A2 (public-persons) decision gated by\n"
+            "ADR-000, not a packaging detail.\n"
+            "See 'A note on personal data in this repo' in README.md.\n"
+            "To run this script, supply a CSV at that path with these columns:\n"
+            "supplier_name, company_number, contract_value_gbp, source_of_referral,\n"
+            "actual_referrer, source_doc, source_url, source_reference",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     with POSITIVES_CSV.open() as f:
         reader = csv.DictReader(f)
         positives = list(reader)

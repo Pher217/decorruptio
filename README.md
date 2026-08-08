@@ -280,9 +280,11 @@ tokenizer needs `UNCORRUPT_VAULT_HMAC_KEY` — copy `.env.example` to `.env`. **
 your own keys**; none are distributed with this repo.
 
 Some scripts (`scripts/measure_temporal_lift.py`, `scripts/phase_c_paths.py`,
-`scripts/cohort_test_v2.py`) read a local cohort CSV that is **not** in this repo
-and will refuse to run without it — see [issues](https://github.com/Pher217/decorruptio/issues)
-for the plan to replace it with a published fixture.
+`scripts/cohort_test_v2.py`) read a local cohort CSV — the DHSC VIP-lane referral
+cohort — that is **deliberately not** distributed here: it names individual
+referrers, so publishing it is an A2 decision under ADR-000, not a packaging
+detail. Those scripts exit `2` with the required column list rather than throwing
+a traceback. Everything else runs without it.
 
 ## A note on personal data in this repo
 

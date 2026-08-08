@@ -23,7 +23,11 @@ blocked it.
 > write-ups — live in a separate private Obsidian vault, not in this repo.** This
 > repo is code, config, and the executable guardrails. Where a docstring cites
 > `02 Projects/Ideas/Decorruptio/...`, that is a vault path; the load-bearing
-> content is summarised here. If you're contributing and need an ADR, open an
+> content is summarised here. The two ADRs a stranger needs to understand the
+> discipline — [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md) (the
+> legal/ethical guardrails) and [ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)
+> (the fail-closed measurement boundary) — are published in `docs/adr/`; the rest
+> remain vault-only for now. If you're contributing and need another ADR, open an
 > issue and it gets published.
 
 ---
@@ -38,7 +42,7 @@ is the reason this repo is now open.
 **The fail-closed gate was built, then run against itself — and it blocked.** The
 one artifact in this repository that you can audit yourself is
 `experiments/no_score_certificate.json`: a certificate bound to a code commit and
-an attestation-inclusive graph hash ([ADR-008](#the-guardrails-are-executable-not-prose)),
+an attestation-inclusive graph hash ([ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)),
 recording `"verdict": "NO SCORE -- INSTRUMENT-LIMITED"` against **five** named
 blockers — three per-stratum control batteries (`commons_declared_interest`,
 `lords_declared_interest`, `ch_officer_appointment`) measured and failing, plus the
@@ -184,8 +188,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 This project deliberately does **not** algorithmically "expose corrupt
 politicians" — that is illegal (GDPR/LGPD), defamation-exposed, and unsound
 (automated flagging is a triage funnel: the best deployed system turns ~17,700
-flags into ~134 actions). So the guardrails live in code and CI, not in a
-manifesto:
+flags into ~134 actions). The two design records behind this section are
+published in-repo: [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md)
+(the legal/ethical guardrails) and [ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)
+(the fail-closed measurement boundary). So the guardrails live in code and CI,
+not in a manifesto:
 
 - **`sources/`** — a machine-readable legal-basis + redistribution register (14
   source entries). A connector **cannot run** without a valid entry.
@@ -199,7 +206,7 @@ manifesto:
   imports this.
 - **`src/uncorrupt/vault/`** — keyed-HMAC tokenizer; refuses to run without a key,
   never returns a raw ID.
-- **`src/uncorrupt/gates/`** — the fail-closed measurement boundary (ADR-008):
+- **`src/uncorrupt/gates/`** — the fail-closed measurement boundary ([ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)):
   `coverage.py`, `stratum.py`, `certificate.py`, `binding.py`. A blocked gate emits
   a **no-score certificate** bound to a code commit + graph hash, rather than a
   score with an asterisk.
@@ -305,7 +312,7 @@ your own keys**; none are distributed with this repo.
 Some scripts (`scripts/measure_temporal_lift.py`, `scripts/phase_c_paths.py`,
 `scripts/cohort_test_v2.py`) read a local cohort CSV — the DHSC VIP-lane referral
 cohort — that is **deliberately not** distributed here: it names individual
-referrers, so publishing it is an A2 decision under ADR-000, not a packaging
+referrers, so publishing it is an A2 decision under [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md), not a packaging
 detail. Those scripts exit `2` with the required column list rather than throwing
 a traceback. Everything else runs without it.
 

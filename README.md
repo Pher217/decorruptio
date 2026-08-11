@@ -23,7 +23,11 @@ blocked it.
 > write-ups — live in a separate private Obsidian vault, not in this repo.** This
 > repo is code, config, and the executable guardrails. Where a docstring cites
 > `02 Projects/Ideas/Decorruptio/...`, that is a vault path; the load-bearing
-> content is summarised here. If you're contributing and need an ADR, open an
+> content is summarised here. The two ADRs a stranger needs to understand the
+> discipline — [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md) (the
+> legal/ethical guardrails) and [ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)
+> (the fail-closed measurement boundary) — are published in `docs/adr/`; the rest
+> remain vault-only for now. If you're contributing and need another ADR, open an
 > issue and it gets published.
 
 ---
@@ -38,38 +42,67 @@ is the reason this repo is now open.
 **The fail-closed gate was built, then run against itself — and it blocked.** The
 one artifact in this repository that you can audit yourself is
 `experiments/no_score_certificate.json`: a certificate bound to a code commit and
-an attestation-inclusive graph hash ([ADR-008](#the-guardrails-are-executable-not-prose)),
+an attestation-inclusive graph hash ([ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)),
 recording `"verdict": "NO SCORE -- INSTRUMENT-LIMITED"` against **five** named
 blockers — three per-stratum control batteries (`commons_declared_interest`,
 `lords_declared_interest`, `ch_officer_appointment`) measured and failing, plus the
 two coverage families recorded as **`UNMEASURED`**. Either state blocks scoring
 identically; that is the whole point. **Unknown never reads as pass.**
 
-**Read the next part sceptically, because the numbers are not in this repo.** A
-coverage-gate run on 2026-08-05 produced the two figures below, but its report
-lives under `experiments/`, which is gitignored, so *the certificate above does not
-carry them* — it carries the same two families as never-measured. Both readings
-block. Neither is auditable from a clone:
+**Read the next part sceptically, because the numerators are not in this repo.** A
+coverage-gate run on 2026-08-05 produced the two figures below. Its full report
+lives under `experiments/`, which is gitignored, and the ingest + gold manifest
+that produced the numerators are not reproducible from a clone (see Gate 0, item 2
+below), so *the certificate above does not carry them* — it carries the same two
+families as never-measured. The **denominators**, however, are now reconciled and
+independently reproducible from a clone (verified live 2026-08-09); the
+**numerators** (the `63` and the `1,675`) are not:
 
 | Coverage gate | Accounted for | Standard | Result |
 |---|---|---|---|
-| Companies House officer roster over the procurement-supplier universe | 63 / 12,227 (0.52%) | 100% accounted | BLOCKED — *report not in repo* |
-| Commons register ingest vs. the Interests API's own `totalResults` | 1,675 / 3,237 (51.7%) | 100% accounted | BLOCKED — *denominator disputed, see below* |
+| Companies House officer roster over the procurement-supplier universe | 63 / 12,227 (0.52%) | 100% accounted | BLOCKED — *numerator not reproducible from a clone* |
+| Commons register ingest vs. the Interests API's own `totalResults` | 1,675 / 3,237 (51.7%) | 100% accounted | BLOCKED — *numerator not reproducible; denominator reconciled below* |
 
-And the Commons denominator does not reconcile with our own code:
-`src/uncorrupt/gates/coverage.py` documents the live `totalResults` as **3,415**
-with `ExpandChildInterests=true` (the flag the fetcher always sends) versus **4,057**
-without it, both verified live 2026-08-04, and
-`tests/fixtures/commons_retrieval_controls.json` uses 4,057. The 3,237 above matches
-neither. **We are not going to quietly pick one.** Reconciling it — and checking
-whether the shortfall is a genuine gap or the deliberate ADR-004 privacy exclusions
-the gate fails to credit — is open work, item 3 in *how you can help* below.
+The Commons denominator is no longer a dispute. All four numbers are live readings
+of the same endpoint (`https://interests-api.parliament.uk/api/v1/Interests`), taken
+2026-08-09, differing only by query shape — so they are reproducible from a clone
+with `curl`:
 
-Publishing a blocked gate whose own headline figures are unpublished is a real
-defect in this README's auditability, found by an adversarial review of it rather
-than by us. It is recorded here rather than smoothed over, on the same reasoning as
-the methods confession further down: the fix is to check the report in, not to
-soften the sentence.
+- **4,057** — `ExpandChildInterests=false`, unwindowed (children counted as flat records).
+- **3,415** — `ExpandChildInterests=true`, unwindowed (the full corpus; the fetcher always sends this flag).
+- **3,237** — `ExpandChildInterests=true`, `RegisteredFrom=2019-01-01`, no upper bound (the 2026-08-05 run's denominator).
+- **178** — `ExpandChildInterests=true`, `RegisteredTo=2018-12-31` (interests registered before 2019-01-01).
+
+They close exactly: `3,237 + 178 = 3,415`. The 3,237 the 2026-08-05 run used is a
+**date-window** figure (interests registered from 2019-01-01 onwards), not a
+contradiction of the 3,415 full corpus — the 178-record difference is simply the
+pre-2019 interests the window excludes. `tests/fixtures/commons_retrieval_controls.json`
+uses 4,057 (the no-expand shape) for its own retrieval-control battery, a separate
+purpose. The verbatim probe:
+
+```
+curl -s 'https://interests-api.parliament.uk/api/v1/Interests?Take=1&SortOrder=PublishingDateDescending&ExpandChildInterests=true&RegisteredFrom=2019-01-01'
+# -> "totalResults": 3237
+curl -s 'https://interests-api.parliament.uk/api/v1/Interests?Take=1&SortOrder=PublishingDateDescending&ExpandChildInterests=true'
+# -> "totalResults": 3415
+curl -s 'https://interests-api.parliament.uk/api/v1/Interests?Take=1&SortOrder=PublishingDateDescending&ExpandChildInterests=true&RegisteredTo=2018-12-31'
+# -> "totalResults": 178
+```
+
+What remains unauditable is the **numerator** (`1,675` ingested attestations, and
+`63` of `12,227` officers): those are DB counts from an ingest run whose data and
+the manifest that binds it are not in this repo. The 4,057-vs-3,415 gap is the
+`ExpandChildInterests` flag itself (already documented in `coverage.py`); it is not
+a privacy exclusion. Whether the *ingest shortfall* (the `1,562` records fetched but
+not written) is the deliberate ADR-004 privacy exclusions the gate fails to credit
+is item 3 in *how you can help* below — the exclusions exist, but the proposed exact
+identity for them does not close (see item 3).
+
+Publishing a blocked gate whose headline numerators are not reproducible from a
+clone is a real defect in this README's auditability, found by an adversarial
+review of it rather than by us. It is recorded here rather than smoothed over: the
+fix is to resolve Gate 0 (the missing gold manifest) so the gate can be re-run and
+the report checked in — not to soften the sentence.
 
 **The instrument was then tested against a case known to be true** — CMA Case
 50697, the demolition cartel (decision 12 June 2023, ~£60m fines, 19 rigged
@@ -144,12 +177,23 @@ blocking problems are **not** "write more code":
    formally retire the coverage-gated pipeline with its own ADR. Everything else is
    downstream of that decision. (`scripts/load_gold_manifest.py`,
    `scripts/run_gold_benchmark.py`, `tests/fixtures/gold_manifest.example.csv`.)
-3. **The Commons coverage figure may be a measurement defect, not a data gap.** The
-   fetch retrieves all 3,237 records; ~1,562 are dropped in the graph-write step by
-   *deliberate* privacy exclusions (`skipped_family`, `skipped_private_individual`),
-   which the gate wrongly counts as missing rather than accounted-for-excluded.
-   Confirming `1,675 + the four skip counters == 3,237` exactly would clear half of
-   Gate 0 cheaply. (`src/uncorrupt/gates/coverage.py::measure_commons_coverage`.)
+3. **The Commons coverage figure is a measurement defect, not a data gap — partly
+   confirmed, partly still open.** The denominator is reconciled (see above):
+   `3,237` is `ExpandChildInterests=true` with `RegisteredFrom=2019-01-01`, a date
+   window — not a privacy exclusion. The *ingest shortfall* (`3,237 - 1,675 = 1,562`
+   records fetched but not written) is partly the **deliberate ADR-004 privacy
+   exclusions** the gate fails to credit: `src/uncorrupt/graph/parliament_interests.py`
+   excludes family-member categories (`skipped_family`, ADR-004 D1) and
+   private-individual donors (`skipped_private_individual`, ADR-004 D2) by design, and
+   `measure_commons_coverage` counts every non-ingested record as `not_attempted`
+   rather than `explicitly_failed`, so it overstates the genuine gap by the size of
+   those exclusions. **But** the cheap clearance this item once proposed — confirming
+   `1,675 + the four skip counters == 3,237` exactly — does **not** close: the ingest
+   counts *one unit per counterparty-classification decision* (a multi-donor "Visits"
+   interest is 2 units; child interests are flattened), while `totalResults` counts
+   *interests*, so the two sides are different units. The real next step is to re-run
+   the ingest, read the actual skip counters, and credit the exclusions in the gate
+   — which needs the manifest Gate 0 is missing (item 2). (`src/uncorrupt/gates/coverage.py::measure_commons_coverage`.)
 4. **A known bug with a measured blast radius.** Companies House packs multiple
    companies into a single `company_names` string
    (`"BROWN AND MASON GROUP LIMITED (01892133)  BROWN AND MASON LIMITED (00686405)"`),
@@ -184,10 +228,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 This project deliberately does **not** algorithmically "expose corrupt
 politicians" — that is illegal (GDPR/LGPD), defamation-exposed, and unsound
 (automated flagging is a triage funnel: the best deployed system turns ~17,700
-flags into ~134 actions). So the guardrails live in code and CI, not in a
-manifesto:
+flags into ~134 actions). The two design records behind this section are
+published in-repo: [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md)
+(the legal/ethical guardrails) and [ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)
+(the fail-closed measurement boundary). So the guardrails live in code and CI,
+not in a manifesto:
 
-- **`sources/`** — a machine-readable legal-basis + redistribution register (13
+- **`sources/`** — a machine-readable legal-basis + redistribution register (14
   source entries). A connector **cannot run** without a valid entry.
   `opensanctions.yml` ships marked `non_commercial` + `A2` + `dpia_cleared: false`
   so the guardrail tests have a real failing case to bite on.
@@ -199,7 +246,7 @@ manifesto:
   imports this.
 - **`src/uncorrupt/vault/`** — keyed-HMAC tokenizer; refuses to run without a key,
   never returns a raw ID.
-- **`src/uncorrupt/gates/`** — the fail-closed measurement boundary (ADR-008):
+- **`src/uncorrupt/gates/`** — the fail-closed measurement boundary ([ADR-008](docs/adr/ADR-008-fail-closed-measurement-boundary.md)):
   `coverage.py`, `stratum.py`, `certificate.py`, `binding.py`. A blocked gate emits
   a **no-score certificate** bound to a code commit + graph hash, rather than a
   score with an asterisk.
@@ -305,7 +352,7 @@ your own keys**; none are distributed with this repo.
 Some scripts (`scripts/measure_temporal_lift.py`, `scripts/phase_c_paths.py`,
 `scripts/cohort_test_v2.py`) read a local cohort CSV — the DHSC VIP-lane referral
 cohort — that is **deliberately not** distributed here: it names individual
-referrers, so publishing it is an A2 decision under ADR-000, not a packaging
+referrers, so publishing it is an A2 decision under [ADR-000](docs/adr/ADR-000-legal-and-ethical-guardrails.md), not a packaging
 detail. Those scripts exit `2` with the required column list rather than throwing
 a traceback. Everything else runs without it.
 

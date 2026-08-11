@@ -1,0 +1,47 @@
+source_id: uk_cma_decisions
+name: UK Competition and Markets Authority — non-confidential infringement & disqualification decisions
+jurisdictions: [GB]
+data_class: A2   # names individual directors (CDDA 1986 s.9B competition-law
+                 # disqualifications) — natural persons — even though the infringers
+                 # are companies, mirroring uk_companies_house_officers.yml's precedent
+                 # (company directors/officers are A2 even when the focus is the company)
+tier: a          # the decision is a public Crown-copyright document; re-distribution of
+                 # the raw document is open. Derived person-grade *flags* would be tier
+                 # b/c per ADR-000 G5 — that is a separate publication decision, not this
+                 # source's default tier for the raw artefact.
+license: "Open Government Licence v3.0 (Crown copyright — CMA published decisions)"
+redistribution: open
+legal_basis: >-
+  Competition Act 1998 / Competition and Markets Authority Act 2015 — the CMA
+  publishes non-confidential infringement decisions and CDDA 1986 disqualification
+  orders as public regulatory records. Crown-copyright material re-used under the
+  Open Government Licence v3.0 (verified on gov.uk 2026-08-09).
+access_method: ocr   # the redistributed asset is a PDF; src/uncorrupt/extraction/
+                     # text-layers it with a quality gate (OCR fallback per ADR-008
+                     # item 2). "ocr" is the schema's closest fit — the register has
+                     # no "document"/"primary" kind (see notes).
+robots_tos_reviewed: 2026-08-09
+freshness_sla_days: 365   # schema-required (>= 1); does NOT meaningfully apply — the
+                         # redistributed asset is a final, static historical decision,
+                         # not a live register. Re-verify only if a decision is appealed
+                         # to the Competition Appeal Tribunal; see notes.
+dpia_cleared: false   # A2 — names natural persons (disqualified directors); gated by
+                      # the same global DPIA/LIA as the other UK A2 sources, not yet
+                      # formally cleared. Re-distributing the CMA's own public record
+                      # is not itself new processing, but any derived person-grade use
+                      # is blocked until the DPIA is done.
+notes: >-
+  Redistributed primary document, NOT a pipeline connector — no
+  src/uncorrupt/connectors/uk_cma_decisions/ module exists and none is implied.
+  This entry exists because the register's own principle (a legal-basis +
+  redistribution record for every redistributed source) applies to redistributed
+  third-party documents too, and the one such document in this repo —
+  `sources/primary/CMA-50697-non-confidential-infringement-decision.pdf`, the
+  demolition-cartel infringement decision (12 June 2023), used as the s9B / Case
+  50697 ground-truth positive control by `scripts/measure_s9b_seed_footprint.py`
+  and `scripts/disqualified_director_cross_register.py` — sat outside it.
+  `connector_kind` defaults to `procurement` only because the schema offers no
+  `document`/`primary` kind; a dedicated kind for redistributed primary documents
+  is a follow-up design decision, not resolved here. The PDF is content-hashed by
+  the extraction layer (ADR-008); the register entry records the legal basis and
+  licence for that redistributed copy.

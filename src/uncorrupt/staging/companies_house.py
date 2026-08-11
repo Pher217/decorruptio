@@ -27,6 +27,7 @@ CH_COLUMNS = {
     "companyname": "company_name",
     "companystatus": "company_status",
     "companyincorporationdate": "incorporation_date",
+    "incorporationdate": "incorporation_date",  # live CH bulk header
     "accountsaccountcategory": "accounts_category",
     "accountslastmadeupdate": "accounts_last_made_up_date",
     "siccode_sic_text_1": "sic_codes",
@@ -121,6 +122,7 @@ def ingest_ch_bulk_csv(
             ("companyname", "company_name"),
             ("companystatus", "company_status"),
             ("companyincorporationdate", "incorporation_date"),
+            ("incorporationdate", "incorporation_date"),
             ("accountsaccountcategory", "accounts_category"),
             ("accountslastmadeupdate", "accounts_last_made_up_date"),
             ("siccode_sic_text_1", "sic_codes"),
@@ -143,9 +145,7 @@ def ingest_ch_bulk_csv(
                     company_number=company_number.strip(),
                     company_name=company_name.strip(),
                     company_status=_get_col(row, col_map, "companystatus"),
-                    incorporation_date=_parse_date(
-                        _get_col(row, col_map, "companyincorporationdate")
-                    ),
+                    incorporation_date=_parse_date(_get_col(row, col_map, "incorporationdate")),
                     accounts_category=_get_col(row, col_map, "accountsaccountcategory"),
                     accounts_last_made_up_date=_parse_date(
                         _get_col(row, col_map, "accountslastmadeupdate")

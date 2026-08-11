@@ -124,12 +124,14 @@ import httpx
 from django.db import transaction
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
+from uncorrupt.register.loader import load_source
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
 from uncorrupt.staging.models import Company
 
 INTERESTS_API_BASE = "https://interests-api.parliament.uk/api/v1/Interests"
 REGISTERS_API_BASE = "https://interests-api.parliament.uk/api/v1/Registers"
 SOURCE_NAME = "UK Parliament Register of Interests"
+SOURCE_ID = "uk_parliament_interests"
 
 FAMILY_CATEGORY_MARKER = "family members"
 
@@ -231,6 +233,7 @@ def fetch_parliament_interests(
     to point `output_dir` at a gitignored path (e.g. `experiments/`) — this
     function does not commit anything.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_parliament_interests.yml
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "parliament_interests.json"
@@ -732,6 +735,7 @@ def ingest_parliament_interests_json(json_path: str | Path) -> dict[str, Any]:
     already set by child interests, which are flattened into their own
     counted units by `_leaf_interests` before this loop ever sees them.
     """
+    load_source(SOURCE_ID)  # refuses to run without sources/uk_parliament_interests.yml
     json_path = Path(json_path)
     items = json.loads(json_path.read_text())
 

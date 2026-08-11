@@ -13,7 +13,7 @@ from uncorrupt.indicators.catalog.i007_value_vs_company_size import ValueVsCompa
 from uncorrupt.indicators.catalog.i008_dormancy_delinquency import DormancyDelinquency
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.loader import load_locale
-from uncorrupt.staging.companies_house import resolve_suppliers
+from uncorrupt.staging.companies_house import ingest_ch_bulk_csv, resolve_suppliers
 from uncorrupt.staging.ingest import ingest_artifacts
 from uncorrupt.staging.models import Award, Company, SupplierResolution, Tender
 
@@ -672,3 +672,35 @@ class Phase4KnownCaseCoverageTest(TestCase):
         i008 = DormancyDelinquency()
         i008_flags = list(i008.evaluate(_make_ctx()))
         assert len(i008_flags) == 0
+
+
+class ChBulkCsvColumnMapTest(TestCase):
+    """Regression: ingest_ch_bulk_csv must populate incorporation_date from the real
+    Companies House bulk header 'IncorporationDate' (which normalises to
+    'incorporationdate' — no 'company' prefix), not just the speculative
+    'companyincorporationdate' key the live header never matches. Before the fix,
+    5.7M companies ingested with incorporation_date=NULL and i006 returned 0 flags."""
+
+    def test_incorporation_date_populated_from_real_ch_header(self):
+        import tempfile
+        from datetime import date
+
+        csv_text = (
+            "CompanyName, CompanyNumber,CompanyStatus,IncorporationDate,"
+            "Accounts.AccountCategory,Accounts.LastMadeUpDate,SICCode.SicText_1\n"
+            "SHELL LTD,12345678,Active,2024-05-01,MICRO_ENTITY,2025-05-01,70229\n"
+            "OLD LTD,87654321,Active,1999-01-01,FULL,2024-12-31,99999\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+            f.write(csv_text)
+            path = f.name
+        n = ingest_ch_bulk_csv(path, snapshot_date=date(2026, 7, 1))
+        assert n == 2
+        shell = Company.objects.get(company_number="12345678")
+        old = Company.objects.get(company_number="87654321")
+        assert shell.incorporation_date == date(2024, 5, 1), (
+            f"incorporation_date not parsed from 'IncorporationDate' header: "
+            f"{shell.incorporation_date!r}"
+        )
+        assert old.incorporation_date == date(1999, 1, 1)
+        assert shell.accounts_category == "MICRO_ENTITY"

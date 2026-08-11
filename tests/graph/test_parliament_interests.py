@@ -14,6 +14,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+import uncorrupt.graph.parliament_interests as parliament_interests_module
+from uncorrupt.core.errors import RegisterError
 from uncorrupt.graph.models import Attestation, Entity
 from uncorrupt.graph.parliament_interests import (
     fetch_parliament_interests,
@@ -993,3 +995,52 @@ class TestParliamentInterestsFetch:
 
         assert requested_skips == [0, 20, 40]
         assert result.item_count == 45
+
+
+class TestParliamentInterestsRegisterContract:
+    """ADR-001 D5 wiring: fetch + ingest must refuse to run without a valid
+    sources/uk_parliament_interests.yml entry (mirrors ec_donations)."""
+
+    def test_ingest_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN the register entry cannot be resolved WHEN ingest_parliament_interests_json
+        is called THEN it raises RegisterError and writes nothing to the database."""
+        monkeypatch.setattr(parliament_interests_module, "SOURCE_ID", "does_not_exist_xyz")
+        import json
+
+        p = tmp_path / "dump.json"
+        p.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": 1,
+                        "category": {"name": "Miscellaneous"},
+                        "member": {
+                            "id": 1,
+                            "nameDisplayAs": "X",
+                            "nameListAs": "X",
+                            "house": "Commons",
+                            "memberFrom": "X",
+                            "party": "X",
+                        },
+                        "fields": [],
+                        "registrationDate": "2024-01-01",
+                    }
+                ]
+            )
+        )
+        with pytest.raises(RegisterError):
+            ingest_parliament_interests_json(p)
+
+    def test_fetch_refuses_to_run_without_register_entry(self, tmp_path, monkeypatch):
+        """GIVEN the register entry cannot be resolved WHEN fetch_parliament_interests is
+        called THEN it raises RegisterError before making any HTTP request."""
+        monkeypatch.setattr(parliament_interests_module, "SOURCE_ID", "does_not_exist_xyz")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("fetch_parliament_interests must not make an HTTP request")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with pytest.raises(RegisterError):
+            fetch_parliament_interests(
+                tmp_path, page_size=20, polite_delay_seconds=0, client=client
+            )

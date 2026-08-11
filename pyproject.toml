@@ -54,6 +54,9 @@ i002_short_bid_window = "uncorrupt.indicators.catalog.i002_short_bid_window:Shor
 i003_repeat_winner_share = "uncorrupt.indicators.catalog.i003_repeat_winner_share:RepeatWinnerShare"
 i004_price_vs_estimate = "uncorrupt.indicators.catalog.i004_price_vs_estimate:PriceVsEstimate"
 i005_direct_award_share = "uncorrupt.indicators.catalog.i005_direct_award_share:DirectAwardShare"
+i006_incorporation_proximity = "uncorrupt.indicators.catalog.i006_incorporation_proximity:IncorporationProximity"
+i007_value_vs_company_size = "uncorrupt.indicators.catalog.i007_value_vs_company_size:ValueVsCompanySize"
+i008_dormancy_delinquency = "uncorrupt.indicators.catalog.i008_dormancy_delinquency:DormancyDelinquency"
 
 [build-system]
 requires = ["hatchling"]

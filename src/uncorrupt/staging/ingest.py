@@ -241,7 +241,8 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
                     "supplier_name": sup_name,
                     "supplier_id_scheme": supplier_id_scheme,
                     "supplier_id": supplier_id,
-                    "currency": award_value.get("currency") or DEFAULT_CURRENCY["uk_contracts_finder"],
+                    "currency": award_value.get("currency")
+                    or DEFAULT_CURRENCY["uk_contracts_finder"],
                     "value_amount_cents": _to_cents(award_value.get("amount")),
                     "status": award.get("status"),
                     "award_date": _parse_dt(award.get("date")),

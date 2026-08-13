@@ -5,4 +5,5 @@ procedure_metadata:
   min_bid_days_open: 30       # UK PCR 2015 minimum for open procedures
   min_bid_days_restricted: 25
   direct_award_threshold: 25000   # GBP — below this, direct awards are common (threshold varies by framework)
+  open_tender_threshold_gbp: 122976   # UK PCR 2015 open-tender threshold, central govt goods/services
 notes: "UK/Contracts Finder profile. Baseline in the comparative experiment — lower enforcement gap expected."

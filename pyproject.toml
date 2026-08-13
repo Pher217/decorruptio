@@ -57,6 +57,7 @@ i005_direct_award_share = "uncorrupt.indicators.catalog.i005_direct_award_share:
 i006_incorporation_proximity = "uncorrupt.indicators.catalog.i006_incorporation_proximity:IncorporationProximity"
 i007_value_vs_company_size = "uncorrupt.indicators.catalog.i007_value_vs_company_size:ValueVsCompanySize"
 i008_dormancy_delinquency = "uncorrupt.indicators.catalog.i008_dormancy_delinquency:DormancyDelinquency"
+i009_contract_splitting = "uncorrupt.indicators.catalog.i009_contract_splitting:ContractSplitting"
 
 [build-system]
 requires = ["hatchling"]

@@ -98,6 +98,7 @@ class ContractSplitting(Indicator):
 
         awards = (
             Award.objects.filter(source_id=source, status="active")
+            .exclude(value_amount_cents__isnull=True)
             .exclude(value_amount_cents__lte=0)  # B2: zero-value awards are unscoreable
             .exclude(award_date__isnull=True)
             .select_related("tender_ref")
@@ -137,7 +138,7 @@ class ContractSplitting(Indicator):
                     award_id=a.award_id,
                     tender_id=a.tender_id,
                     award_date=a.award_date.date() if a.award_date else date.today(),
-                    value_cents=a.value_amount_cents,
+                    value_cents=a.value_amount_cents or 0,
                     supplier_name=a.supplier_name,
                     company_number=r["company_number"],
                     match_confidence=r["confidence"],

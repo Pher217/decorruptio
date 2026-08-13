@@ -47,8 +47,11 @@ class DormancyDelinquency(Indicator):
         today = date.today()
         source = ctx.source_id
 
-        awards = Award.objects.filter(source_id=source, status="active").select_related(
-            "tender_ref"
+        awards = (
+            Award.objects.filter(source_id=source, status="active")
+            .exclude(value_amount_cents__isnull=True)
+            .exclude(value_amount_cents=0)
+            .select_related("tender_ref")
         )
 
         resolutions: dict[str, dict[str, Any]] = {}

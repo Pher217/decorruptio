@@ -205,45 +205,49 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
         award_id = award.get("id", "")
         if not award_id:
             continue
-        supplier = award.get("suppliers", [{}])[0] if award.get("suppliers") else {}
         award_value = award.get("value", {})
+        suppliers_list = award.get("suppliers", [])
 
-        # Cross-reference parties[] by supplier id, falling back to name.
-        sup_id = supplier.get("id", "")
-        sup_name = supplier.get("name", "")
-        supplier_id_scheme = supplier.get("identifier", {}).get("scheme")
-        supplier_id = supplier.get("identifier", {}).get("id")
+        for sup_idx, supplier in enumerate(suppliers_list):
+            # Cross-reference parties[] by supplier id, falling back to name.
+            sup_id = supplier.get("id", "")
+            sup_name = supplier.get("name", "")
+            supplier_id_scheme = supplier.get("identifier", {}).get("scheme")
+            supplier_id = supplier.get("identifier", {}).get("id")
 
-        if not supplier_id and sup_id:
-            party = party_by_id.get(sup_id)
-            if party:
-                pid = party.get("identifier", {})
-                supplier_id_scheme = pid.get("scheme")
-                supplier_id = pid.get("id")
+            if not supplier_id and sup_id:
+                party = party_by_id.get(sup_id)
+                if party:
+                    pid = party.get("identifier", {})
+                    supplier_id_scheme = pid.get("scheme")
+                    supplier_id = pid.get("id")
 
-        if not supplier_id and sup_name:
-            party = party_by_name.get(sup_name)
-            if party:
-                pid = party.get("identifier", {})
-                supplier_id_scheme = pid.get("scheme")
-                supplier_id = pid.get("id")
+            if not supplier_id and sup_name:
+                party = party_by_name.get(sup_name)
+                if party:
+                    pid = party.get("identifier", {})
+                    supplier_id_scheme = pid.get("scheme")
+                    supplier_id = pid.get("id")
 
-        Award.objects.update_or_create(
-            source_id="uk_contracts_finder",
-            tender_id=tender_id,
-            award_id=award_id,
-            defaults={
-                "tender_ref": tender_obj,
-                "supplier_name": sup_name,
-                "supplier_id_scheme": supplier_id_scheme,
-                "supplier_id": supplier_id,
-                "currency": award_value.get("currency") or DEFAULT_CURRENCY["uk_contracts_finder"],
-                "value_amount_cents": _to_cents(award_value.get("amount")),
-                "status": award.get("status"),
-                "award_date": _parse_dt(award.get("date")),
-                "raw_json": award,
-            },
-        )
+            # Make award_id unique per supplier to satisfy the UNIQUE constraint.
+            unique_award_id = f"{award_id}:{sup_idx}" if len(suppliers_list) > 1 else award_id
+
+            Award.objects.update_or_create(
+                source_id="uk_contracts_finder",
+                tender_id=tender_id,
+                award_id=unique_award_id,
+                defaults={
+                    "tender_ref": tender_obj,
+                    "supplier_name": sup_name,
+                    "supplier_id_scheme": supplier_id_scheme,
+                    "supplier_id": supplier_id,
+                    "currency": award_value.get("currency") or DEFAULT_CURRENCY["uk_contracts_finder"],
+                    "value_amount_cents": _to_cents(award_value.get("amount")),
+                    "status": award.get("status"),
+                    "award_date": _parse_dt(award.get("date")),
+                    "raw_json": award,
+                },
+            )
 
 
 def _ingest_co_secop_ii(artifact: RawArtifact) -> None:

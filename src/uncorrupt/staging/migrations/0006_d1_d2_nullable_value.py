@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('staging', '0005_d1_supplier_resolution_grain'),
+        ("staging", "0005_d1_supplier_resolution_grain"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='award',
-            name='value_amount_cents',
+            model_name="award",
+            name="value_amount_cents",
             field=models.BigIntegerField(blank=True, default=0, null=True),
         ),
     ]

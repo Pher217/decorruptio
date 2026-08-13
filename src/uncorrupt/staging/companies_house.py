@@ -282,7 +282,7 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
                         },
                     )
                     unmatched += 1
-                continue
+                continue  # DO NOT fall through to name match — the award carries its own ID
 
             # Tier 2: exact name match (uniqueness-guarded)
             normalised = _normalise_name(name)

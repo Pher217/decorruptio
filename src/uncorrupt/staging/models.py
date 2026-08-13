@@ -87,7 +87,7 @@ class Award(models.Model):
     supplier_id_scheme = models.CharField(max_length=50, null=True, blank=True)
     supplier_id = models.CharField(max_length=200, null=True, blank=True)
     currency = models.CharField(max_length=3, default="USD")
-    value_amount_cents = models.BigIntegerField(default=0, null=True, blank=True)
+    value_amount_cents = models.BigIntegerField(default=0)
     status = models.CharField(max_length=50, null=True, blank=True)
     award_date = models.DateTimeField(null=True, blank=True)
     raw_json = models.JSONField(default=dict)
@@ -255,11 +255,10 @@ class SupplierResolution(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [("source_id", "supplier_id")]
+        unique_together = [("source_id", "supplier_name")]
         indexes = [
             models.Index(fields=["source_id", "match_method"]),
             models.Index(fields=["company_number"]),
-            models.Index(fields=["source_id", "supplier_name"]),
         ]
 
     def __str__(self) -> str:

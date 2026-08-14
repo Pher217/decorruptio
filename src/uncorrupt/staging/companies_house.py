@@ -111,10 +111,10 @@ def ingest_ch_bulk_csv(
 
         # Map known column names (normalised) to CSV headers
         col_map: dict[str, str] = {}
-        for norm, _ in CH_COLUMNS.items():
+        for norm, target in CH_COLUMNS.items():
             norm_key = norm.lower().replace("_", "")
-            if norm_key in header_lower:
-                col_map[norm] = header_lower[norm_key]
+            if norm_key in header_lower and target not in col_map:
+                col_map[target] = header_lower[norm_key]
 
         # Also try common variants
         for variant, target in [
@@ -128,30 +128,30 @@ def ingest_ch_bulk_csv(
             ("siccode_sic_text_1", "sic_codes"),
             ("registeredofficeaddress", "registered_address"),
         ]:
-            if target not in col_map.values():
+            if target not in col_map:
                 vkey = variant.lower().replace("_", "")
                 if vkey in header_lower:
-                    col_map[variant] = header_lower[vkey]
+                    col_map[target] = header_lower[vkey]
 
         companies_batch: list[Company] = []
         for row in reader:
-            company_number = _get_col(row, col_map, "companynumber")
+            company_number = _get_col(row, col_map, "company_number")
             if not company_number:
                 continue
-            company_name = _get_col(row, col_map, "companyname") or ""
+            company_name = _get_col(row, col_map, "company_name") or ""
 
             companies_batch.append(
                 Company(
                     company_number=company_number.strip(),
                     company_name=company_name.strip(),
-                    company_status=_get_col(row, col_map, "companystatus"),
-                    incorporation_date=_parse_date(_get_col(row, col_map, "incorporationdate")),
-                    accounts_category=_get_col(row, col_map, "accountsaccountcategory"),
+                    company_status=_get_col(row, col_map, "company_status"),
+                    incorporation_date=_parse_date(_get_col(row, col_map, "incorporation_date")),
+                    accounts_category=_get_col(row, col_map, "accounts_category"),
                     accounts_last_made_up_date=_parse_date(
-                        _get_col(row, col_map, "accountslastmadeupdate")
+                        _get_col(row, col_map, "accounts_last_made_up_date")
                     ),
-                    sic_codes=_get_col(row, col_map, "siccode_sic_text_1"),
-                    registered_address=_get_col(row, col_map, "registeredofficeaddress"),
+                    sic_codes=_get_col(row, col_map, "sic_codes"),
+                    registered_address=_get_col(row, col_map, "registered_address"),
                     normalised_name=_normalise_name(company_name),
                     bulk_snapshot_date=snapshot_date,
                 )

@@ -232,12 +232,6 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
             # Make award_id unique per supplier to satisfy the UNIQUE constraint.
             unique_award_id = f"{award_id}:{sup_idx}" if len(suppliers_list) > 1 else award_id
 
-            # D2: multi-supplier awards carry a framework ceiling, not per-supplier money.
-            # Null the value when N>1 so indicators don't aggregate a ceiling as spend.
-            per_supplier_value = (
-                _to_cents(award_value.get("amount")) if len(suppliers_list) == 1 else None
-            )
-
             Award.objects.update_or_create(
                 source_id="uk_contracts_finder",
                 tender_id=tender_id,
@@ -249,7 +243,7 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
                     "supplier_id": supplier_id,
                     "currency": award_value.get("currency")
                     or DEFAULT_CURRENCY["uk_contracts_finder"],
-                    "value_amount_cents": per_supplier_value,
+                    "value_amount_cents": _to_cents(award_value.get("amount")),
                     "status": award.get("status"),
                     "award_date": _parse_dt(award.get("date")),
                     "raw_json": award,

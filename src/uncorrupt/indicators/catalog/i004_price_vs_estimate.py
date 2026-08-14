@@ -41,14 +41,10 @@ class PriceVsEstimate(Indicator):
         today = date.today()
         threshold = self.params["pct_threshold"]
 
-        awards = (
-            Award.objects.select_related("tender_ref")
-            .filter(
-                source_id=ctx.source_id,
-                value_amount_cents__gt=0,
-                tender_ref__value_amount_cents__gt=0,
-            )
-            .exclude(value_amount_cents__isnull=True)
+        awards = Award.objects.select_related("tender_ref").filter(
+            source_id=ctx.source_id,
+            value_amount_cents__gt=0,
+            tender_ref__value_amount_cents__gt=0,
         )
         self.units_evaluated = awards.count()
         for a in awards:
@@ -64,10 +60,8 @@ class PriceVsEstimate(Indicator):
                 tender.raw_json,
             ):
                 continue
-            tender_value = tender.value_amount_cents or 0
-            award_value = a.value_amount_cents or 0
-            if tender_value == 0:
-                continue
+            tender_value = tender.value_amount_cents
+            award_value = a.value_amount_cents
             deviation = abs(award_value - tender_value) * 100 / tender_value
             if deviation / 100 < threshold:
                 continue

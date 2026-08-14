@@ -67,11 +67,8 @@ class ValueVsCompanySize(Indicator):
         today = date.today()
         source = ctx.source_id
 
-        awards = (
-            Award.objects.filter(source_id=source, status="active")
-            .exclude(value_amount_cents__isnull=True)
-            .exclude(value_amount_cents=0)
-            .select_related("tender_ref")
+        awards = Award.objects.filter(source_id=source, status="active").select_related(
+            "tender_ref"
         )
 
         resolutions: dict[str, dict[str, Any]] = {}
@@ -101,13 +98,13 @@ class ValueVsCompanySize(Indicator):
             flag_reason = None
             threshold = 0
 
-            if category in DORMANT_CATEGORIES and (value_cents or 0) > DORMANT_THRESHOLD_CENTS:
+            if category in DORMANT_CATEGORIES and value_cents > DORMANT_THRESHOLD_CENTS:
                 flag_reason = "dormant accounts"
                 threshold = DORMANT_THRESHOLD_CENTS
-            elif category in MICRO_CATEGORIES and (value_cents or 0) > MICRO_ENTITY_THRESHOLD_CENTS:
+            elif category in MICRO_CATEGORIES and value_cents > MICRO_ENTITY_THRESHOLD_CENTS:
                 flag_reason = "micro-entity accounts"
                 threshold = MICRO_ENTITY_THRESHOLD_CENTS
-            elif category in SMALL_CATEGORIES and (value_cents or 0) > SMALL_THRESHOLD_CENTS:
+            elif category in SMALL_CATEGORIES and value_cents > SMALL_THRESHOLD_CENTS:
                 flag_reason = "small company accounts"
                 threshold = SMALL_THRESHOLD_CENTS
 
@@ -147,7 +144,7 @@ def _confidence_note(res: dict[str, Any]) -> str:
 
 
 def _fmt_value(award: Award) -> str:
-    return f"{(award.value_amount_cents or 0) / 100:.2f} {award.currency}"
+    return f"{award.value_amount_cents / 100:.2f} {award.currency}"
 
 
 def _fmt_cents(cents: int) -> str:

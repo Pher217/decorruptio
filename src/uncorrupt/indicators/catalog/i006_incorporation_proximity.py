@@ -44,11 +44,8 @@ class IncorporationProximity(Indicator):
         today = date.today()
         source = ctx.source_id
 
-        awards = (
-            Award.objects.filter(source_id=source, status="active")
-            .exclude(value_amount_cents__isnull=True)
-            .exclude(value_amount_cents=0)
-            .select_related("tender_ref")
+        awards = Award.objects.filter(source_id=source, status="active").select_related(
+            "tender_ref"
         )
 
         # Build resolution lookup: supplier_name → (company_number, confidence, method)
@@ -114,7 +111,7 @@ def _confidence_note(res: dict[str, Any]) -> str:
 
 
 def _fmt_value(award: Award) -> str:
-    return f"{(award.value_amount_cents or 0) / 100:.2f} {award.currency}"
+    return f"{award.value_amount_cents / 100:.2f} {award.currency}"
 
 
 def _make_evidence(award: Award, company, source: str) -> ProvenanceRecord:

@@ -55,7 +55,7 @@ result:
    ascertainment over the rest of the register — that is the same
    ascertainment bias wearing a fairness label. `procurement_supplier_universe`
    instead pulls the company_numbers Companies House suppliers were already
-   resolved to (`staging.SupplierResolution`, built from the frozen
+   resolved to (`staging.AwardResolution`, built from the frozen
    procurement corpus) — a set that exists independently of which rows
    ended up in any golden/benchmark set.
 2. **The traversal order over that universe must not correlate with a
@@ -113,7 +113,7 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.register.models import SourceEntry
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
-from uncorrupt.staging.models import Company, SupplierResolution
+from uncorrupt.staging.models import AwardResolution, Company
 from uncorrupt.staging.raw import read_cached_fetch, write_cached_fetch
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -385,8 +385,10 @@ def procurement_supplier_universe() -> list[str]:
     """Company numbers of every CH supplier resolved from the frozen procurement corpus.
 
     This is the pre-registered universe for officer-coverage expansion. It
-    is built from `staging.SupplierResolution` -- suppliers already
-    resolved to a Companies House company from the procurement award data
+    is built from `staging.AwardResolution` -- one resolution row per Award,
+    already resolved to a Companies House company from the procurement award
+    data (ADR-012 D1: `AwardResolution` replaced `SupplierResolution` as the
+    per-award resolution grain; this function moved with it, same invariant)
     -- and defined **without any reference to benchmark/gold-row
     membership**. Deriving the universe from which companies happen to
     appear in a positive or negative benchmark row -- even applied
@@ -398,7 +400,7 @@ def procurement_supplier_universe() -> list[str]:
     The true invariant is `company__isnull=False` -- a verified FK to an
     actual `staging.Company` row -- NOT `company_number__isnull=False`.
     `resolve_suppliers` (`staging/companies_house.py`) sets `company_number`
-    to the raw, unverified external identifier even when the match against
+    to the normalised external identifier even when the match against
     the CH bulk snapshot **failed** (`company=None`, `match_confidence=0.0`,
     see the "GB-COH identifier ... not found" branch there) -- so filtering
     on `company_number` alone silently admits unmatched identifiers into the
@@ -415,7 +417,7 @@ def procurement_supplier_universe() -> list[str]:
     order itself.
     """
     numbers = (
-        SupplierResolution.objects.filter(company__isnull=False)
+        AwardResolution.objects.filter(company__isnull=False)
         .values_list("company_number", flat=True)
         .distinct()
         .order_by("company_number")

@@ -15,7 +15,7 @@ from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.loader import load_locale
 from uncorrupt.staging.companies_house import ingest_ch_bulk_csv, resolve_suppliers
 from uncorrupt.staging.ingest import ingest_artifacts
-from uncorrupt.staging.models import Award, Company, SupplierResolution, Tender
+from uncorrupt.staging.models import Award, AwardResolution, Company, SupplierResolution, Tender
 
 
 def _make_uk_release(
@@ -169,8 +169,8 @@ def _setup_award_with_resolution(
     match_confidence: float = 1.0,
     award_value_gbp: float = 50000,
     award_date: str = "2024-06-15T00:00:00",
-) -> tuple[Award, SupplierResolution]:
-    """Create an Award + SupplierResolution for indicator testing."""
+) -> tuple[Award, AwardResolution]:
+    """Create an Award + AwardResolution for indicator testing (ADR-012 D1 grain)."""
 
     tender = Tender.objects.create(
         source_id="uk_contracts_finder",
@@ -192,11 +192,9 @@ def _setup_award_with_resolution(
         raw_json={},
     )
     company = Company.objects.get(company_number=company_number)
-    res = SupplierResolution.objects.create(
+    res = AwardResolution.objects.create(
+        award=award,
         source_id="uk_contracts_finder",
-        supplier_name=supplier_name,
-        supplier_id_scheme="GB-COH" if match_method == "identifier" else None,
-        supplier_id=company_number if match_method == "identifier" else None,
         company=company,
         company_number=company_number,
         match_confidence=match_confidence,
@@ -255,8 +253,17 @@ class I006IncorporationProximityTest(TestCase):
         assert len(flags) == 0
 
     def test_no_resolution_does_not_flag(self):
-        """An award with no resolution must not flag."""
+        """An award with no AwardResolution row must not flag.
+
+        A second, resolved award exists so the source has at least one
+        AwardResolution row overall — otherwise this indicator's own
+        "no AwardResolution rows for this source" guard would raise
+        RuntimeError, which is a different scenario (see
+        TestNoAwardResolutionRowsRaises in test_award_resolution.py).
+        """
         _setup_company(company_number="12345678")
+        _setup_award_with_resolution(company_number="12345678")
+
         # Create an award with a supplier name that has NO resolution
         tender = Tender.objects.create(
             source_id="uk_contracts_finder",
@@ -279,6 +286,7 @@ class I006IncorporationProximityTest(TestCase):
         ind = IncorporationProximity()
         flags = list(ind.evaluate(_make_ctx()))
         assert len(flags) == 0
+        assert ind.units_evaluated == 1
 
 
 class I007ValueVsCompanySizeTest(TestCase):
@@ -421,9 +429,12 @@ class SupplierResolutionTest(TestCase):
         result = resolve_suppliers("uk_contracts_finder")
         assert result["tier1_identifier"] == 1
 
-        res = SupplierResolution.objects.get(supplier_name="Test Supplier Ltd")
+        # Identifier resolutions are no longer written to SupplierResolution
+        # (ADR-012 D1) — they live on AwardResolution now.
+        res = AwardResolution.objects.get(award__award_id="test-award-res")
         assert res.match_confidence == 1.0
         assert res.match_method == "identifier"
+        assert not SupplierResolution.objects.filter(supplier_name="Test Supplier Ltd").exists()
 
     def test_ambiguous_name_low_confidence_no_match(self):
         """A deliberately ambiguous name → low confidence and NOT silently treated as a match."""

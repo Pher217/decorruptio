@@ -31,8 +31,9 @@ from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionS
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
 from uncorrupt.indicators.catalog._framework import is_framework_or_dps
+from uncorrupt.indicators.catalog._shared import confidence_note
 from uncorrupt.indicators.context import EvaluationContext
-from uncorrupt.staging.models import Award, SupplierResolution
+from uncorrupt.staging.models import Award, AwardResolution
 
 # Defaults. The threshold is NOT hardcoded — it is read from the locale profile
 # (locales/gb.yml procedure_metadata.open_tender_threshold_gbp). min_pieces=3:
@@ -100,26 +101,21 @@ class ContractSplitting(Indicator):
             Award.objects.filter(source_id=source, status="active")
             .exclude(value_amount_cents__lte=0)  # B2: zero-value awards are unscoreable
             .exclude(award_date__isnull=True)
-            .select_related("tender_ref")
+            .select_related("tender_ref", "resolution")
         )
 
-        # Build resolution lookup: supplier_name -> (company_number, confidence, method)
-        resolutions: dict[str, dict[str, Any]] = {}
-        for res in SupplierResolution.objects.filter(source_id=source).exclude(
-            company_number__isnull=True
-        ):
-            resolutions[res.supplier_name] = {
-                "company_number": res.company_number,
-                "confidence": res.match_confidence,
-                "method": res.match_method,
-            }
+        if awards.exists() and not AwardResolution.objects.filter(source_id=source).exists():
+            raise RuntimeError(
+                f"No AwardResolution rows for source '{source}' — run "
+                f"resolve_suppliers('{source}') before evaluating this indicator."
+            )
 
         # Filter to eligible awards: resolved supplier, non-framework, has buyer.
         eligible: list[_AwardView] = []
         for a in awards:
-            if not a.supplier_name or a.supplier_name not in resolutions:
+            if not hasattr(a, "resolution") or not a.resolution.company_number:
                 continue
-            r = resolutions[a.supplier_name]
+            r = a.resolution
             tender = a.tender_ref
             if not tender or not tender.buyer_name:
                 continue
@@ -139,9 +135,9 @@ class ContractSplitting(Indicator):
                     award_date=a.award_date.date() if a.award_date else date.today(),
                     value_cents=a.value_amount_cents,
                     supplier_name=a.supplier_name,
-                    company_number=r["company_number"],
-                    match_confidence=r["confidence"],
-                    match_method=r["method"],
+                    company_number=r.company_number,
+                    match_confidence=r.match_confidence,
+                    match_method=r.match_method,
                     buyer_name=buyer,
                     procurement_method=tender.procurement_method,
                     procurement_method_details=tender.procurement_method_details,
@@ -210,14 +206,14 @@ class ContractSplitting(Indicator):
                 else:
                     band = f"within-{window_days}d"
 
-                # Confidence: weakest match in the cluster.
+                # Confidence: weakest match in the cluster. Always printed — see
+                # `_shared.confidence_note` for why suppressing it on an identifier
+                # match is exactly wrong.
                 weakest = min(cluster, key=lambda v: v.match_confidence)
-                conf_note = ""
-                if weakest.match_method != "identifier":
-                    conf_note = (
-                        f" [weakest cluster match: confidence="
-                        f"{weakest.match_confidence:.1f}, method={weakest.match_method}]"
-                    )
+                conf_note = (
+                    f" Weakest cluster match:"
+                    f"{confidence_note(weakest.match_confidence, weakest.match_method)}"
+                )
 
                 cluster_date = cluster[0].award_date.isoformat()
                 subject_ref = f"{company_number}@{buyer}:{cluster_date}"

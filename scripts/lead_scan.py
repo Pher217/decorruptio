@@ -27,7 +27,7 @@ time auditable, METHOD.
 Method, deliberately mirroring `findings.md` SS6.1's own description so the
 question being asked stays the same even though the driver code does not:
 
-  1. candidates  -- distinct, NORMALISED `SupplierResolution.company_number`
+  1. candidates  -- distinct, NORMALISED `AwardResolution.company_number`
      for `source_id="uk_contracts_finder"` (see `build_candidates`'s
      docstring for why normalisation is needed to avoid double-counting one
      company under two spellings). The sealed cohort is NOT excluded here
@@ -42,7 +42,7 @@ question being asked stays the same even though the driver code does not:
      `company_number` ALONE (registry-ID-only; see `resolve_candidates`'s
      docstring for why the name-fallback tier of `resolve_supplier` is
      deliberately not engaged here). As of this writing, candidates only
-     cover suppliers that already have a `SupplierResolution` row at all --
+     cover suppliers that already have an `AwardResolution` row at all --
      55.0% of real awardee supplier names do not (see `stage1_context` in
      the emitted report), so `resolved` is a fraction of a fraction; do not
      read `resolved / candidates` as visibility into the full awardee
@@ -139,7 +139,7 @@ from scripts.phase_c_paths import (  # noqa: E402
 
 from uncorrupt.graph.models import Edge, Entity  # noqa: E402
 from uncorrupt.graph.register_snapshots import path_min_identity_confidence  # noqa: E402
-from uncorrupt.staging.models import Award, SupplierResolution  # noqa: E402
+from uncorrupt.staging.models import Award, AwardResolution  # noqa: E402
 
 SOURCE_ID = "uk_contracts_finder"
 MEMBER_ENTITY_TYPE = "person"
@@ -234,13 +234,20 @@ CONFIDENCE_CAVEAT = (
 
 
 def build_candidates() -> dict[str, date | None]:
-    """distinct NORMALISED `SupplierResolution.company_number` -> earliest award date, or None.
+    """distinct NORMALISED `AwardResolution.company_number` -> earliest award date, or None.
 
     Mirrors `findings.md` SS6.1's own definition of the candidate set: distinct
-    `SupplierResolution.company_number` for `source_id="uk_contracts_finder"`.
-    Unlike SS6.1, the sealed cohort is NOT excluded -- see this module's
-    docstring for why (excluding it would require reading it as an input,
-    which this script's scope forbids).
+    resolved company_number for `source_id="uk_contracts_finder"`. Unlike SS6.1,
+    the sealed cohort is NOT excluded -- see this module's docstring for why
+    (excluding it would require reading it as an input, which this script's
+    scope forbids).
+
+    ADR-012 D1: candidates are now built from `staging.AwardResolution` (one
+    resolution row per Award) instead of `staging.SupplierResolution` (one row
+    per supplier_name, which could silently collapse two awards' distinct
+    GB-COH ids under one shared name). Each `AwardResolution` row carries its
+    own award via a OneToOne FK, so the cutoff below reads `award__award_date`
+    directly instead of joining back to `Award` by supplier_name string.
 
     Company numbers are normalised (`phase_c_paths.normalise_company_number`)
     BEFORE they become candidate keys, not just at resolution time. Upstream
@@ -254,38 +261,34 @@ def build_candidates() -> dict[str, date | None]:
     upstream staging table; it only normalises its own candidate key.
 
     A candidate's cutoff is the EARLIEST `Award.award_date` among every
-    `supplier_name` that resolved to its `company_number` (more than one
-    supplier-name string can resolve to the same company, now including
+    `AwardResolution` row that resolved to its `company_number` (more than
+    one award can resolve to the same company, now including
     different-spelling company-number strings that normalise to the same
     one). `None` means no dated award was found for this candidate at all --
     reported honestly via the `path_no_award_date` status downstream, never
     silently defaulted to a permissive or restrictive date.
     """
     raw_pairs = (
-        SupplierResolution.objects.filter(source_id=SOURCE_ID)
+        AwardResolution.objects.filter(source_id=SOURCE_ID)
         .exclude(company_number__isnull=True)
         .exclude(company_number="")
-        .values_list("supplier_name", "company_number")
+        .select_related("award")
+        .values_list("company_number", "award__award_date")
     )
-    supplier_to_company: dict[str, str] = {
-        supplier_name: normalise_company_number(company_number)
-        for supplier_name, company_number in raw_pairs
-    }
 
     cutoffs: dict[str, date] = {}
-    awards = (
-        Award.objects.filter(source_id=SOURCE_ID, supplier_name__in=supplier_to_company.keys())
-        .exclude(award_date__isnull=True)
-        .values_list("supplier_name", "award_date")
-    )
-    for supplier_name, award_date in awards:
-        company_number = supplier_to_company[supplier_name]
+    company_numbers: set[str] = set()
+    for raw_company_number, award_date in raw_pairs:
+        company_number = normalise_company_number(raw_company_number)
+        company_numbers.add(company_number)
+        if award_date is None:
+            continue
         award_day = award_date.date()
         current = cutoffs.get(company_number)
         if current is None or award_day < current:
             cutoffs[company_number] = award_day
 
-    return {cn: cutoffs.get(cn) for cn in sorted(set(supplier_to_company.values()))}
+    return {cn: cutoffs.get(cn) for cn in sorted(company_numbers)}
 
 
 def resolve_candidates(candidates: dict[str, date | None]) -> dict[str, Entity | None]:
@@ -550,23 +553,30 @@ def compute_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
 def _stage1_context() -> dict[str, Any]:
     """How far downstream `candidates` starts, against the real awardee population.
 
-    `candidates` is scoped to `SupplierResolution` rows that already exist for
+    `candidates` is scoped to `AwardResolution` rows that already exist for
     `source_id="uk_contracts_finder"` -- it says nothing about awardee supplier
-    names with NO `SupplierResolution` row at all (never attempted, or attempted
-    and not persisted). Measured against the live graph, 55.0% of distinct
-    awardee supplier names in `Award` have no `SupplierResolution` row: a reader
-    seeing `candidates: 13,124 -> resolved: ~12,200` could infer ~93% graph
-    visibility into awardees, when against the real awardee population it is
-    roughly 31% (resolved / total awardee names). This makes that denominator
-    explicit in the artifact instead of leaving it to be inferred.
+    names with NO `AwardResolution` row at all.
+
+    ADR-012 D1 changed what "no resolution row" means here. `resolve_suppliers`
+    now writes one `AwardResolution` per Award whenever the award carries a
+    GB-COH id OR a non-empty supplier_name -- including when the match itself
+    failed, with `company_number=None` (see `resolve_suppliers`'s Step B
+    docstring in `staging/companies_house.py`). Only an award with NEITHER a
+    GB-COH id NOR a supplier_name gets no row at all. Under the old
+    `SupplierResolution` grain, a name that matched zero Companies House
+    rows also got no row -- so this denominator is now much smaller than it
+    was pre-ADR-012: a name appearing in
+    `awardee_supplier_names_without_supplier_resolution_row` today means it
+    is missing a supplier_name entirely on every one of its awards, not
+    merely that its name failed to match against the CH bulk snapshot.
     """
     awardee_names = set(
         Award.objects.filter(source_id=SOURCE_ID).values_list("supplier_name", flat=True)
     )
     resolution_names = set(
-        SupplierResolution.objects.filter(source_id=SOURCE_ID).values_list(
-            "supplier_name", flat=True
-        )
+        AwardResolution.objects.filter(source_id=SOURCE_ID)
+        .select_related("award")
+        .values_list("award__supplier_name", flat=True)
     )
     without_resolution = awardee_names - resolution_names
     total = len(awardee_names)
@@ -577,10 +587,12 @@ def _stage1_context() -> dict[str, Any]:
             round(100 * len(without_resolution) / total, 1) if total else None
         ),
         "note": (
-            "`candidates` below counts only SupplierResolution rows that already "
+            "`candidates` below counts only AwardResolution rows that already "
             "exist for this source; the percentage above is the share of real "
             "awardee supplier names (from Award) that have none at all, and are "
-            "therefore not `candidates`, not `unresolved`, not any status below."
+            "therefore not `candidates`, not `unresolved`, not any status below. "
+            "See this function's docstring for how ADR-012 changed this "
+            "denominator's meaning versus the pre-ADR-012 SupplierResolution grain."
         ),
     }
 
@@ -622,9 +634,10 @@ def build_report(max_hops: int = DEFAULT_MAX_HOPS) -> dict[str, Any]:
             "entities": Entity.objects.count(),
             "edges": Edge.objects.count(),
             "same_as_edges": Edge.objects.filter(edge_type="same_as").count(),
-            "supplier_resolution_rows": SupplierResolution.objects.filter(
-                source_id=SOURCE_ID
-            ).count(),
+            # Key name kept as "supplier_resolution_rows" for output-format
+            # stability; sourced from AwardResolution since ADR-012 D1 moved
+            # per-award resolution provenance to that model.
+            "supplier_resolution_rows": AwardResolution.objects.filter(source_id=SOURCE_ID).count(),
         },
         "max_hops": max_hops,
         "funnel": funnel,

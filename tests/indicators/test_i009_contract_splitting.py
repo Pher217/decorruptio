@@ -17,7 +17,8 @@ import pytest
 from uncorrupt.indicators.catalog.i009_contract_splitting import ContractSplitting
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.models import LocaleProfile
-from uncorrupt.staging.models import Award, Company, SupplierResolution, Tender
+from uncorrupt.staging.companies_house import resolve_suppliers
+from uncorrupt.staging.models import Award, Company, Tender
 
 SOURCE = "uk_contracts_finder"
 THRESHOLD_GBP = 122976
@@ -74,20 +75,6 @@ def _setup_award(tender, award_id: str, supplier_name: str, value_cents: int, aw
     )
 
 
-def _setup_resolution(supplier_name: str, company_number: str = "12345678"):
-    company = Company.objects.get(company_number=company_number)
-    SupplierResolution.objects.create(
-        source_id=SOURCE,
-        supplier_name=supplier_name,
-        supplier_id_scheme="GB-COH",
-        supplier_id=company_number,
-        company=company,
-        company_number=company_number,
-        match_confidence=1.0,
-        match_method="identifier",
-    )
-
-
 class TestI009ContractSplitting:
     """i009: buyer splits one procurement into sub-threshold pieces."""
 
@@ -98,7 +85,6 @@ class TestI009ContractSplitting:
         WHEN i009 evaluates THEN it flags the cluster."""
         _setup_company()
         supplier = "TEST SUPPLIER LTD"
-        _setup_resolution(supplier)
 
         for i, (tid, d, val) in enumerate(
             [
@@ -110,6 +96,7 @@ class TestI009ContractSplitting:
             t = _setup_tender(tid)
             _setup_award(t, f"A{i + 1}", supplier, val, d)
 
+        resolve_suppliers(SOURCE)
         ind = ContractSplitting()
         flags = list(ind.evaluate(_make_ctx()))
 
@@ -126,7 +113,6 @@ class TestI009ContractSplitting:
         THEN it flags nothing (framework/DPS is a legitimate single-supplier route)."""
         _setup_company()
         supplier = "TEST SUPPLIER LTD"
-        _setup_resolution(supplier)
 
         for i, (tid, d, val) in enumerate(
             [
@@ -138,6 +124,7 @@ class TestI009ContractSplitting:
             t = _setup_tender(tid, title="Framework call-off for services")
             _setup_award(t, f"A{i + 1}", supplier, val, d)
 
+        resolve_suppliers(SOURCE)
         ind = ContractSplitting()
         flags = list(ind.evaluate(_make_ctx()))
         assert len(flags) == 0
@@ -147,7 +134,6 @@ class TestI009ContractSplitting:
         """GIVEN only 2 awards (min_pieces=3) WHEN i009 evaluates THEN no flag."""
         _setup_company()
         supplier = "TEST SUPPLIER LTD"
-        _setup_resolution(supplier)
 
         for i, (tid, d, val) in enumerate(
             [
@@ -158,6 +144,7 @@ class TestI009ContractSplitting:
             t = _setup_tender(tid)
             _setup_award(t, f"A{i + 1}", supplier, val, d)
 
+        resolve_suppliers(SOURCE)
         ind = ContractSplitting()
         flags = list(ind.evaluate(_make_ctx()))
         assert len(flags) == 0
@@ -168,7 +155,6 @@ class TestI009ContractSplitting:
         WHEN i009 evaluates THEN no flag (collapses to 1 piece < min_pieces)."""
         _setup_company()
         supplier = "TEST SUPPLIER LTD"
-        _setup_resolution(supplier)
 
         t = _setup_tender("T1")
         for i, d, val in [
@@ -178,6 +164,7 @@ class TestI009ContractSplitting:
         ]:
             _setup_award(t, f"A{i}", supplier, val, d)
 
+        resolve_suppliers(SOURCE)
         ind = ContractSplitting()
         flags = list(ind.evaluate(_make_ctx()))
         assert len(flags) == 0
@@ -188,7 +175,6 @@ class TestI009ContractSplitting:
         WHEN i009 evaluates THEN no flag."""
         _setup_company()
         supplier = "TEST SUPPLIER LTD"
-        _setup_resolution(supplier)
 
         for i, (tid, d, val) in enumerate(
             [
@@ -200,6 +186,7 @@ class TestI009ContractSplitting:
             t = _setup_tender(tid)
             _setup_award(t, f"A{i + 1}", supplier, val, d)
 
+        resolve_suppliers(SOURCE)
         ind = ContractSplitting()
         flags = list(ind.evaluate(_make_ctx()))
         assert len(flags) == 0

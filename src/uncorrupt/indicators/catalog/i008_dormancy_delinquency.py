@@ -16,8 +16,9 @@ from typing import Any
 from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionStamp
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
+from uncorrupt.indicators.catalog._shared import confidence_note
 from uncorrupt.indicators.context import EvaluationContext
-from uncorrupt.staging.models import Award, SupplierResolution
+from uncorrupt.staging.models import Award, AwardResolution
 
 # Accounts category values indicating dormancy
 DORMANT_CATEGORIES = {"dormant", "dormant company", "dormant no significant accounting"}
@@ -48,31 +49,26 @@ class DormancyDelinquency(Indicator):
         source = ctx.source_id
 
         awards = Award.objects.filter(source_id=source, status="active").select_related(
-            "tender_ref"
+            "tender_ref", "resolution"
         )
 
-        resolutions: dict[str, dict[str, Any]] = {}
-        for res in SupplierResolution.objects.filter(source_id=source).exclude(
-            company_number__isnull=True
-        ):
-            resolutions[res.supplier_name] = {
-                "company_number": res.company_number,
-                "confidence": res.match_confidence,
-                "method": res.match_method,
-            }
+        if awards.exists() and not AwardResolution.objects.filter(source_id=source).exists():
+            raise RuntimeError(
+                f"No AwardResolution rows for source '{source}' — run "
+                f"resolve_suppliers('{source}') before evaluating this indicator."
+            )
 
-        evaluable = [a for a in awards if a.supplier_name and a.supplier_name in resolutions]
+        evaluable = [a for a in awards if hasattr(a, "resolution") and a.resolution.company_number]
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
-            assert award.supplier_name is not None
-            r = resolutions[award.supplier_name]
-            company = _get_company(r["company_number"])
+            r = award.resolution
+            company = _get_company(r.company_number)
             if not company:
                 continue
 
             flag_reason = None
-            confidence_note = _confidence_note(r)
+            note = confidence_note(r.match_confidence, r.match_method)
 
             # Check for dormant accounts
             if (
@@ -106,7 +102,7 @@ class DormancyDelinquency(Indicator):
                         f" ({_award_date_str(award)}). "
                         f"Company number {company.company_number}. "
                         f"A company with dormant or delinquent filings winning a contract "
-                        f"may be a shell or front entity.{confidence_note}"
+                        f"may be a shell or front entity.{note}"
                     ),
                     evidence=[_make_evidence(award, company, source)],
                     stamp=VersionStamp(
@@ -121,12 +117,6 @@ def _get_company(company_number: str):
     from uncorrupt.staging.models import Company
 
     return Company.objects.filter(company_number=company_number).first()
-
-
-def _confidence_note(res: dict[str, Any]) -> str:
-    if res["method"] == "identifier":
-        return ""
-    return f" [match_confidence={res['confidence']:.1f}, method={res['method']}]"
 
 
 def _award_date_str(award: Award) -> str:

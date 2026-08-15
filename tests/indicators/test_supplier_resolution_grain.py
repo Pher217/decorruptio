@@ -123,7 +123,9 @@ class TestSupplierResolutionGrain:
         ind = IncorporationProximity()
         flags = list(ind.evaluate(_make_ctx()))
 
-        assert len(flags) == 1, f"expected 1 flag, got {len(flags)}: {[f.subject_ref for f in flags]}"
+        assert len(flags) == 1, (
+            f"expected 1 flag, got {len(flags)}: {[f.subject_ref for f in flags]}"
+        )
         assert flags[0].subject_ref == "T1:A1"
 
     @pytest.mark.django_db

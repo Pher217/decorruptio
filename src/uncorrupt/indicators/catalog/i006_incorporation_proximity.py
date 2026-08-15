@@ -16,8 +16,9 @@ from typing import Any
 from uncorrupt.core.provenance import ProvenanceRecord, Redistribution, VersionStamp
 from uncorrupt.core.tiers import DataClass, Tier
 from uncorrupt.indicators.base import Flag, Indicator, ValidationStatus
+from uncorrupt.indicators.catalog._shared import confidence_note
 from uncorrupt.indicators.context import EvaluationContext
-from uncorrupt.staging.models import Award, SupplierResolution
+from uncorrupt.staging.models import Award, AwardResolution
 
 # Default: supplier incorporated less than 90 days before the award date.
 # 90 days is the threshold — a company incorporated within 3 months of winning
@@ -45,35 +46,29 @@ class IncorporationProximity(Indicator):
         source = ctx.source_id
 
         awards = Award.objects.filter(source_id=source, status="active").select_related(
-            "tender_ref"
+            "tender_ref", "resolution"
         )
 
-        # Build resolution lookup: supplier_name → (company_number, confidence, method)
-        resolutions: dict[str, dict[str, Any]] = {}
-        for res in SupplierResolution.objects.filter(source_id=source).exclude(
-            company_number__isnull=True
-        ):
-            resolutions[res.supplier_name] = {
-                "company_number": res.company_number,
-                "confidence": res.match_confidence,
-                "method": res.match_method,
-            }
+        if awards.exists() and not AwardResolution.objects.filter(source_id=source).exists():
+            raise RuntimeError(
+                f"No AwardResolution rows for source '{source}' — run "
+                f"resolve_suppliers('{source}') before evaluating this indicator."
+            )
 
-        # Evaluate only awards with a resolved supplier
-        evaluable = [a for a in awards if a.supplier_name and a.supplier_name in resolutions]
+        # Evaluate only awards with a resolved supplier (non-null company_number)
+        evaluable = [a for a in awards if hasattr(a, "resolution") and a.resolution.company_number]
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
-            assert award.supplier_name is not None
-            r = resolutions[award.supplier_name]
-            company = _get_company(r["company_number"])
+            r = award.resolution
+            company = _get_company(r.company_number)
             if not company or not company.incorporation_date or not award.award_date:
                 continue
 
             age_days = (award.award_date.date() - company.incorporation_date).days
 
             if 0 <= age_days < INCORPORATION_PROXIMITY_DAYS:
-                confidence_note = _confidence_note(r)
+                note = confidence_note(r.match_confidence, r.match_method)
                 yield Flag(
                     indicator_id=self.id,
                     subject_ref=f"{award.tender_id}:{award.award_id}",
@@ -85,7 +80,7 @@ class IncorporationProximity(Indicator):
                         f"Company number {company.company_number}, "
                         f"incorporated {company.incorporation_date.isoformat()}. "
                         f"A company this new winning a public contract may be a shell entity "
-                        f"created to capture this procurement.{confidence_note}"
+                        f"created to capture this procurement.{note}"
                     ),
                     evidence=[
                         _make_evidence(award, company, source),
@@ -102,12 +97,6 @@ def _get_company(company_number: str):
     from uncorrupt.staging.models import Company
 
     return Company.objects.filter(company_number=company_number).first()
-
-
-def _confidence_note(res: dict[str, Any]) -> str:
-    if res["method"] == "identifier":
-        return ""
-    return f" [match_confidence={res['confidence']:.1f}, method={res['method']}]"
 
 
 def _fmt_value(award: Award) -> str:

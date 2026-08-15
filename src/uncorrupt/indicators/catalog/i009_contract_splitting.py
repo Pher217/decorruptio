@@ -110,12 +110,21 @@ class ContractSplitting(Indicator):
                 f"resolve_suppliers('{source}') before evaluating this indicator."
             )
 
-        # Filter to eligible awards: resolved supplier, non-framework, has buyer.
+        # Filter to eligible awards: named, resolved supplier, non-framework, has buyer.
+        # Nameless awards stay excluded (ADR-012 open item 2, pending founder decision).
         eligible: list[_AwardView] = []
         for a in awards:
-            if not hasattr(a, "resolution") or not a.resolution.company_number:
+            if (
+                not a.supplier_name
+                or not hasattr(a, "resolution")
+                or not a.resolution.company_number
+            ):
                 continue
             r = a.resolution
+            supplier_name = a.supplier_name
+            company_number = r.company_number
+            if supplier_name is None or company_number is None:
+                continue
             tender = a.tender_ref
             if not tender or not tender.buyer_name:
                 continue
@@ -134,8 +143,8 @@ class ContractSplitting(Indicator):
                     tender_id=a.tender_id,
                     award_date=a.award_date.date() if a.award_date else date.today(),
                     value_cents=a.value_amount_cents,
-                    supplier_name=a.supplier_name,
-                    company_number=r.company_number,
+                    supplier_name=supplier_name,
+                    company_number=company_number,
                     match_confidence=r.match_confidence,
                     match_method=r.match_method,
                     buyer_name=buyer,

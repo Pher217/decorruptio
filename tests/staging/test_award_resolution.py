@@ -255,3 +255,44 @@ class TestConfidenceNote:
         assert note != ""
         assert "identifier" in note
         assert "1.0" in note
+
+
+@pytest.mark.django_db
+class TestNamelessAwardExcludedFromIndicator:
+    def test_nameless_gb_coh_id_gets_resolution_but_is_not_evaluated(self):
+        """GIVEN an active award with supplier_name=None and a valid GB-COH
+        supplier_id WHEN resolve_suppliers() runs THEN it still gets an
+        AwardResolution row with a non-null company_number, but i006 does
+        NOT count it in units_evaluated."""
+        _make_company("00000010", "HIDDEN LTD")
+        tender = _make_tender("T1")
+        award = _make_award(tender, "A1", None, "00000010", "GB-COH")
+
+        resolve_suppliers(SOURCE)
+
+        res = AwardResolution.objects.get(award=award)
+        assert res.company_number == "00000010"
+
+        ind = IncorporationProximity()
+        list(ind.evaluate(_make_ctx()))
+        assert ind.units_evaluated == 0
+
+
+@pytest.mark.django_db
+class TestWhitespaceGbCohIdStaysInDenominator:
+    def test_whitespace_only_gb_coh_id_is_evaluable(self):
+        """GIVEN an active award with supplier_name='Whitespace Ltd' and a
+        whitespace-only GB-COH supplier_id ' ' WHEN resolve_suppliers()
+        runs THEN its AwardResolution.company_number is not None and i006
+        counts it in units_evaluated, preserving the legacy behaviour."""
+        tender = _make_tender("T1")
+        award = _make_award(tender, "A1", "Whitespace Ltd", " ", "GB-COH")
+
+        resolve_suppliers(SOURCE)
+
+        res = AwardResolution.objects.get(award=award)
+        assert res.company_number is not None
+
+        ind = IncorporationProximity()
+        list(ind.evaluate(_make_ctx()))
+        assert ind.units_evaluated == 1

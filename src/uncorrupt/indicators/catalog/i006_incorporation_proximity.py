@@ -55,13 +55,20 @@ class IncorporationProximity(Indicator):
                 f"resolve_suppliers('{source}') before evaluating this indicator."
             )
 
-        # Evaluate only awards with a resolved supplier (non-null company_number)
-        evaluable = [a for a in awards if hasattr(a, "resolution") and a.resolution.company_number]
+        # Evaluate only awards with a supplier name and a resolved GB-COH id.
+        # Nameless awards stay excluded (ADR-012 open item 2, pending founder decision).
+        evaluable = [
+            a
+            for a in awards
+            if a.supplier_name and hasattr(a, "resolution") and a.resolution.company_number
+        ]
         self.units_evaluated = len(evaluable)
 
         for award in evaluable:
             r = award.resolution
-            company = _get_company(r.company_number)
+            company_number = r.company_number
+            assert company_number is not None
+            company = _get_company(company_number)
             if not company or not company.incorporation_date or not award.award_date:
                 continue
 

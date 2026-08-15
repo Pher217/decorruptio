@@ -382,12 +382,16 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
                     )
                     tier1 += 1
                 else:
+                    # Preserve the pre-existing behaviour: an unmatched GB-COH
+                    # id still counts as evaluated, so store a non-null value
+                    # even when normalisation strips it to None.
+                    stored_number = normalised_sid or award.supplier_id
                     AwardResolution.objects.update_or_create(
                         award=award,
                         defaults={
                             "source_id": source_id,
                             "company": None,
-                            "company_number": normalised_sid,
+                            "company_number": stored_number,
                             "match_confidence": 0.0,
                             "match_method": None,
                             "normalisation_note": (
@@ -399,13 +403,14 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
                     )
                     unmatched += 1
             elif award.supplier_name:
-                entry = name_tier.get(award.supplier_name)
-                if entry is None:
+                cached = name_tier.get(award.supplier_name)
+                if cached is None:
                     # A name seen only on id-carrying awards is absent from the
                     # Step A dict. Resolve it once and memoise — passing this as
                     # a `dict.get` default would re-query CH for every award.
-                    entry = _name_tier_entry(award.supplier_name)
-                    name_tier[award.supplier_name] = entry
+                    cached = _name_tier_entry(award.supplier_name)
+                    name_tier[award.supplier_name] = cached
+                entry = cached
                 company = entry["company"]
                 AwardResolution.objects.update_or_create(
                     award=award,

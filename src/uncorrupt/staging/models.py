@@ -78,7 +78,19 @@ class Tender(models.Model):
 
 
 class Award(models.Model):
-    """A contract award within a tender."""
+    """A contract award within a tender.
+
+    `value_amount_cents` is only per-supplier money when
+    `value_kind == "per_supplier"`. When `value_kind == "shared_ceiling"` the
+    amount is an aggregate belonging to the whole award (e.g. a framework
+    ceiling shared across multiple suppliers) and MUST NOT be read as this
+    supplier's money, nor summed across the award's rows.
+    """
+
+    VALUE_KINDS = [
+        ("per_supplier", "Per-supplier award value"),
+        ("shared_ceiling", "Aggregate ceiling shared across multiple suppliers"),
+    ]
 
     source_id = models.CharField(max_length=50, db_index=True)
     tender_id = models.CharField(max_length=200)
@@ -88,6 +100,9 @@ class Award(models.Model):
     supplier_id = models.CharField(max_length=200, null=True, blank=True)
     currency = models.CharField(max_length=3, default="USD")
     value_amount_cents = models.BigIntegerField(default=0)
+    value_kind = models.CharField(
+        max_length=20, choices=VALUE_KINDS, default="per_supplier", db_index=True
+    )
     status = models.CharField(max_length=50, null=True, blank=True)
     award_date = models.DateTimeField(null=True, blank=True)
     raw_json = models.JSONField(default=dict)

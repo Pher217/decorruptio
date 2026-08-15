@@ -83,9 +83,17 @@ class ValueVsCompanySize(Indicator):
 
         evaluable = [a for a in awards if a.supplier_name and a.supplier_name in resolutions]
         self.units_evaluated = len(evaluable)
+        self.units_unscoreable = 0
 
         for award in evaluable:
             assert award.supplier_name is not None
+
+            if award.value_kind == "shared_ceiling":
+                # A shared framework ceiling is not this supplier's money —
+                # abstain rather than flag. Stays counted in units_evaluated.
+                self.units_unscoreable += 1
+                continue
+
             r = resolutions[award.supplier_name]
             company = _get_company(r["company_number"])
             if not company or not company.accounts_category:

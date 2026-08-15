@@ -43,7 +43,7 @@ from uncorrupt.graph.ch_officers import (
     select_next_pending,
 )
 from uncorrupt.graph.models import Attestation, Edge, Entity
-from uncorrupt.staging.models import Company, SupplierResolution
+from uncorrupt.staging.models import Award, AwardResolution, Company, Tender
 
 RAW_OFFICER_ITEM = {
     "name": "SMITH, John Michael",
@@ -772,23 +772,57 @@ class TestSaltedHashOrder:
         assert sorted(result) == sorted(numbers)
 
 
+def _make_award_resolution(
+    award_id: str,
+    company=None,
+    company_number: str | None = None,
+    match_confidence: float = 0.0,
+    match_method: str | None = None,
+    normalisation_note: str | None = None,
+) -> AwardResolution:
+    """Create an Award + AwardResolution -- the ADR-012 D1 per-award grain."""
+    tender = Tender.objects.create(
+        source_id="uk_contracts_finder",
+        tender_id=f"tender-{award_id}",
+        source_url="https://example.com",
+    )
+    award = Award.objects.create(
+        source_id="uk_contracts_finder",
+        tender_id=tender.tender_id,
+        tender_ref=tender,
+        award_id=award_id,
+        supplier_name="Test Supplier Ltd",
+        currency="GBP",
+        value_amount_cents=5000000,
+        status="active",
+        raw_json={},
+    )
+    return AwardResolution.objects.create(
+        award=award,
+        source_id="uk_contracts_finder",
+        company=company,
+        company_number=company_number,
+        match_confidence=match_confidence,
+        match_method=match_method,
+        normalisation_note=normalisation_note,
+    )
+
+
 @pytest.mark.django_db
 class TestProcurementSupplierUniverse:
     def test_returns_distinct_resolved_company_numbers(self):
-        """GIVEN two verified supplier resolutions pointing at the same company WHEN
+        """GIVEN two verified award resolutions pointing at the same company WHEN
         building the universe THEN the company number appears exactly once."""
         company = Company.objects.create(company_number="00000001", company_name="Acme Ltd")
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Acme Ltd",
+        _make_award_resolution(
+            "award-1",
             company=company,
             company_number="00000001",
             match_confidence=1.0,
             match_method="identifier",
         )
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Acme Limited",
+        _make_award_resolution(
+            "award-2",
             company=company,
             company_number="00000001",
             match_confidence=0.9,
@@ -800,16 +834,9 @@ class TestProcurementSupplierUniverse:
         assert universe == ["00000001"]
 
     def test_excludes_unresolved_suppliers_with_no_company_number(self):
-        """GIVEN a supplier resolution with no resolved company_number WHEN building the
+        """GIVEN an award resolution with no resolved company_number WHEN building the
         universe THEN that row contributes nothing to it."""
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Unknown Supplier Ltd",
-            company=None,
-            company_number=None,
-            match_confidence=0.0,
-            match_method=None,
-        )
+        _make_award_resolution("award-1", company=None, company_number=None)
 
         universe = procurement_supplier_universe()
 
@@ -817,16 +844,13 @@ class TestProcurementSupplierUniverse:
 
     def test_excludes_unverified_identifier_that_carries_a_company_number(self):
         """GIVEN a GB-COH identifier match that FAILED against the CH bulk snapshot --
-        `resolve_suppliers` still sets `company_number=sid` (the raw, unverified
+        `resolve_suppliers` still sets `company_number=sid` (the normalised, unverified
         external identifier) even though `company=None` and `match_confidence=0.0`
         (see `staging/companies_house.py`'s "not found in CH bulk snapshot" branch) --
         WHEN building the universe THEN that row is excluded. Filtering on
         `company_number__isnull=False` alone would wrongly admit it."""
-        SupplierResolution.objects.create(
-            source_id="uk_contracts_finder",
-            supplier_name="Ghost Supplier Ltd",
-            supplier_id_scheme="GB-COH",
-            supplier_id="09999999",
+        _make_award_resolution(
+            "award-1",
             company=None,
             company_number="09999999",
             match_confidence=0.0,
@@ -839,7 +863,7 @@ class TestProcurementSupplierUniverse:
         assert universe == []
 
     def test_empty_when_no_supplier_resolutions_exist(self):
-        """GIVEN no SupplierResolution rows at all WHEN building the universe THEN it is
+        """GIVEN no AwardResolution rows at all WHEN building the universe THEN it is
         empty, never invented."""
         assert procurement_supplier_universe() == []
 
@@ -990,7 +1014,7 @@ class TestCoverageReport:
 @pytest.mark.django_db
 class TestProcurementUniverseCoverageReport:
     def test_universe_size_matches_distinct_resolved_suppliers(self):
-        """GIVEN two verified SupplierResolution rows resolving to two distinct
+        """GIVEN two verified AwardResolution rows resolving to two distinct
         companies WHEN reporting universe coverage THEN universe_size is exactly 2."""
         _make_verified_supplier_resolution("00000001", "Acme Ltd")
         _make_verified_supplier_resolution("00000002", "Beta Ltd")
@@ -1001,7 +1025,7 @@ class TestProcurementUniverseCoverageReport:
 
     def test_company_outside_universe_is_excluded_from_report(self):
         """GIVEN a GB-COH company entity with officers but NOT referenced by any
-        verified SupplierResolution WHEN reporting universe coverage THEN it is not
+        verified AwardResolution WHEN reporting universe coverage THEN it is not
         counted anywhere in the universe report."""
         _make_verified_supplier_resolution("00000001", "Acme Ltd")
         outside_universe = _make_company_entity("00000099")
@@ -1110,8 +1134,8 @@ def _make_officer_of_edge(
 
 def _make_verified_supplier_resolution(
     company_number: str, supplier_name: str = "Test Supplier Ltd"
-) -> SupplierResolution:
-    """Create a SupplierResolution that is actually verified (`company` FK set).
+) -> AwardResolution:
+    """Create an AwardResolution that is actually verified (`company` FK set).
 
     Mirrors the real success path in `resolve_suppliers` -- NOT the "GB-COH
     identifier present but never matched against the CH bulk snapshot"
@@ -1122,9 +1146,8 @@ def _make_verified_supplier_resolution(
     company, _ = Company.objects.get_or_create(
         company_number=company_number, defaults={"company_name": supplier_name}
     )
-    return SupplierResolution.objects.create(
-        source_id="uk_contracts_finder",
-        supplier_name=supplier_name,
+    return _make_award_resolution(
+        f"award-{company_number}",
         company=company,
         company_number=company_number,
         match_confidence=1.0,

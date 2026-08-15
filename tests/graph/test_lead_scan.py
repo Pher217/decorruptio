@@ -34,7 +34,7 @@ from scripts.lead_scan import (
 
 from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.graph.register_snapshots import path_min_identity_confidence
-from uncorrupt.staging.models import Award, SupplierResolution
+from uncorrupt.staging.models import Award, AwardResolution
 
 SOURCE_ID = "uk_contracts_finder"
 
@@ -52,10 +52,10 @@ def _award(supplier_name: str, award_date: date | None, *, tender_id: str | None
     )
 
 
-def _resolution(supplier_name: str, company_number: str | None) -> SupplierResolution:
-    return SupplierResolution.objects.create(
+def _resolution(award: Award, company_number: str | None) -> AwardResolution:
+    return AwardResolution.objects.create(
+        award=award,
         source_id=SOURCE_ID,
-        supplier_name=supplier_name,
         company_number=company_number,
         match_confidence=1.0 if company_number else 0.0,
         match_method="identifier" if company_number else None,
@@ -112,8 +112,8 @@ class TestBuildCandidates:
         """GIVEN one resolved SupplierResolution row for uk_contracts_finder
         WHEN build_candidates runs THEN its company_number appears as a
         candidate key."""
-        _resolution("Acme Ltd", "00000001")
-        _award("Acme Ltd", date(2020, 1, 1))
+        award = _award("Acme Ltd", date(2020, 1, 1))
+        _resolution(award, "00000001")
 
         candidates = build_candidates()
 
@@ -123,10 +123,10 @@ class TestBuildCandidates:
         """GIVEN two different supplier_name strings resolving to the SAME
         company_number, with different award dates, WHEN build_candidates
         runs THEN the candidate's cutoff is the EARLIER of the two dates."""
-        _resolution("Acme Ltd", "00000001")
-        _resolution("Acme Limited", "00000001")
-        _award("Acme Ltd", date(2021, 6, 1))
-        _award("Acme Limited", date(2019, 3, 15))
+        award_acme = _award("Acme Ltd", date(2021, 6, 1))
+        award_acme_ltd = _award("Acme Limited", date(2019, 3, 15))
+        _resolution(award_acme, "00000001")
+        _resolution(award_acme_ltd, "00000001")
 
         candidates = build_candidates()
 
@@ -136,8 +136,8 @@ class TestBuildCandidates:
         """GIVEN a SupplierResolution row with no company_number (an
         unmatched supplier) WHEN build_candidates runs THEN it contributes no
         candidate."""
-        _resolution("Unmatched Supplier", None)
-        _award("Unmatched Supplier", date(2020, 1, 1))
+        award = _award("Unmatched Supplier", date(2020, 1, 1))
+        _resolution(award, None)
 
         candidates = build_candidates()
 
@@ -147,9 +147,17 @@ class TestBuildCandidates:
         """GIVEN a resolved SupplierResolution for a DIFFERENT source
         WHEN build_candidates runs THEN it is excluded -- this script's
         candidate set is scoped to uk_contracts_finder only."""
-        SupplierResolution.objects.create(
+        other_award = Award.objects.create(
             source_id="ua_prozorro",
+            tender_id="tender-Other Source Ltd",
+            award_id="award-Other Source Ltd",
             supplier_name="Other Source Ltd",
+            award_date=None,
+            raw_json={},
+        )
+        AwardResolution.objects.create(
+            award=other_award,
+            source_id="ua_prozorro",
             company_number="00000009",
             match_confidence=1.0,
             match_method="identifier",
@@ -163,8 +171,8 @@ class TestBuildCandidates:
         """GIVEN a resolved SupplierResolution whose Award carries no
         award_date WHEN build_candidates runs THEN the candidate's cutoff is
         None -- reported honestly, not defaulted to any particular date."""
-        _resolution("No Date Ltd", "00000002")
-        _award("No Date Ltd", None)
+        award = _award("No Date Ltd", None)
+        _resolution(award, "00000002")
 
         candidates = build_candidates()
 
@@ -174,8 +182,8 @@ class TestBuildCandidates:
         """GIVEN a SupplierResolution row whose company_number is an empty
         string (not NULL, but not a usable identifier either) WHEN
         build_candidates runs THEN it contributes no candidate."""
-        _resolution("Blank Number Ltd", "")
-        _award("Blank Number Ltd", date(2020, 1, 1))
+        award = _award("Blank Number Ltd", date(2020, 1, 1))
+        _resolution(award, "")
 
         candidates = build_candidates()
 
@@ -191,10 +199,10 @@ class TestBuildCandidates:
         number, not two -- otherwise the same real company would be double
         counted in `candidates`, and if both spellings ever resolve, emitted
         as two separate leads."""
-        _resolution("Acme Ltd (raw spelling)", "4125764")
-        _resolution("Acme Ltd (padded spelling)", "04125764")
-        _award("Acme Ltd (raw spelling)", date(2021, 6, 1))
-        _award("Acme Ltd (padded spelling)", date(2019, 3, 15))
+        award_raw = _award("Acme Ltd (raw spelling)", date(2021, 6, 1))
+        award_padded = _award("Acme Ltd (padded spelling)", date(2019, 3, 15))
+        _resolution(award_raw, "4125764")
+        _resolution(award_padded, "04125764")
 
         candidates = build_candidates()
 
@@ -208,8 +216,8 @@ class TestBuildCandidates:
         exactly as stored -- pinning that normalisation happens at
         candidate-construction time, not left to whatever resolves it
         downstream."""
-        _resolution("Acme Ltd", "4125764")
-        _award("Acme Ltd", date(2020, 1, 1))
+        award = _award("Acme Ltd", date(2020, 1, 1))
+        _resolution(award, "4125764")
 
         candidates = build_candidates()
 
@@ -1035,8 +1043,8 @@ class TestMainCLI:
         officer = _officer("EXAMPLE, Lord")
         _same_as(member, officer, 0.60, "surname_title_only")
         _officer_of(officer, company, date(2015, 1, 1))
-        _resolution("Acme Ltd", "00000001")
-        _award("Acme Ltd", date(2020, 1, 1))
+        award = _award("Acme Ltd", date(2020, 1, 1))
+        _resolution(award, "00000001")
 
         out_path = tmp_path / "lead_scan.json"
         self._run_main(monkeypatch, ["--out", str(out_path)])
@@ -1111,10 +1119,10 @@ class TestBuildReportIntegration:
         officer = _officer("EXAMPLE, Lord")
         _same_as(member, officer, 0.60, "surname_title_only")
         _officer_of(officer, company, date(2015, 1, 1))
-        _resolution("Acme Ltd", "00000001")
-        _award("Acme Ltd", date(2020, 1, 1))
-        _resolution("Ghost Supplier Ltd", "00000099")
-        _award("Ghost Supplier Ltd", date(2020, 1, 1))
+        award_acme = _award("Acme Ltd", date(2020, 1, 1))
+        _resolution(award_acme, "00000001")
+        award_ghost = _award("Ghost Supplier Ltd", date(2020, 1, 1))
+        _resolution(award_ghost, "00000099")
 
         assert member.id in member_entity_ids()
 
@@ -1157,8 +1165,8 @@ class TestBuildReportIntegration:
             target_entity=target,
             valid_from=date(2012, 1, 1),
         )
-        _resolution("Target Ltd", "00000001")
-        _award("Target Ltd", date(2020, 1, 1))
+        award = _award("Target Ltd", date(2020, 1, 1))
+        _resolution(award, "00000001")
 
         report = build_report()
 

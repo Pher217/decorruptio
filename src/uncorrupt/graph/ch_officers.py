@@ -113,7 +113,7 @@ from uncorrupt.graph.models import Attestation, Edge, Entity
 from uncorrupt.register.loader import load_source
 from uncorrupt.register.models import SourceEntry
 from uncorrupt.staging.companies_house import _normalise_name, normalise_company_number
-from uncorrupt.staging.models import AwardResolution, Company
+from uncorrupt.staging.models import Award, AwardResolution, Company
 from uncorrupt.staging.raw import read_cached_fetch, write_cached_fetch
 
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -416,6 +416,9 @@ def procurement_supplier_universe() -> list[str]:
     to it for traversal -- it is not meant to be used as the traversal
     order itself.
     """
+    if Award.objects.exists() and not AwardResolution.objects.exists():
+        raise RuntimeError("No AwardResolution rows -- run resolve_suppliers first.")
+
     numbers = (
         AwardResolution.objects.filter(company__isnull=False)
         .values_list("company_number", flat=True)

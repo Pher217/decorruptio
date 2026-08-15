@@ -405,9 +405,10 @@ def resolve_suppliers(source_id: str) -> dict[str, Any]:
             elif award.supplier_name:
                 cached = name_tier.get(award.supplier_name)
                 if cached is None:
-                    # A name seen only on id-carrying awards is absent from the
-                    # Step A dict. Resolve it once and memoise — passing this as
-                    # a `dict.get` default would re-query CH for every award.
+                    # Defensive fallback: Step A already populated name_tier for
+                    # every id-less supplier name, so this branch should be
+                    # unreachable in practice. It also avoids the cost of
+                    # eagerly evaluating a computed default for dict.get.
                     cached = _name_tier_entry(award.supplier_name)
                     name_tier[award.supplier_name] = cached
                 entry = cached

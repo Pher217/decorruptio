@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("staging", "0004_company_accounts_next_due_company_company_category_and_more"),
+        ("staging", "0005_awardresolution"),
     ]
 
     operations = [

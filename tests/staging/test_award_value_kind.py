@@ -17,6 +17,7 @@ from uncorrupt.connectors.base import RawArtifact
 from uncorrupt.indicators.catalog.i007_value_vs_company_size import ValueVsCompanySize
 from uncorrupt.indicators.context import EvaluationContext
 from uncorrupt.register.loader import load_locale
+from uncorrupt.staging.companies_house import resolve_suppliers
 from uncorrupt.staging.ingest import ingest_artifacts
 from uncorrupt.staging.models import Award, Company, SupplierResolution, Tender
 
@@ -163,6 +164,10 @@ def _setup_award(
         match_confidence=1.0,
         match_method="identifier",
     )
+    # D1 (ADR-012) made resolution identifier-primary and derived: i007 now reads
+    # award.resolution and fail-closes if no AwardResolution rows exist for the source.
+    # Derive them through the production path rather than hand-building the row.
+    resolve_suppliers("uk_contracts_finder")
     return award
 
 

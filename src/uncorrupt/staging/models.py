@@ -280,3 +280,50 @@ class SupplierResolution(models.Model):
         return (
             f"{self.source_id}:{self.supplier_name} → {self.company_number} ({self.match_method})"
         )
+
+
+class AwardResolution(models.Model):
+    """Resolution of a supplier to a Companies House company, AT THE AWARD-SUPPLIER
+    OCCURRENCE grain (ADR-012 D1).
+
+    `SupplierResolution` is unique on (source_id, supplier_name): when two awards
+    declare DIFFERENT GB-COH supplier_ids under the same supplier_name, one write
+    silently overwrites the other. `AwardResolution` is one row per Award instead,
+    so each award's own identifier drives its own resolution and never inherits
+    another award's outcome.
+
+    DERIVED, rebuildable data: never hand-edit a row here. To fix a bad resolution,
+    truncate this table and re-run `resolve_suppliers()`.
+    """
+
+    award = models.OneToOneField(
+        Award,
+        on_delete=models.CASCADE,
+        related_name="resolution",
+    )
+    source_id = models.CharField(max_length=50, db_index=True)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.SET_NULL,
+        related_name="award_resolutions",
+        null=True,
+        blank=True,
+    )
+    company_number = models.CharField(max_length=20, null=True, blank=True, db_index=True)
+    match_method = models.CharField(
+        max_length=20, choices=SupplierResolution.MATCH_METHODS, null=True, blank=True
+    )
+    match_confidence = models.FloatField(default=0.0)
+    normalisation_note = models.TextField(null=True, blank=True)
+    resolved_at = models.DateTimeField(auto_now=True)
+    # Company.bulk_snapshot_date used for this resolution, for freshness tracking.
+    ch_snapshot_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["source_id", "match_method"]),
+            models.Index(fields=["company_number"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.award_id} → {self.company_number} ({self.match_method})"

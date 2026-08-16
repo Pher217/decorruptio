@@ -14,8 +14,8 @@ manufactured result:
 
 - **The company set must not be derived from the benchmark.** Use
   `--universe procurement-suppliers` to draw the candidate set from
-  `staging.SupplierResolution` (every CH company a procurement-corpus
-  supplier was already resolved to) -- defined without any reference to
+  `staging.AwardResolution` (resolved GB-COH company for every procurement-corpus
+  award, one row per Award) -- defined without any reference to
   which rows are positive or negative benchmark cases. `--company-number`
   / `--company-numbers-file` remain available for an explicit list, but
   that list must not be assembled by filtering on benchmark membership.
@@ -155,7 +155,7 @@ def main() -> None:
         choices=["procurement-suppliers"],
         help="Draw the candidate set from a pre-registered, benchmark-independent universe "
         "instead of an explicit list. 'procurement-suppliers': every CH company a "
-        "procurement-corpus supplier was already resolved to (staging.SupplierResolution). "
+        "procurement-corpus award, one row per Award (staging.AwardResolution). "
         "Mutually exclusive with --company-number/--company-numbers-file.",
     )
     parser.add_argument(

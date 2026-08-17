@@ -159,6 +159,7 @@ class Bid(models.Model):
 class Flag(models.Model):
     """An anomaly flag produced by an indicator. Carries provenance for reproducibility."""
 
+    source_id = models.CharField(max_length=50, db_index=True)
     indicator_id = models.CharField(max_length=50, db_index=True)
     subject_ref = models.CharField(max_length=500)
     as_of = models.DateField()

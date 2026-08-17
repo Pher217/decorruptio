@@ -9,21 +9,11 @@ directly — that is what keeps a `ValidationStatus.UNVALIDATED` indicator like
 i009_contract_splitting for gb/ua/co from ever running in a normal scoring
 pass) and persists every yielded `Flag` dataclass to the `Flag` model.
 
-Idempotency scoping (READ THIS BEFORE CHANGING THE DELETE): the `Flag` model
-has no `source_id` column, so a run cannot delete "this indicator, this
-source" precisely. We scope the delete to indicator_id alone: before
-inserting, delete every existing Flag row whose indicator_id is one of the
-indicators this run is about to (re-)evaluate. This is correct today because
-exactly one source (`uk_contracts_finder`) has ever been scored — an
-indicator_id-scoped delete IS a source-scoped delete when there is only one
-source. It stops being correct the day a second source starts sharing an
-indicator_id (e.g. i001 run for both `uk_contracts_finder` and `ua_prozorro`):
-at that point this delete would also wipe the other source's flags for that
-indicator on every run. The fix then is a schema migration adding
-`Flag.source_id` (human-applied, per project convention) so the delete (and
-the uniqueness of a "run") can be scoped precisely; until that lands, this
-runner is single-source-safe only, and multi-source callers must be scoped
-per source_id understanding this limitation applies globally per indicator.
+Idempotency scoping: `Flag` carries `source_id`, so the delete and the
+persisted-row integrity check are both scoped to `(source_id, indicator_id)`.
+Re-running the same source replaces that source's flags for the evaluated
+indicators only; a second source's flags are never touched.
+
 Also note: not every Flag.subject_ref resolves to a Tender (i003/i005/i009
 use buyer/buyer-supplier keys, not a tender-shaped ref) so `tender_ref` is
 best-effort and legitimately None for those.
@@ -87,14 +77,15 @@ def run(source: str, locale_code: str, *, dry_run: bool = False) -> dict[str, An
     per_indicator: dict[str, dict[str, int]] = {}
 
     with transaction.atomic():
-        # Idempotency: wipe this run's scope (see module docstring) before
-        # inserting, so re-running never duplicates rows.
-        FlagModel.objects.filter(indicator_id__in=ran_ids).delete()
+        # Idempotency: wipe this source/run's scope before inserting, so re-running
+        # never duplicates rows and a second source never deletes another source's flags.
+        FlagModel.objects.filter(source_id=source, indicator_id__in=ran_ids).delete()
 
         for indicator in ran:
             flags = list(indicator.evaluate(ctx))
             rows = [
                 FlagModel(
+                    source_id=source,
                     indicator_id=f.indicator_id,
                     subject_ref=f.subject_ref,
                     as_of=f.as_of,
@@ -123,7 +114,9 @@ def run(source: str, locale_code: str, *, dry_run: bool = False) -> dict[str, An
         # data that is already durable -- an alarm, not a guard. Inside, the count sees
         # this transaction's own rows and the raise rolls the whole run back.
         if not dry_run:
-            actual_persisted = FlagModel.objects.filter(indicator_id__in=ran_ids).count()
+            actual_persisted = FlagModel.objects.filter(
+                source_id=source, indicator_id__in=ran_ids
+            ).count()
             if actual_persisted != total_persisted:
                 raise AssertionError(
                     f"persisted-row count mismatch: db has {actual_persisted} Flag rows "

@@ -5,9 +5,11 @@ wrong for every row already in the table: classification happens only at ingest
 (`ingest.py`, `"shared_ceiling" if len(suppliers_list) > 1 else "per_supplier"`), so
 pre-existing rows were never classified at all.
 
-Measured on the 2026-08-16 dev snapshot: 4,105 of 124,738 Award rows carry more than one
-supplier in `raw_json`, i.e. 4,105 framework ceilings would sit in the database labelled
-as per-supplier money -- the exact error ADR-013 exists to remove.
+Measured 2026-08-17 against the live dev Postgres (the earlier figure of 4,105/124,738 in
+this docstring came from a stale SQLite file and was wrong): **8,027 of 193,053** Award rows
+carried more than one supplier in `raw_json`, holding 62,097 supplier entries between them.
+So 8,027 framework ceilings would sit in the database labelled as per-supplier money -- the
+exact error ADR-013 exists to remove.
 
 A full re-ingest also fixes them, so this migration is strictly a guard against the
 migration and the rebuild being run as two separate operations. That separation is what

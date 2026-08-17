@@ -47,6 +47,9 @@ class Indicator(ABC):
     # actually evaluated for the source. Used by the runner to compute
     # base rates: flags_emitted / units_evaluated.
     units_evaluated: int = 0
+    # Count of units that were evaluated but could not be scored (e.g. value
+    # semantics that don't apply) and were abstained on rather than flagged.
+    units_unscoreable: int = 0
 
     def runs_in(self, locale_code: str) -> bool:
         return self.validation.get(locale_code) is ValidationStatus.VALIDATED

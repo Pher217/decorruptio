@@ -85,8 +85,15 @@ class ValueVsCompanySize(Indicator):
             if a.supplier_name and hasattr(a, "resolution") and a.resolution.company_number
         ]
         self.units_evaluated = len(evaluable)
+        self.units_unscoreable = 0
 
         for award in evaluable:
+            if award.value_kind == "shared_ceiling":
+                # A shared framework ceiling is not this supplier's money —
+                # abstain rather than flag. Stays counted in units_evaluated.
+                self.units_unscoreable += 1
+                continue
+
             r = award.resolution
             company_number = r.company_number
             assert company_number is not None

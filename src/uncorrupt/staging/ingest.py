@@ -244,6 +244,7 @@ def _ingest_uk_contracts_finder(artifact: RawArtifact) -> None:
                     "currency": award_value.get("currency")
                     or DEFAULT_CURRENCY["uk_contracts_finder"],
                     "value_amount_cents": _to_cents(award_value.get("amount")),
+                    "value_kind": "shared_ceiling" if len(suppliers_list) > 1 else "per_supplier",
                     "status": award.get("status"),
                     "award_date": _parse_dt(award.get("date")),
                     "raw_json": award,

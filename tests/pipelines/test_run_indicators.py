@@ -173,3 +173,33 @@ class TestRunIndicatorsPersistence:
             assert stats["persisted"] == db_count, (
                 f"{indicator_id}: report says {stats['persisted']}, db has {db_count}"
             )
+
+
+@pytest.mark.django_db(transaction=True)
+class TestIntegrityCheckRollsBack:
+    def test_count_mismatch_raises_and_leaves_no_rows_behind(self, monkeypatch) -> None:
+        """GIVEN a run where MORE rows reach the database than the report claims
+        WHEN run() performs its persisted-row integrity check
+        THEN it raises AssertionError AND the transaction is rolled back, so zero
+        Flag rows survive.
+
+        The divergence is injected as a DUPLICATE insert rather than a dropped row:
+        dropping the only row would leave the database empty regardless of whether
+        the rollback fired, making the assertion vacuously true. Inserting an extra
+        row means a surviving row can only mean the rollback did NOT happen.
+        """
+        _build_fixture()
+        real_bulk_create = Flag.objects.bulk_create
+
+        def duplicating_bulk_create(objs, *args, **kwargs):
+            objs = list(objs)
+            return real_bulk_create(objs + objs, *args, **kwargs) if objs else []
+
+        monkeypatch.setattr(Flag.objects, "bulk_create", duplicating_bulk_create)
+
+        assert Flag.objects.count() == 0
+        with pytest.raises(AssertionError, match="persisted-row count mismatch"):
+            run_indicators.run(SOURCE, "gb")
+
+        # Load-bearing: any surviving row proves the check fired after the commit.
+        assert Flag.objects.count() == 0

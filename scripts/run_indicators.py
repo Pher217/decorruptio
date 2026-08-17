@@ -116,20 +116,25 @@ def run(source: str, locale_code: str, *, dry_run: bool = False) -> dict[str, An
                 "units_unscoreable": getattr(indicator, "units_unscoreable", 0),
             }
 
+        total_persisted = sum(v["persisted"] for v in per_indicator.values())
+
+        # The integrity check MUST run inside the transaction. Outside it, the rows are
+        # already committed by the time the count runs, so a mismatch raises loudly over
+        # data that is already durable -- an alarm, not a guard. Inside, the count sees
+        # this transaction's own rows and the raise rolls the whole run back.
+        if not dry_run:
+            actual_persisted = FlagModel.objects.filter(indicator_id__in=ran_ids).count()
+            if actual_persisted != total_persisted:
+                raise AssertionError(
+                    f"persisted-row count mismatch: db has {actual_persisted} Flag rows "
+                    f"for {ran_ids}, report computed {total_persisted}. This is the exact "
+                    "divergence this runner exists to prevent -- do not paper over it."
+                )
+
         if dry_run:
             transaction.set_rollback(True)
 
     total_flags = sum(v["flags"] for v in per_indicator.values())
-    total_persisted = sum(v["persisted"] for v in per_indicator.values())
-
-    if not dry_run:
-        actual_persisted = FlagModel.objects.filter(indicator_id__in=ran_ids).count()
-        if actual_persisted != total_persisted:
-            raise AssertionError(
-                f"persisted-row count mismatch: db has {actual_persisted} Flag rows "
-                f"for {ran_ids}, report computed {total_persisted}. This is the exact "
-                "divergence this runner exists to prevent -- do not paper over it."
-            )
 
     return {
         "source": source,

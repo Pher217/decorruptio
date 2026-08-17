@@ -38,13 +38,13 @@ SOURCE = "uk_contracts_finder"
 LOCALE = "gb"
 
 
-def _build_fixture() -> None:
+def _build_fixture(source: str = SOURCE) -> None:
     award_date = timezone.now() - timedelta(days=5)
     incorporation_date = award_date.date() - timedelta(days=10)
 
     tender = Tender.objects.create(
-        source_id=SOURCE,
-        tender_id="T1",
+        source_id=source,
+        tender_id=f"{source}_T1",
         title="Widget supply",
         procurement_method="single_tender_action",
         procurement_method_details="direct award",
@@ -54,9 +54,9 @@ def _build_fixture() -> None:
         source_url="https://example.com/t1",
     )
     Award.objects.create(
-        source_id=SOURCE,
+        source_id=source,
         tender_id=tender.tender_id,
-        award_id="A1",
+        award_id=f"{source}_A1",
         tender_ref=tender,
         supplier_name="Shell Co Ltd",
         supplier_id_scheme="GB-COH",
@@ -66,15 +66,17 @@ def _build_fixture() -> None:
         status="active",
         award_date=award_date,
     )
-    company = Company.objects.create(
+    company, _created = Company.objects.update_or_create(
         company_number="12345678",
-        company_name="Shell Co Ltd",
-        incorporation_date=incorporation_date,
-        accounts_category="full accounts",
-        accounts_last_made_up_date=None,
+        defaults={
+            "company_name": "Shell Co Ltd",
+            "incorporation_date": incorporation_date,
+            "accounts_category": "full accounts",
+            "accounts_last_made_up_date": None,
+        },
     )
     SupplierResolution.objects.create(
-        source_id=SOURCE,
+        source_id=source,
         supplier_name="Shell Co Ltd",
         supplier_id_scheme="GB-COH",
         supplier_id="12345678",
@@ -86,7 +88,7 @@ def _build_fixture() -> None:
     # D1 (ADR-012) made resolution identifier-primary and derived: i006-i009 read
     # award.resolution and fail-closed when a source has no AwardResolution rows.
     # Derive them through the production path rather than hand-building the row.
-    resolve_suppliers(SOURCE)
+    resolve_suppliers(source)
 
 
 @pytest.mark.django_db
@@ -173,6 +175,30 @@ class TestRunIndicatorsPersistence:
             assert stats["persisted"] == db_count, (
                 f"{indicator_id}: report says {stats['persisted']}, db has {db_count}"
             )
+
+    def test_running_a_second_source_does_not_delete_the_first_sources_flags(
+        self,
+    ) -> None:
+        """GIVEN flags already persisted for the first source (uk_contracts_finder)
+        WHEN run() is called for a second source (ua_prozorro)
+        THEN the first source's i006_incorporation_proximity flags are still
+        exactly 1.
+        """
+        _build_fixture()
+        run_indicators.run(SOURCE, LOCALE)
+        first_count = Flag.objects.filter(
+            tender_ref__source_id=SOURCE, indicator_id="i006_incorporation_proximity"
+        ).count()
+        assert first_count == 1
+
+        _build_fixture(source="ua_prozorro")
+        run_indicators.run("ua_prozorro", LOCALE)
+        assert (
+            Flag.objects.filter(
+                tender_ref__source_id=SOURCE, indicator_id="i006_incorporation_proximity"
+            ).count()
+            == first_count
+        )
 
 
 @pytest.mark.django_db(transaction=True)

@@ -12,9 +12,8 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('staging', '0007_backfill_award_value_kind'),
+        ("staging", "0007_backfill_award_value_kind"),
     ]
 
     operations = [
@@ -22,15 +21,15 @@ class Migration(migrations.Migration):
         # Flag row. Only `uk_contracts_finder` has ever been scored, so that source_id
         # is the correct value for all existing rows.
         migrations.AddField(
-            model_name='flag',
-            name='source_id',
-            field=models.CharField(db_index=True, default='uk_contracts_finder', max_length=50),
+            model_name="flag",
+            name="source_id",
+            field=models.CharField(db_index=True, default="uk_contracts_finder", max_length=50),
         ),
         # Remove the database default so new rows must explicitly provide source_id,
         # matching the declaration in models.py and the other staging tables.
         migrations.AlterField(
-            model_name='flag',
-            name='source_id',
+            model_name="flag",
+            name="source_id",
             field=models.CharField(db_index=True, max_length=50),
         ),
     ]

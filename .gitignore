@@ -49,3 +49,6 @@ graphify-out/
 # published. Previously ignored only via .git/info/exclude, which is local to
 # one clone and is NOT shared; a fresh clone would have tracked it.
 .consult/
+
+# Local pre-rebuild database dumps (1.2GB+). Never commit.
+.backups/
